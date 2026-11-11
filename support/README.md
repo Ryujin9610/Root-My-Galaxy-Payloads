@@ -9,6 +9,7 @@ Each entry contains only:
 - `payloadId` and `displayName`;
 - one or more exact `Build.MODEL` values in `models`;
 - one or more versions in `kernelVersions`;
+- optional exact Android `Build.FINGERPRINT` values in `buildFingerprints`;
 - optional `requiresShizuku: true` for shell-only payload routes;
 - `url` and `size` for the exploit and KernelSU artifacts.
 
@@ -21,9 +22,12 @@ disables its per-boot P0 cache for that profile and gives the single combined
 attempt the target-specific long timeout. The field defaults to `false`, so
 existing profiles retain the cached multi-attempt behavior.
 
-The app extracts the leading numeric version from `uname -r`. Kernel suffixes,
-Android build displays, fingerprints, and security-patch dates do not
-participate in matching.
+The app extracts the leading numeric version from `uname -r` for ordinary
+profiles. A profile that requires Shizuku, or declares `buildFingerprints`, is
+matched strictly: the device fingerprint must exactly match one of
+`buildFingerprints`, and its full `uname -r` release must exactly match one of
+`kernelVersions`. Include both the leading three-part version and the full
+release when the profile should also appear in version summaries.
 
 `targets-v2.json` remains unchanged for released 0.2.3 clients. New clients
 read only schema version 3.
