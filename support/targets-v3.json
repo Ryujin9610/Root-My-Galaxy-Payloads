@@ -13,11 +13,13 @@
       "requiresShizuku": true,
       "exploit": {
         "url": "https://raw.githubusercontent.com/Ryujin9610/Root-My-Galaxy-Payloads/r9q-g990b-lizh2/artifacts/r9q-G990BXXSLIZH2/cve-2026-43499-app.so",
-        "size": 134072
+        "size": 134072,
+        "sha256": "f0a2b39c3d3a0e05beccd839f3e2af2417ca7f60e849b4e5e6bee898688b437b"
       },
       "kernelsu": {
         "url": "https://raw.githubusercontent.com/Ryujin9610/Root-My-Galaxy-Payloads/r9q-g990b-lizh2/kernelsu/ksud-r9q-G990BXXSLIZH2-kdp",
-        "size": 4844920
+        "size": 4844920,
+        "sha256": "bafc40f0166418ec7564578d9f181083b33db6ae9815095a3cf67eba7ba551e9"
       }
     },
     {
