@@ -12,11 +12,11 @@
       "buildFingerprints": ["samsung/r9qxeea/r9q:16/BP2A.250605.031.A3/G990BXXSLIZH2:user/release-keys"],
       "requiresShizuku": true,
       "exploit": {
-        "url": "https://raw.githubusercontent.com/Ryujin9610/Root-My-Galaxy-Payloads/b8d42887ccb72c40b91f9253af65fba38c3f2832/artifacts/r9q-G990BXXSLIZH2/cve-2026-43499-app.so",
+        "url": "https://raw.githubusercontent.com/Ryujin9610/Root-My-Galaxy-Payloads/r9q-g990b-lizh2/artifacts/r9q-G990BXXSLIZH2/cve-2026-43499-app.so",
         "size": 134072
       },
       "kernelsu": {
-        "url": "https://raw.githubusercontent.com/Ryujin9610/Root-My-Galaxy-Payloads/b8d42887ccb72c40b91f9253af65fba38c3f2832/kernelsu/ksud-r9q-G990BXXSLIZH2-kdp",
+        "url": "https://raw.githubusercontent.com/Ryujin9610/Root-My-Galaxy-Payloads/r9q-g990b-lizh2/kernelsu/ksud-r9q-G990BXXSLIZH2-kdp",
         "size": 4844920
       }
     },
