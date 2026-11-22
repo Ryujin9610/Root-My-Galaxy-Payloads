@@ -677,3 +677,20 @@ is freed and during each 32-object reclaim batch. That will show whether the
 block stays free, is split/merged, or becomes a slab, and report the actual
 owning cache pointer without relaxing the cache gate. The app's memcg ID
 remains unknown until its process is running and its cgroup path can be read.
+
+### Staged reclaim snapshot candidate
+
+On 2026-11-22, the diagnostic candidate added read-only snapshots of the
+candidate order-3 page after the AF_UNIX skb is drained/freed, after 192 pipe
+arrays, after the next array, and after the full reclaim population. At each
+checkpoint it resolves distinct compound-page heads and records the
+`slab_cache` pointer, `page_type`, read results, and errno. It does not change
+the cache acceptance gate or write to kernel memory. The 192/193 boundary
+checks whether reclaim first consumes the six drain slabs before requesting a
+new slab page.
+
+The candidate compiled successfully with NDK r27b as an AArch64 Android 30
+shared object, 136,400 bytes, SHA-256
+`415dbca2abb4e3df8f4f90b637a9a8b5d4992b1a6d956d9545d424f4d2239fa5`. The
+artifact and target manifest are synchronized. This diagnostic build has not
+been run on the phone; the existing one-attempt-per-run limit still applies.

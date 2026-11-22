@@ -2,8 +2,9 @@
 
 This directory contains the target-specific source for the
 `SM-G990B` / `G990BXXSLIZH2` payload. The baseline pipe route was
-hardware-proven; the current live-offset cache-table change is experimental
-and has not yet been exercised on the phone.
+hardware-proven. The live-offset cache-table change was exercised once but
+did not reach physical read/write. The current page-reclaim snapshots are a
+diagnostic candidate and have not been run on the phone.
 
 Samsung's 5.4 kernel requires target-specific compiler stack geometry for the
 legacy `rt_mutex_waiter` overlay. The proven route uses a pselect result-copy
@@ -26,10 +27,11 @@ ANDROID_NDK_HOME=/path/to/android-ndk-r27b \
 ```
 
 The target automatically uses API 30 for the exploit and API 35 for the
-generic Root My Galaxy helper. The current working-tree build, including the experimental pipe-cache gate, produces:
+generic Root My Galaxy helper. The current working-tree build, including the
+experimental pipe-cache gate and staged page-metadata diagnostics, produces:
 
 ```text
-c845e10ba1385c73e7e6483381bee7746ce393c17afa1cc8564f7788c6dd6a66  cve-2026-43499-app.so
+415dbca2abb4e3df8f4f90b637a9a8b5d4992b1a6d956d9545d424f4d2239fa5  cve-2026-43499-app.so
 fd193ddecbc5db5d13e72281cf54ce3ae054e1b3d8728c1dfc64ff1fc80d0bb8  cve-2026-43499-root
 ```
 

