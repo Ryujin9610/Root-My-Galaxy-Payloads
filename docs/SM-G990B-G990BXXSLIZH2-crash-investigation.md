@@ -861,7 +861,11 @@ restart this still-successful boot until a concrete fix is ready and separately
 approved.
 
 No second exploit attempt or flash was performed. The drain-order exploit
-candidate remains separate from the supported exploit artifact. The active
-target manifest currently selects the experimental proc-fallback KernelSU
-service described above; return it to the documented hardware-proven pair only
-after verifying the pair against the current source/build metadata.
+candidate remains separate from the supported exploit artifact. After verifying
+the local artifacts against the repo's exact-build records, the target manifest
+was changed back to the documented hardware-proven G990B `ksud` artifact
+(SHA-256 `bafc40f0166418ec7564578d9f181083b33db6ae9815095a3cf67eba7ba551e9`).
+This affects a future payload download only; it does not replace or unload the
+experimental module already present in the current boot. A fresh controlled
+device run is still needed to confirm the baseline pair on this phone and should
+not be started without explicit approval.

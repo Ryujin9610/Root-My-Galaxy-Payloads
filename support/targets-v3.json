@@ -17,9 +17,9 @@
         "sha256": "415dbca2abb4e3df8f4f90b637a9a8b5d4992b1a6d956d9545d424f4d2239fa5"
       },
       "kernelsu": {
-        "url": "https://raw.githubusercontent.com/Ryujin9610/Root-My-Galaxy-Payloads/r9q-g990b-lizh2/kernelsu/ksud-r9q-G990BXXSLIZH2-kdp-proc-fallback-candidate",
-        "size": 4849960,
-        "sha256": "1eae042ffbd70848af8ec3cad8b138b70cce14f8176b88dcb435224b4256ec77"
+        "url": "https://raw.githubusercontent.com/Ryujin9610/Root-My-Galaxy-Payloads/r9q-g990b-lizh2/kernelsu/ksud-r9q-G990BXXSLIZH2-kdp",
+        "size": 4844920,
+        "sha256": "bafc40f0166418ec7564578d9f181083b33db6ae9815095a3cf67eba7ba551e9"
       }
     },
     {
