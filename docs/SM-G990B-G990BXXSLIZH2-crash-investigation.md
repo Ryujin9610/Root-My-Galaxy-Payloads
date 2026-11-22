@@ -409,7 +409,32 @@ exact kernel before relying on those comments.
   revalidate stack/IRQ geometry with `CONFIG_VMAP_STACK=y`. Do not treat the
   current diagnostic artifact as safe to repeat based on this diagnosis.
 
-## 2026-11-22: candidate run on RMG Extended
+## 2026-11-22: RMG Extended attempts
+
+### 18:00 successful exploit, KernelSU control check incomplete
+
+Install-history record `21b12d29-f41e-4cf7-a1f4-d3d3fd7f7b72` is marked
+`Succeeded` and ran from 18:00:12 to 18:08:10 local time. It used the imported
+`cve-2026-43499-app-pte2g-mmstats-v3.so` override with source commit
+`c7121f9cd66ee70550eda247e8feecfff8ccad38`. The exploit completed its pipe
+physical read/write route (`done=1 root=1 read_ok=1 write_ok=1`) and changed
+the execution uid from 2000 to 0. RMG recorded `Bootstrap root acquired` and
+`Rooted in 7 min 56 s`.
+
+The subsequent KernelSU stage did not validate cleanly. The log says
+`late-load: KernelSU driver fd unavailable`; its control-channel check found a
+native probe but no Shizuku `su`, and the helper printed no control report.
+The app also says `KernelSU is loaded, but the payload's own check failed`,
+then marks KernelSU active and the overall install successful. It staged the
+older `ksud-s25u-kdp` service from the `c7121f9` profile for the next boot.
+This supports the distinction between successful temporary root and an
+unavailable or unrecognized KernelSU driver/control endpoint. The saved record
+does not itself include a direct `/dev/ksu` directory listing, so the exact
+node's absence is not independently proven by that history file. This success
+predates manifest commit `2976ceb`, which points to the proc-fallback helper;
+that newer helper was not tested in this successful run.
+
+### 21:37 failed attempt after the manifest update
 
 After the phone's swipe-only keyguard was dismissed through Android's normal
 `wm dismiss-keyguard` path, the separate RMG Extended app was used (package
