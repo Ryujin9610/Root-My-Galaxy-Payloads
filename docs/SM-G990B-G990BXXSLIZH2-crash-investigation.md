@@ -728,3 +728,37 @@ gate cannot recognize. The run does not establish temporary root or KernelSU
 loading. Keep the acceptance gate unchanged; the next step is offline source
 work to identify actual memcg cache ownership and trace allocator reuse before
 considering another device attempt.
+
+### Follow-up: source package and exact-target reference review (2026-11-22)
+
+The downloaded `C:\Users\admin\Desktop\kernel source\SM-G990B.zip` is not a
+complete kernel tree. It contains `SM-G990B_16_Opensource.zip`, whose inner
+`G990BXXSLIZH2_kernel.tar.gz` is only about 240 KB and contains a small set of
+35 vendor update files. The accompanying `G990BXXSLIZH2_kernel.txt` explicitly
+says to first download and unpack the `G990BXXUGIYJ1` kernel source, then overlay
+this update. It does not contain core files such as `fs/pipe.c`,
+`mm/slub.c`, or `mm/memcontrol.c`. Obtain the matching base source before using
+this local package to make claims about those core paths.
+
+A public exact-target standalone reference is available at
+https://github.com/k-o-n-t-o-r/ghostlock-sm-g990b. Its README and technical
+notes claim two independent clean-boot successes on this exact model, firmware,
+and kernel. These are repository-owner claims, not independently verified
+results. Its described root chain is a temporary uid-0 daemon and does not by
+itself demonstrate KernelSU loading or `/dev/ksu` support.
+
+A source comparison found one concrete reclaim-order difference worth testing
+offline. In the reference `src/pipe.c`, drain pipe arrays remain allocated while
+the marked skb that captures the target order-3 page is freed; reclaim pipe
+arrays are grown afterward. In this branch's staged diagnostic,
+`pipe_stage_exact_order3()` frees the drain arrays while the marked skb still
+pins the target, then frees the skb and grows the reclaim population. This may
+change which order-3 page the next slab allocation uses. It is a plausible
+allocator-order explanation, not yet a demonstrated cause. The last device run
+showed the target page had no recognized slab-cache owner after the skb free and
+never passed the pipe cache gate.
+
+Next offline step: review and adapt the reference's allocation lifetime/order
+for the RMG target, preserving the current cache gate and diagnostics. Build and
+hash-check that candidate before considering another single device attempt; do
+not run the standalone binary or infer KernelSU success from its root claim.
