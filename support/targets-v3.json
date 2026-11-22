@@ -13,8 +13,8 @@
       "requiresShizuku": true,
       "exploit": {
         "url": "https://raw.githubusercontent.com/Ryujin9610/Root-My-Galaxy-Payloads/r9q-g990b-lizh2/artifacts/r9q-G990BXXSLIZH2/cve-2026-43499-app.so",
-        "size": 134072,
-        "sha256": "f0a2b39c3d3a0e05beccd839f3e2af2417ca7f60e849b4e5e6bee898688b437b"
+        "size": 135784,
+        "sha256": "c845e10ba1385c73e7e6483381bee7746ce393c17afa1cc8564f7788c6dd6a66"
       },
       "kernelsu": {
         "url": "https://raw.githubusercontent.com/Ryujin9610/Root-My-Galaxy-Payloads/r9q-g990b-lizh2/kernelsu/ksud-r9q-G990BXXSLIZH2-kdp-proc-fallback-candidate",

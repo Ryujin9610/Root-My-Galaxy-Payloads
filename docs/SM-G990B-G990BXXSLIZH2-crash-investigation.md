@@ -457,7 +457,7 @@ the file run: it was 134,072 bytes with SHA-256
 `f0a2b39c3d3a0e05beccd839f3e2af2417ca7f60e849b4e5e6bee898688b437b`. The
 modified artifact in the local repository worktree was also different: 135,312
 bytes with SHA-256
-`daf8a8380b31f9d4eBC81F7A713D8E3A6EFEA9C4CAD99B879F7ACD7099A6DC87`.
+`daf8a8380b31f9d4ebc81f7a713d8e3a6efea9c4cad99b879f7acd7099a6dc87`.
 Therefore this run tested the phone's imported v3 build, not the branch's
 manifest artifact or the current worktree artifact. The history records
 `KernelSU service verified` and `Payload download complete`; the KernelSU
@@ -503,3 +503,50 @@ write discovery failure and reviewing the new readiness/overlay trace. The
 `errno=12` spectrum allocation failures are additional evidence to account for
 in any next diagnostic build.
 
+
+### 22:06 failed attempt with candidate helper staged
+
+Install-history record `b0cf09fb-9336-41b0-bffa-3cc3832aa26b` is the next
+single-attempt run. It used the same imported exploit override
+`cve-2026-43499-app-pte2g-mmstats-v3.so` (SHA-256
+`e274fd6d27b420a9c18f80ee69f167f0bd5c95eed6d5f1760d13ca58221513de`), not
+the modified local worktree artifact (SHA-256
+`daf8a8380b31f9d4ebc81f7a713d8e3a6efea9c4cad99b879f7acd7099a6dc87`). The
+run reached KASLR discovery and controlled reclaim, then failed before root at
+pipe page-cache identification: `reclaimed-page cache match=0`,
+`first_page=0000000000000000`, and `pipe physrw attempt=1/1 failed`. The summary
+reported `done=0 root=0`, `read_ok=0`, and `write_ok=0`; it left the dirty fops
+page retained and required a reboot. The phone was subsequently rebooted and
+returned online on the same Android 16 / LIZH2 build. After reboot the shell
+remained uid 2000 and `/dev/ksu` and `/proc/ksu` were absent.
+
+The proc-fallback KernelSU service candidate was available in RMG's cache under
+`ksud-s25u-kdp`, with the expected SHA-256
+`1eae042ffbd70848af8ec3cad8b138b70cce14f8176b88dcb435224b4256ec77`. It was
+verified/staged before the run, but the exploit never acquired root, so this
+attempt provides no evidence about whether the helper can expose a working
+KernelSU control interface.
+
+#### Current untested pipe-source change
+
+The current local `port/pipe.c` modification reads the live
+`physvirt_offset` and `kimage_voffset`, derives the linear-map alias for
+`kmalloc_caches`, and accepts its cache table only when a full table read
+matches the canonical kernel-image mapping byte-for-byte. This is a useful
+fail-closed diagnostic candidate for the repeated cache-match failure. It is
+not the source used by the 22:06 phone run. It has since been built successfully, but has not yet been validated on-device. The table match alone also does not establish that the
+reclaimed page is the expected pipe-buffer slab; the per-page `struct page`
+cache metadata still needs to match the expected cache slot.
+
+For the next phone attempt, use this artifact fingerprint and manifest entry, review the added mapping diagnostics and the exact page metadata gate, and use one attempt while capturing complete output. If a run is
+later authorized, use one attempt and capture the complete output. Do not infer
+anything about the proc-fallback helper unless root is actually acquired and
+the helper stage runs.
+
+The cache-table experiment was built with NDK r27b (12297006) on 2026-11-22.
+The output is a valid AArch64 Android 30 shared object, 135,784 bytes,
+SHA-256 `c845e10ba1385c73e7e6483381bee7746ce393c17afa1cc8564f7788c6dd6a66`.
+Compilation completed with only existing unused-function warnings. This is a
+new candidate build, not a reproduction of the earlier hardware-tested binary;
+it still needs a single controlled on-device attempt before its effectiveness
+or KernelSU helper behavior can be assessed.
