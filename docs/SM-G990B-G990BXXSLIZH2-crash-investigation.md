@@ -216,6 +216,12 @@ and its userspace includes the `/proc/ksu` fallback path. The first userspace
 build did not yet embed the module; the recorded artifact is from the clean
 rebuild after adding the correctly named KMI asset.
 
+The patched `ksud` checks whether any KernelSU module is already loaded and
+skips loading its embedded candidate if so. The last recorded phone state had
+the previous `kernelsu` module present, so a future candidate attempt would
+need a fresh boot or a separately validated unload. The phone state has not
+been rechecked, and neither action was taken here.
+
 Artifacts are saved as candidates in `kernelsu/`:
 
 - `android16-5.4_kernelsu-r9q-G990BXXSLIZH2-kdp-proc-fallback-candidate.ko`
