@@ -423,13 +423,25 @@ that source at commit `2976ceb3e5a1e351c448b6948522d2e7f7440685` and reported
 confusion with the other installed RMG package (`dev.busung.s25uroot`), whose
 settings screen did not expose the payload-source manager.
 
-RMG Extended downloaded its payload and KernelSU service. It logged
-`KernelSU service verified` and `Payload download complete`, then executed one
-independent exploit attempt (`attempts=1/1`) using Shizuku. The startup context
-was ordinary shell (`uid=euid=2000`, SELinux `u:r:shell:s0`, enforcing), and
-the build label was `r9q-G990BXXSLIZH2-diag-pte2g-once`. KASLR discovery
-succeeded through tracefs with slide `0x1e8000` and the corrected physical
-image delta `0x20080000`.
+RMG Extended honored its imported-exploit override and staged the phone's local
+`cve-2026-43499-app-pte2g-mmstats-v3.so`. The staged file and
+`files/local-payload/local-exploit.so` had the same SHA-256:
+`e274fd6d27b420a9c18f80ee69f167f0bd5c95eed6d5f1760d13ca58221513de` (140,592
+bytes). The exploit listed in the manifest at source commit `2976ceb` was not
+the file run: it was 134,072 bytes with SHA-256
+`f0a2b39c3d3a0e05beccd839f3e2af2417ca7f60e849b4e5e6bee898688b437b`. The
+modified artifact in the local repository worktree was also different: 135,312
+bytes with SHA-256
+`daf8a8380b31f9d4eBC81F7A713D8E3A6EFEA9C4CAD99B879F7ACD7099A6DC87`.
+Therefore this run tested the phone's imported v3 build, not the branch's
+manifest artifact or the current worktree artifact. The history records
+`KernelSU service verified` and `Payload download complete`; the KernelSU
+service was downloaded and verified. RMG then executed one independent
+exploit attempt (`attempts=1/1`) using Shizuku. The startup context was
+ordinary shell (`uid=euid=2000`, SELinux `u:r:shell:s0`, enforcing), and the
+build label was `r9q-G990BXXSLIZH2-diag-pte2g-once`. KASLR discovery succeeded
+through tracefs with slide `0x1e8000` and the corrected physical image delta
+`0x20080000`.
 
 The controlled reclaim scan completed with
 `scans=192 leak_miss=0 accepted=43 invalid=0 overflow=0 duplicate=0`,
