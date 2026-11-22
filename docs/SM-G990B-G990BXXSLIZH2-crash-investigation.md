@@ -762,3 +762,23 @@ Next offline step: review and adapt the reference's allocation lifetime/order
 for the RMG target, preserving the current cache gate and diagnostics. Build and
 hash-check that candidate before considering another single device attempt; do
 not run the standalone binary or infer KernelSU success from its root claim.
+
+### Drain-array lifetime candidate (2026-11-22)
+
+Based on the reference comparison, the target port now has a separate
+experimental build that keeps the 192 drain pipe arrays allocated while the
+marked skb is released and while the reclaim population is grown. This removes
+the local version's pre-release drain-array shrink and follows the allocation
+lifetime used by the standalone reference. It does not change the cache gate,
+KASLR profile, or privilege-escalation path.
+
+The candidate compiled with Android NDK r27b as an AArch64 Android 30 shared
+object. Size: 136,368 bytes. SHA-256:
+`4d97a75d1201ed085c60a9fe78aa33b99837532ebe6a383b94d4c87e4850af73`. It is
+stored separately as `artifacts/r9q-G990BXXSLIZH2/cve-2026-43499-app-drain-order.so`;
+the current supported payload artifact and manifest remain unchanged. This is
+an untested hypothesis. It has not been loaded onto the phone or executed.
+
+Next step: review the candidate and its build/hash, then request approval before
+one new diagnostic attempt on a clean boot. A successful temporary-root claim
+from the standalone reference does not establish KernelSU compatibility.

