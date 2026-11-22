@@ -758,10 +758,8 @@ allocator-order explanation, not yet a demonstrated cause. The last device run
 showed the target page had no recognized slab-cache owner after the skb free and
 never passed the pipe cache gate.
 
-Next offline step: review and adapt the reference's allocation lifetime/order
-for the RMG target, preserving the current cache gate and diagnostics. Build and
-hash-check that candidate before considering another single device attempt; do
-not run the standalone binary or infer KernelSU success from its root claim.
+That comparison motivated the separate drain-array lifetime candidate documented
+below. The standalone binary was not used.
 
 ### Drain-array lifetime candidate (2026-11-22)
 
@@ -776,9 +774,32 @@ The candidate compiled with Android NDK r27b as an AArch64 Android 30 shared
 object. Size: 136,368 bytes. SHA-256:
 `4d97a75d1201ed085c60a9fe78aa33b99837532ebe6a383b94d4c87e4850af73`. It is
 stored separately as `artifacts/r9q-G990BXXSLIZH2/cve-2026-43499-app-drain-order.so`;
-the current supported payload artifact and manifest remain unchanged. This is
-an untested hypothesis. It has not been loaded onto the phone or executed.
+the current supported payload artifact and manifest remain unchanged. The device
+run and its KernelSU result are recorded below. The standalone reference's
+temporary-root claim remains separate from the RMG result.
 
-Next step: review the candidate and its build/hash, then request approval before
-one new diagnostic attempt on a clean boot. A successful temporary-root claim
-from the standalone reference does not establish KernelSU compatibility.
+### Drain-array lifetime candidate run (2026-11-23)
+
+After a clean reboot, the candidate was imported into RMG Extended and run once
+for the exact `r9q-G990BXXSLIZH2` profile. The on-device SHA-256 matched the
+published candidate:
+`4d97a75d1201ed085c60a9fe78aa33b99837532ebe6a383b94d4c87e4850af73`.
+The supervisor reported `attempts=1` and `exploit attempt=1/1`. The pipe
+order-3 oracle captured probe 0. The payload summary reported `done=1 root=1`,
+and the RMG install screen showed `KernelSU active`, with all four run stages
+checked and the text “KernelSU was loaded and checked successfully.” A screenshot
+was saved locally as `rmg-success.png` in the investigation workspace.
+
+Afterward, the RMG screen also reported that its Shizuku-based soft-restart
+action was rejected because Shizuku did not have root permission. No soft restart
+was triggered. The phone remained booted on
+`5.4.289-qgki-32192773-abG990BXXSLIZH2`; `sys.boot_completed=1` and the ADB
+shell was still `uid=2000(shell)`. The shell still could not find `/dev/ksu` or `/proc/ksu`,`nbut it could see
+`/sys/module/kernelsu` and `/data/adb/ksu`; the `rmgnext-helper` process was
+running as `root`. Thus KernelSU was loaded despite those two expected node names
+being absent. The RMG status and sysfs/module evidence agree; the missing
+`/dev/ksu` path remains a separate interface detail, not a failed load.
+
+No second exploit attempt or flash was performed. The standard supported
+artifact and manifest were not changed; this experimental candidate remains
+separate.
