@@ -637,3 +637,31 @@ context and the allocator's reuse constraints, then design diagnostics that
 recognize both the exact accounted-cache owner and the actual pipe-buffer
 contents. Do not weaken the cache gate or run another attempt until that
 diagnostic is concrete.
+
+### AF_UNIX backing and pipe-array lifetime check
+
+The firmware's `net/unix/af_unix.c` confirms that ordinary stream `sendmsg`
+uses paged skbs. For the controlled probe, the requested fragment order is
+`get_order(UNIX_SKB_FRAGS_SZ)`; `net/core/skbuff.c` then tries an order-3
+`alloc_pages()` allocation for the 32 KiB data area, falling back to order-0
+pages only if that high-order allocation fails. Consuming and freeing the skb
+releases its fragment references through `put_page()`. This path does not use
+the per-task `task_frag` cache used by other socket send paths, so a persistent
+task-fragment reference is not supported as the explanation for the observed
+miss.
+
+The exact `fs/pipe.c` also shows that resizing a pipe allocates its new buffer
+array with `kcalloc(..., GFP_KERNEL_ACCOUNT)` and immediately calls `kfree()`
+on the old array after swapping it. The requested 16-slot array is 640 bytes
+(`16 * sizeof(struct pipe_buffer)` at 40 bytes each), which maps to the 1 KiB
+kmalloc bucket as expected. These source paths validate the intended allocation
+sizes and lifetime, but they do not prove that SLUB subsequently takes the
+specific released order-3 page. All eight candidate subpages still had zero
+slab-cache metadata in the live trace.
+
+At the time of this follow-up, the phone exposed a cgroup v2 `memory`
+controller, but RMG Extended was not running, so its app-specific cgroup path
+and memcg cache ID could not be read. The kernel's page-fragment and pipe-array
+lifetime checks did not establish a different root cause. The remaining
+diagnostic needs to observe which cache and slab order actually receives the
+reclaim allocations, without relaxing the cache gate.
