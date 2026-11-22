@@ -409,3 +409,60 @@ exact kernel before relying on those comments.
   revalidate stack/IRQ geometry with `CONFIG_VMAP_STACK=y`. Do not treat the
   current diagnostic artifact as safe to repeat based on this diagnosis.
 
+## 2026-11-22: candidate run on RMG Extended
+
+After the phone's swipe-only keyguard was dismissed through Android's normal
+`wm dismiss-keyguard` path, the separate RMG Extended app was used (package
+`dev.rushiranpise.rmgnext`, version `0.13+local.af081c2`, code `28063401`).
+Its payload-source editor already had
+`Ryujin9610/Root-My-Galaxy-Payloads @ r9q-g990b-lizh2` enabled. The app verified
+that source at commit `2976ceb3e5a1e351c448b6948522d2e7f7440685` and reported
+`Matches this device: r9q-G990BXXSLIZH2`. The selected catalog entry was
+`CVE-2026-43499`, shown as `Galaxy S21 FE 5G (SM-G990B) | Kernel 5.4.289`,
+`Exact kernel match`, with the source label above. This resolves the earlier
+confusion with the other installed RMG package (`dev.busung.s25uroot`), whose
+settings screen did not expose the payload-source manager.
+
+RMG Extended downloaded its payload and KernelSU service. It logged
+`KernelSU service verified` and `Payload download complete`, then executed one
+independent exploit attempt (`attempts=1/1`) using Shizuku. The startup context
+was ordinary shell (`uid=euid=2000`, SELinux `u:r:shell:s0`, enforcing), and
+the build label was `r9q-G990BXXSLIZH2-diag-pte2g-once`. KASLR discovery
+succeeded through tracefs with slide `0x1e8000` and the corrected physical
+image delta `0x20080000`.
+
+The controlled reclaim scan completed with
+`scans=192 leak_miss=0 accepted=43 invalid=0 overflow=0 duplicate=0`,
+`groups=2`, and `best=34/34`. Spectrum setup succeeded at 512 and 4096
+entries but failed at 1024, 2048, 8192, 16384, and 32768 with `errno=12`
+(`ENOMEM`); the exploit continued with two spectrum entries. The first
+readiness-cow path reported a CFI miss at step 33, then its overlay attempt
+reported `ret=118`, `mprotect=0/0`, `blocked=0`, and `overlay=1`. The PI
+readiness canary had `gate=1`, but the subsequent live snapshot had
+`live_root=0` and no detected root transition.
+
+The fallback pipe physical-read/write path did not find a matching reclaimed
+pipe page. It logged `pipe physrw attempt=1/1 failed`, followed by
+`pipe-physrw-summary ... done=0 root=0 kaslr=1`, `read_ok=0`, `write_ok=0`,
+and `uid=4294967295->4294967295`. The install-history record
+`c5ca4609-22c3-4d5c-b407-4daa1682a3ea.json` ends with:
+
+```text
+[-] stability keeper pid=27025 retaining dirty fops page; reboot required
+[-] exploit attempt=1/1 failed status=1
+[!] exploit failed after 1 independent attempts
+[-] The payload failed with code 255 — the command could not be run:
+    a refused or unavailable privilege, or nothing to execute
+[*] Failed at: Running kernel exploit
+failureStage: Exploit
+```
+
+The phone remained ADB-accessible and completed a reboot after this result.
+After reboot it reported the same Android 16 firmware and
+`5.4.289-qgki-32192773-abG990BXXSLIZH2`; the shell still had uid 2000 and
+`/dev/ksu` was absent. No KernelSU load was attempted after the failed exploit.
+Do not retry this candidate without first resolving the pipe physical-read/
+write discovery failure and reviewing the new readiness/overlay trace. The
+`errno=12` spectrum allocation failures are additional evidence to account for
+in any next diagnostic build.
+
