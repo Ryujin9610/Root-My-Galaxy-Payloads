@@ -869,3 +869,21 @@ This affects a future payload download only; it does not replace or unload the
 experimental module already present in the current boot. A fresh controlled
 device run is still needed to confirm the baseline pair on this phone and should
 not be started without explicit approval.
+
+### Follow-up: approved reboot and retained app cache (2026-11-23)
+
+After the user authorized a reboot, the phone completed boot on the same
+Android 16 fingerprint and `5.4.289-qgki-32192773-abG990BXXSLIZH2` kernel.
+`/proc/modules` no longer lists `kernelsu`; `/dev/ksu` and `/proc/ksu` are
+absent, and ADB is the ordinary `uid=2000(shell)` context. No exploit or new
+KernelSU load was run after this reboot.
+
+RMG's app-private payload cache still contains the previous
+`ksud-s25u-kdp` bytes, SHA-256
+`1eae042ffbd70848af8ec3cad8b138b70cce14f8176b88dcb435224b4256ec77`, even
+though the repository manifest now points to the baseline daemon. A future
+attempt must refresh the RMG source/catalog and re-fetch this service payload;
+verify the cached daemon digest is the baseline
+`bafc40f0166418ec7564578d9f181083b33db6ae9815095a3cf67eba7ba551e9` before
+launching it. The remote manifest change alone did not replace the app's cached
+payload.
