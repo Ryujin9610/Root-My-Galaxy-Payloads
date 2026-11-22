@@ -547,6 +547,94 @@ The cache-table experiment was built with NDK r27b (12297006) on 2026-11-22.
 The output is a valid AArch64 Android 30 shared object, 135,784 bytes,
 SHA-256 `c845e10ba1385c73e7e6483381bee7746ce393c17afa1cc8564f7788c6dd6a66`.
 Compilation completed with only existing unused-function warnings. This is a
-new candidate build, not a reproduction of the earlier hardware-tested binary;
-it still needs a single controlled on-device attempt before its effectiveness
-or KernelSU helper behavior can be assessed.
+new candidate build, not a reproduction of the earlier hardware-tested binary.
+It was subsequently exercised in the single-run test below; it has not passed
+the pipe physical read/write stage, so its effectiveness and KernelSU helper
+behavior remain unverified.
+
+### 22:33 single-run test of the live cache-alias candidate
+
+After commit `5dfd5c71acd57d0011f88a3ffa69eca9cd896ef6` was pushed, the rebuilt
+payload was imported into RMG Extended as `r9q-live-cache-candidate.so`. The app
+reported the exact `r9q-G990BXXSLIZH2` profile, selected the user fork and
+`r9q-g990b-lizh2` branch, verified the KernelSU service, and logged one
+independent exploit attempt. The app used the imported local exploit (not a
+second download); its repository branch still supplied the KernelSU helper
+candidate. The complete UI log was saved locally as
+`work/rmg-run-2026-11-22-2232.txt`.
+
+The attempt found KASLR at slide `0x1e8000` and completed the readiness-COW
+step (`success=1`, `step=8`, `errno=0`), but failed in each of the three
+internal pipe-reclaim rounds before physical read/write or root. Each round
+reported `phys step pipe probe found=0`, zero candidate `pipe_buffer` scans,
+`first_page=0000000000000000`, and a cache-gate diagnostic with
+`matched=0`, `page_index=-1`, and `cache_slot=-1`. The final summary was
+`done=0 root=0 kaslr=1`, `read_ok=0`, `write_ok=0`, and the app said one
+independent attempt failed. The stability keeper retained the dirty fops page;
+ADB disconnected during recovery, then the phone returned after reboot with
+`5.4.289-qgki-32192773-abG990BXXSLIZH2`, shell uid 2000, and no `/dev/ksu` or
+`/proc/ksu`. Since temporary root was never obtained, the proc-fallback
+KernelSU helper was not loaded or tested.
+
+#### What the new mapping trace establishes
+
+All three rounds read the runtime globals successfully:
+`physvirt_offset=0x0000008080000000` and
+`kimage_voffset=0xffffffbf70000000`. For the KASLR-adjusted canonical
+`kmalloc_caches` address `0xffffffc0127e8910`, the payload derived the linear
+alias `0xffffff80227e8910`; the full 224-byte read succeeded and matched the
+canonical image mapping (`match=1`). It resolved both normal and cgroup 1 KiB
+cache slots to `0xffffff8000897600`. The older static `data_addr()` alias was
+`0xffffff80827e8910`, so the live-derived route supplied a valid cache table
+without relying on that stale alias.
+
+The target-specific Samsung source archive in
+`C:\Users\admin\Desktop\kernel source\SM-G990B.zip` contains the 5.4 kernel
+`struct page` definition. Its slab-cache pointer is at offset `0x18`, and its
+`page_type`/`active` union is at offset `0x30`, matching the target constants.
+The scans read zero at the slab-cache field for every subpage; several also
+showed `0xdead000000000122` in the list field, consistent with a freed-list
+poison value. These observations are consistent with pages that were not then
+owned by the expected kmalloc-1 KiB SLUB cache; this run does not identify
+which allocator or object last owned them. The cache-table alias correction
+worked; the remaining demonstrated failure is that the pipe reclaim did not turn the
+candidate order-3 page into the target slab or a recognizable pipe-buffer
+array.
+
+Do not make another blind retry. The next useful investigation is to trace
+why the controlled release/reclaim sequence leaves the order-3 candidates out
+of the kmalloc-1 KiB cache and determine whether this app's allocations use a
+memcg child cache. Preserve the one-attempt-per-run limit and do not infer
+helper behavior from this failed run.
+
+### Samsung memcg allocator path
+
+The exact source also exposes a separate cache-classification issue. In
+`fs/pipe.c`, the pipe buffer array is allocated by `kcalloc(...,
+GFP_KERNEL_ACCOUNT)`. The exact kernel's `mm/slab.h` routes accounted SLUB
+allocations through `memcg_kmem_get_cache()` when the memcg-kmem static key is
+enabled; `mm/memcontrol.c` documents that this may select a dynamically created
+per-memcg cache. Those child caches are created asynchronously and are stored
+in the parent cache's memcg cache array, not as extra entries in the global
+`kmalloc_caches` table. The downloaded firmware config enables both
+`CONFIG_MEMCG` and `CONFIG_MEMCG_KMEM`.
+
+The target currently sets `KMALLOC_CGROUP_TYPE=0`, and the live trace showed
+the normal and cgroup-labelled 1 KiB table slots resolving to the same base
+cache pointer. That check cannot identify a child cache pointer. Therefore,
+even after a page is genuinely reclaimed by a pipe buffer array, comparing its
+`struct page.slab_cache` only against the global base cache table can reject a
+valid accounted pipe cache. The current run still did not reach that case:
+every inspected candidate page had a zero cache pointer, so the cache-clone
+issue is a confirmed source-level blind spot, not the demonstrated cause of
+this run's reclaim miss.
+
+The controlled reclaim path first allocates drain pipe arrays, releases an
+order-3 page held by a uniquely marked AF_UNIX skb, drains the capturing skb,
+then allocates the reclaim population. Although intended to reuse that page
+for kmalloc-1 KiB pipe arrays, the run's page metadata and marker scan did not
+show that reuse. The next offline step is to trace the app's memory-cgroup
+context and the allocator's reuse constraints, then design diagnostics that
+recognize both the exact accounted-cache owner and the actual pipe-buffer
+contents. Do not weaken the cache gate or run another attempt until that
+diagnostic is concrete.
