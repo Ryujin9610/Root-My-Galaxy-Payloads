@@ -692,5 +692,39 @@ new slab page.
 The candidate compiled successfully with NDK r27b as an AArch64 Android 30
 shared object, 136,400 bytes, SHA-256
 `415dbca2abb4e3df8f4f90b637a9a8b5d4992b1a6d956d9545d424f4d2239fa5`. The
-artifact and target manifest are synchronized. This diagnostic build has not
-been run on the phone; the existing one-attempt-per-run limit still applies.
+artifact and target manifest are synchronized. The on-device result is recorded
+below; only one independent attempt was run.
+
+### Staged reclaim diagnostic run (2026-11-22)
+
+The staged diagnostic candidate (`cve-2026-43499-app.so`, SHA-256
+`415dbca2abb4e3df8f4f90b637a9a8b5d4992b1a6d956d9545d424f4d2239fa5`) was
+run once through RMG Extended on the connected SM-G990B. The RMG supervisor
+reported `attempts=1` and `exploit attempt=1/1`; the payload then performed its
+three built-in pipe-physrw reclaim rounds. The phone was on the expected Android
+16 build and kernel at start.
+
+The setup reached the forced KASLR profile, controlled `mm_struct` reclaim,
+readiness COW (`success=1`), and both CFI read and write probes. All three pipe
+physrw rounds failed. The first and third round diagnostics showed the released
+order-3 candidate page's eight subpages still lacked the selected kmalloc-1k
+slab-cache match; the cache gate remained closed (`matched=0`, `page_index=-1`,
+`cache_slot=-1`, `gate=0`). The pipe-marker scan also found no candidate pipe
+buffer (`found=0`). The payload summary was `done=0 root=0`, with
+`read_ok=0 write_ok=0 rw64=0/0`; no KernelSU node appeared.
+
+RMG reported that its stability keeper was retaining a dirty fops page and
+required a reboot. The device was rebooted after the failed run. ADB reconnected,
+`sys.boot_completed` returned `1`, the original kernel
+`5.4.289-qgki-32192773-abG990BXXSLIZH2` was present, the ADB shell remained
+unprivileged (`uid=2000(shell)`), and neither `/dev/ksu` nor `/proc/ksu` existed.
+No additional exploit run or flash was performed.
+
+This run confirms the candidate's earlier checkpoint finding: the intended
+order-3 block was not recognized as the selected base kmalloc-1k slab during
+these observations. It does not prove whether the block remained free, was
+reallocated to a different cache, or became a memcg child cache that the current
+gate cannot recognize. The run does not establish temporary root or KernelSU
+loading. Keep the acceptance gate unchanged; the next step is offline source
+work to identify actual memcg cache ownership and trace allocator reuse before
+considering another device attempt.
