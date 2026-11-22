@@ -794,12 +794,74 @@ Afterward, the RMG screen also reported that its Shizuku-based soft-restart
 action was rejected because Shizuku did not have root permission. No soft restart
 was triggered. The phone remained booted on
 `5.4.289-qgki-32192773-abG990BXXSLIZH2`; `sys.boot_completed=1` and the ADB
-shell was still `uid=2000(shell)`. The shell still could not find `/dev/ksu` or `/proc/ksu`,`nbut it could see
-`/sys/module/kernelsu` and `/data/adb/ksu`; the `rmgnext-helper` process was
-running as `root`. Thus KernelSU was loaded despite those two expected node names
-being absent. The RMG status and sysfs/module evidence agree; the missing
-`/dev/ksu` path remains a separate interface detail, not a failed load.
+shell was still `uid=2000(shell)`. The shell could not find `/dev/ksu` or
+`/proc/ksu`, but could see `/sys/module/kernelsu` and `/data/adb/ksu`; the
+`rmgnext-helper` process was running as `root`.
 
-No second exploit attempt or flash was performed. The standard supported
-artifact and manifest were not changed; this experimental candidate remains
-separate.
+### Follow-up: KernelSU control channel (2026-11-23)
+
+Read-only inspection of RMG's retained install history corrected the earlier
+interpretation above: the run proves that a module named `kernelsu` was loaded,
+but it did **not** prove that KernelSU's control interface was usable. The saved
+payload output says `late-load: KernelSU driver fd unavailable`, then reports
+that the helper printed no control report and that module-list inspection found
+`kernelsu`. RMG's own summary says its payload check failed and that the module
+load alone was counted. The control readings also report no KernelSU `su` through
+Shizuku. The separately printed `native probe yes` needs interpretation against
+the exact app build, because it did not turn this run into a verified control
+channel. Treat the app's “KernelSU active” screen as a module-presence indication
+for this run, not confirmation that `su` or `/dev/ksu` works.
+
+Source review now explains that reading: `NativeProbe.isKernelSuActive()` only
+checks whether `/sys/module/kernelsu` exists, then searches `/proc/modules` for
+`kernelsu`. It does not open the driver device or test an ioctl. Thus
+`native probe yes` is another module-presence signal, not independent evidence
+of a working control channel. The current uncommitted RMG Next changes remove
+the explicit `ModuleLoaded` proof, but still treat `ControlProof.NativeProbe`
+as sufficient; with this observed `native probe yes`, their new
+`LoadedWithoutControl` branch may still not be selected. This is a source-review
+finding only; those pre-existing changes were left untouched. Before relying on
+that fix, its control verdict must stop treating the native module-presence
+probe as a control proof.
+
+The app-private payload cache contains
+`files/payloads/Ryujin9610_Root-My-Galaxy-Payloads_r9q-g990b-lizh2--r9q-G990BXXSLIZH2/ksud-s25u-kdp`.
+Its SHA-256 is
+`1eae042ffbd70848af8ec3cad8b138b70cce14f8176b88dcb435224b4256ec77`, exactly
+the digest declared by the target's `kernelsu` entry in `support/targets-v3.json`
+and of the published `ksud-r9q-G990BXXSLIZH2-kdp-proc-fallback-candidate`
+artifact. Therefore the generic `ksud-s25u-kdp` staging filename does not
+indicate that the S25U daemon bytes were selected. RMG could not read back the
+installed `/data/adb/ksud` copy to compare its version, so equality of the
+installed copy with the staged candidate remains unverified.
+
+The selected artifact is an experimental variant, not the repository's
+documented hardware-proven pair. `kernelsu/README.md` describes
+`ksud-r9q-G990BXXSLIZH2-kdp` and
+`android16-5.4_kernelsu-r9q-G990BXXSLIZH2-kdp.ko` as the exact G990B pair that
+passed late-load, `/dev/ksu` control verification, and `su -c id`. That daemon
+is 4,844,920 bytes with SHA-256
+`bafc40f0166418ec7564578d9f181083b33db6ae9815095a3cf67eba7ba551e9`; the
+profile instead selected the 4,849,960-byte proc-fallback candidate. This is
+the clearest actionable discrepancy found so far. It does not prove why the
+candidate's driver fd was unavailable, and the repo's earlier hardware-test
+claim has not been independently repeated in this investigation. Do not swap
+artifacts into the already-loaded module on this boot; compare and validate the
+known-good pair offline, then consider a clean-boot controlled run only with
+separate approval.
+
+The local RMG Next source tree already contains uncommitted changes that add a
+`LoadedWithoutControl` result and prevent a module-list entry alone from being
+treated as a usable KernelSU control channel. These files were not changed as
+part of this investigation. The next useful step is to compare the experimental
+candidate against the documented hardware-proven G990B pair, especially module
+registration and daemon control-fd behavior, and to resolve what the native-probe
+result represents in the installed app build. Do not try another exploit or
+restart this still-successful boot until a concrete fix is ready and separately
+approved.
+
+No second exploit attempt or flash was performed. The drain-order exploit
+candidate remains separate from the supported exploit artifact. The active
+target manifest currently selects the experimental proc-fallback KernelSU
+service described above; return it to the documented hardware-proven pair only
+after verifying the pair against the current source/build metadata.
