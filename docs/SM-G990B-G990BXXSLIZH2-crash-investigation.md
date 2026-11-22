@@ -659,9 +659,21 @@ sizes and lifetime, but they do not prove that SLUB subsequently takes the
 specific released order-3 page. All eight candidate subpages still had zero
 slab-cache metadata in the live trace.
 
+After reboot, the unprivileged ADB shell could read `/proc/slabinfo`. The live
+`kmalloc-1k` row reported object size 1,024, 32 objects per slab, and 8 pages
+per slab; `mm_struct` reported 960-byte objects, 34 objects per slab, and 8
+pages per slab. This confirms that both the controlled `mm_struct` page group
+and the base `kmalloc-1k` slab geometry are order 3 on the running firmware.
+It validates `PIPE_OBJS_PER_SLAB=32`; a wrong 1 KiB slab order is not the
+explanation for the miss. The row reflects the global base cache after the
+attempt, not the app's then-current per-memcg cache.
+
 At the time of this follow-up, the phone exposed a cgroup v2 `memory`
 controller, but RMG Extended was not running, so its app-specific cgroup path
 and memcg cache ID could not be read. The kernel's page-fragment and pipe-array
 lifetime checks did not establish a different root cause. The remaining
-diagnostic needs to observe which cache and slab order actually receives the
-reclaim allocations, without relaxing the cache gate.
+diagnostic should snapshot the released page's metadata after the AF_UNIX skb
+is freed and during each 32-object reclaim batch. That will show whether the
+block stays free, is split/merged, or becomes a slab, and report the actual
+owning cache pointer without relaxing the cache gate. The app's memcg ID
+remains unknown until its process is running and its cgroup path can be read.
