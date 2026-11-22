@@ -1,0 +1,68 @@
+diff --git a/kernel/supercall/supercall.c b/kernel/supercall/supercall.c
+index 233b2be3..49c58579 100644
+--- a/kernel/supercall/supercall.c
++++ b/kernel/supercall/supercall.c
+@@ -5,6 +5,7 @@
+ #include <linux/fs.h>
+ #include <linux/kprobes.h>
+ #include <linux/miscdevice.h>
++#include <linux/proc_fs.h>
+ #include <linux/pid.h>
+ #include <linux/slab.h>
+ #include <linux/syscalls.h>
+@@ -48,6 +49,8 @@ static struct miscdevice legacy_ksu_device = {
+     .fops = &anon_ksu_fops,
+     .mode = 0666,
+ };
++static bool legacy_ksu_misc_registered;
++static struct proc_dir_entry *legacy_ksu_proc;
+ #endif
+ 
+ int ksu_install_fd(void)
+@@ -126,10 +129,17 @@ void __init ksu_supercalls_init(void)
+ 
+ #ifdef CONFIG_KSU_LEGACY_SELINUX
+     rc = misc_register(&legacy_ksu_device);
+-    if (rc)
++    if (rc) {
+         pr_err("legacy /dev/ksu registration failed: %d\n", rc);
+-    else
++        legacy_ksu_proc = proc_create("ksu", 0666, NULL, &anon_ksu_fops);
++        if (!legacy_ksu_proc)
++            pr_err("legacy /proc/ksu fallback registration failed\n");
++        else
++            pr_warn("legacy /proc/ksu fallback control interface registered\n");
++    } else {
++        legacy_ksu_misc_registered = true;
+         pr_info("legacy /dev/ksu control device registered\n");
++    }
+ #else
+     rc = register_kprobe(&reboot_kp);
+     if (rc) {
+@@ -143,7 +153,10 @@ void __init ksu_supercalls_init(void)
+ void __exit ksu_supercalls_exit(void)
+ {
+ #ifdef CONFIG_KSU_LEGACY_SELINUX
+-    misc_deregister(&legacy_ksu_device);
++    if (legacy_ksu_proc)
++        proc_remove(legacy_ksu_proc);
++    if (legacy_ksu_misc_registered)
++        misc_deregister(&legacy_ksu_device);
+ #else
+     unregister_kprobe(&reboot_kp);
+ #endif
+diff --git a/userspace/ksud/src/ksucalls.rs b/userspace/ksud/src/ksucalls.rs
+index b46335b5..489c1da1 100644
+--- a/userspace/ksud/src/ksucalls.rs
++++ b/userspace/ksud/src/ksucalls.rs
+@@ -46,6 +46,10 @@ fn init_driver_fd() -> Option<RawFd> {
+             const DEVICE: &[u8] = b"/dev/ksu\0";
+             fd = unsafe { libc::open(DEVICE.as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC) };
+         }
++        if fd < 0 {
++            const DEVICE: &[u8] = b"/proc/ksu\0";
++            fd = unsafe { libc::open(DEVICE.as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC) };
++        }
+         if fd >= 0 { Some(fd) } else { None }
+     } else {
+         fd
