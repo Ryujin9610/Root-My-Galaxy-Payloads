@@ -527,21 +527,20 @@ verified/staged before the run, but the exploit never acquired root, so this
 attempt provides no evidence about whether the helper can expose a working
 KernelSU control interface.
 
-#### Current untested pipe-source change
+#### Live cache-alias candidate
 
 The current local `port/pipe.c` modification reads the live
 `physvirt_offset` and `kimage_voffset`, derives the linear-map alias for
 `kmalloc_caches`, and accepts its cache table only when a full table read
 matches the canonical kernel-image mapping byte-for-byte. This is a useful
-fail-closed diagnostic candidate for the repeated cache-match failure. It is
-not the source used by the 22:06 phone run. It has since been built successfully, but has not yet been validated on-device. The table match alone also does not establish that the
-reclaimed page is the expected pipe-buffer slab; the per-page `struct page`
-cache metadata still needs to match the expected cache slot.
+fail-closed mapping diagnostic for the repeated cache-match failure. It was
+not the source used by the 22:06 phone run. The later single-run test below
+confirmed that the table mapping matches, but also showed that the candidate
+order-3 page was not recognized as the expected pipe-buffer slab. The live
+table match alone therefore did not establish physical read/write access.
 
-For the next phone attempt, use this artifact fingerprint and manifest entry, review the added mapping diagnostics and the exact page metadata gate, and use one attempt while capturing complete output. If a run is
-later authorized, use one attempt and capture the complete output. Do not infer
-anything about the proc-fallback helper unless root is actually acquired and
-the helper stage runs.
+The proc-fallback helper remains untested because root was not acquired and its
+helper stage never ran.
 
 The cache-table experiment was built with NDK r27b (12297006) on 2026-11-22.
 The output is a valid AArch64 Android 30 shared object, 135,784 bytes,
