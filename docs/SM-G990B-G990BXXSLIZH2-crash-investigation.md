@@ -926,3 +926,47 @@ whether the baseline service restores `/dev/ksu` control. The next work should
 focus offline on why the target order-3 pages are not reclaimed into the
 selected kmalloc-1k cache. Do not infer a KernelSU ABI regression from this
 run.
+
+### Offline allocator-source review (2026-11-23)
+
+The combined Samsung source tree at
+`/home/mick/src/sm-g990b-lizh2-osrc` contains the matching `fs/pipe.c`,
+`include/linux/mm_types.h`, `mm/slub.c`, and `mm/memcontrol.c`. It confirms the
+target's `STRUCT_SLAB_CACHE_OFF=0x18`: `struct page` places `slab_cache` at that
+offset. The target's `KMALLOC_PIPE_INDEX=10` is also consistent with the
+allocator input: `PIPE_DEF_BUFFERS` is 16, `sizeof(struct pipe_buffer)` is 40
+bytes on this 64-bit build, and `alloc_pipe_info()` allocates the 640-byte
+array with `kcalloc(..., GFP_KERNEL_ACCOUNT)`, which maps to the kmalloc-1k
+size class.
+
+There is a limitation in interpreting the cache diagnostic. The recovered
+config enables both `CONFIG_MEMCG_KMEM` and SLUB. In this kernel,
+`GFP_KERNEL_ACCOUNT` passes through `slab_pre_alloc_hook()`, which can switch a
+base kmalloc cache to a dynamically created per-memcg cache via
+`memcg_kmem_get_cache()`. Those clones are not entries in the static
+`kmalloc_caches` table. Therefore comparing `page->slab_cache` only with the
+static normal/reclaim cache pointers can label a valid accounted child cache
+as an unrecognized cache. This is a weakness in the diagnostic's wording and
+classification; it does not establish that this happened in the failed run.
+
+For the failed run specifically, the raw `page->slab_cache` value at offset
+`0x18` was zero on all eight 4 KiB subpages of each candidate order-3 block.
+The separate pipe-buffer scan also returned `found=0` in all three rounds.
+`pipe_reclaim_cache_gate()` is called only after that scan fails, to add
+diagnostic detail; it does not reject a pipe buffer that the scan found. The
+direct failure was therefore that none of the reclaim pipe arrays landed in
+the target block during those rounds. A dynamic child-cache pointer mismatch
+does not explain these zero-valued samples, though it could confuse future
+nonzero cache-owner reports. Retain the raw pointer and distinguish “no slab
+owner” from “slab owner not in the base cache table” in future analysis.
+
+This narrows offline work to the nondeterministic allocator/reclaim path. The
+cache-table alias and canonical snapshots agreed (`match=1`), the cache-class
+index and `struct page` offset match the source, and the exploit's oracle and
+KASLR probes succeeded. The earlier run using the identical exploit file found
+a pipe buffer on its first physrw round; the latest run did not find one in
+three rounds. Do not change the cache index or struct-page offset based on this
+failure. A useful next experiment would be a diagnostic-only change that
+records the actual cache-owner pointer/class for accounted pipe allocations
+and the point at which the released order-3 pages are reused, followed by a
+separately approved phone run.
