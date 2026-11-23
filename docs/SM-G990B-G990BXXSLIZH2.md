@@ -391,6 +391,16 @@ pipe-handoff stage and whether the normal install route establishes read state
 that this diagnostic skips. Do not run another attempt until a read-only
 preflight can return the expected byte count.
 
+The matching Samsung source provides a concrete lead. `ashmem_read_iter()`
+returns EOF immediately when `asma->size` is zero. `configfs_read_once()` opens
+a fresh ashmem handle for each sample, sets only its name, then calls `read()`;
+it does not set the ashmem size or create its backing file with `mmap()`. This
+is consistent with all the observed `read=0, errno=0` results if that handle
+still uses the ordinary ashmem read path. It is not yet proof that this is the
+runtime path, because the exploit may alter ashmem state elsewhere. Inspect
+the normal route's ashmem setup and the exact file-operation transition before
+changing the oracle or attempting another run.
+
 ## Exact artifacts
 
 | Artifact | Bytes | SHA-256 |
