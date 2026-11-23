@@ -976,7 +976,9 @@ separately approved phone run.
 The one-attempt page-identity payload completed successfully under record
 `21a453d1-a9f1-43f1-8524-d57844bda449`. The history records `done=1 root=1`,
 KASLR and physical read/write success, followed by a `kernelsu` module-list
-entry. The RMG screen reported “KernelSU active,” but the helper printed
+entry. The record also has `usedShizuku=true`, confirming this successful
+exploit run used Shizuku; Shizuku transport was not the failing stage. The RMG
+screen reported “KernelSU active,” but the helper printed
 `late-load: KernelSU driver fd unavailable`; the control readings explicitly
 said the native probe saw a module, Shizuku `su` did not work, and the helper
 printed no control report. The native probe checks only
