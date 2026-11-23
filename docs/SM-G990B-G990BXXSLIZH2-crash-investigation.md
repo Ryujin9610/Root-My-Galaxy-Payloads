@@ -1011,6 +1011,48 @@ clarified that this LKM root method survives a userspace soft reboot but not a
 full reboot, which starts a new kernel. The absent `kernelsu` module and device
 nodes after that full reboot are expected; they do not indicate that the
 same-boot load failed. RMG's separate boot-time reroot setting and outcome were
-not verified. RMG's saved local payload selection remains the one-off
-`rmg-page-identity-diagnostic.so`; restore the known drain-order payload before
-any future attempt.
+not verified. At that checkpoint RMG's saved local payload was the one-off
+`rmg-page-identity-diagnostic.so`; subsequent payload changes are recorded in
+the later follow-up entries below.
+
+### Follow-up: pipe reclaim/finder source cross-check (2026-11-23)
+
+Review of the current physrw-only source against the Samsung `vanilla` branch's
+`fs/pipe.c` found no sizing mismatch. The target requests 16 pages of pipe
+capacity, giving 16 `pipe_buffer` slots; its 64-bit buffer layout is 40 bytes,
+so the resized ring array is 640 bytes. Samsung's `pipe_set_size()` rounds the
+requested capacity to pages, allocates the new ring with `kcalloc(...,
+GFP_KERNEL_ACCOUNT)`, then frees the old ring. This is the expected accounted
+kmalloc-1k allocation. The target geometry also matches the live base-cache
+observation: 32 objects per order-3 slab, six drain slabs (192 pipes), and 24
+reclaim slabs (768 pipes). See the [Samsung `fs/pipe.c` implementation](https://github.com/Ryujin9610/android_kernel_samsung_sm8350/blob/vanilla/fs/pipe.c#L994-L1075).
+
+`find_pipe_buffer()` first requires the first word of a candidate structure to
+be a pointer in the target VMEMMAP range; only then does it inspect the ops,
+offset, flags, private field, and length. The last physrw-only checkpoint
+again reached `oracle-hit` and then `pipe-physrw-only-done` with `done=0`.
+Earlier full output for this same diagnostic reported zero VMEMMAP, ops, and
+length candidates, with the oracle marker still at the start of the captured
+page. Therefore the current failure is upstream of the struct-layout and ops
+checks: none of the reclaim pipe arrays was observed in the captured order-3
+block. The successful parent/child handoff also makes a lost pipe-array pointer
+less likely: the ring allocations are on inherited pipe objects and the parent
+scans that same candidate base.
+
+The broad `pipe_reclaim_snapshot()` schedule samples only selected allocation
+counts, not each 32-object cache-slab batch, and the final finder scan occurs
+after all pipe rings have been expanded. It cannot yet distinguish a block
+that stayed free from one split or assigned to another cache before the final
+scan. The next diagnostic should remain offline until designed: record the
+candidate pages' raw compound-head, `slab_cache`, and `page_type` fields
+immediately after the marked skb is freed and after each 32-ring allocation
+batch; preserve raw pointers so a dynamic memcg cache is not misclassified.
+Then inspect actual `pipe_buffer` contents after the parent writes one marker
+to each reclaim pipe. No cache gate should be relaxed based on the current
+evidence, and no further device attempt is justified by this source review
+alone.
+
+For the latest 19:50 run, RMG selected the imported
+`rmg-pipe-physrw-only.so` payload. It intentionally stops before root loading.
+Do not leave it selected for a normal install attempt; choose the intended
+published or separately validated payload before any future run.
