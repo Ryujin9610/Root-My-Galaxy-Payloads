@@ -445,6 +445,9 @@ shell user cannot read `/sys/fs/pstore` or `dmesg`, so the detailed panic trace
 is unavailable from the current ADB access. No further attempt should be made
 until this earlier collection-phase watchdog reset is reviewed offline.
 
+The offline review and a trace-enabled build prepared afterward are described
+below; neither provides a detailed panic trace or proves the watchdog cause.
+
 The route-timed build did not define `RMG_DIAG_CONTROLLED_MM`. In this source,
 the `CONTROLLED_RECLAIM` environment selects `prepare_controlled_kernel_page()`
 for the initial page setup; the collector's 240-second scan deadline and
@@ -461,9 +464,11 @@ The collector was then instrumented locally with a separate
 `RMG_DIAG_CONTROLLED_MM_TRACE` flag so tracing does not select the standalone
 mmcollect-only mode. Durable checkpoints now bracket collector passes, setup,
 child creation, child waits, and brute force. This diagnostic build uses a
-45-second child wait limit and a 90-second scan limit, both below the reported
-100-second watchdog interval. It compiled successfully with SHA-256
-`DED35C4F07633C9A68445CDC48DB4FC5767961A47DB1B377AFE50C08C1730F23`. It has
+45-second child wait limit and a 180-second scan limit. The longer scan limit
+allows for the 135-second page preparation observed in the successful route;
+durable pass and timeout markers now make a stalled stage visible. It compiled
+successfully with SHA-256
+`54F0CB0584FF2CCABD9D67FB6D00676AD30704684267574E8BC4FD31BF2538BC`. It has
 not been installed on the phone or run; source changes remain local.
 
 ## Exact artifacts
