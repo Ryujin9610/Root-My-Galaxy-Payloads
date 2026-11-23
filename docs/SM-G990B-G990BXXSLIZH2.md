@@ -732,3 +732,47 @@ The next narrow step is to inspect how slot 481's candidate buffer relates to
 the captured page and then add a separate, tightly bounded read-only check of
 the pipe's data path. Keep the physical read/write proof and KernelSU load
 disabled until a safe, verified primitive exists.
+
+### 2026-11-23 static review of the pipe read/write path
+
+The target's 40-byte `user_pipe_buffer` layout matches the Samsung 5.4
+`struct pipe_buffer` layout. The matching kernel source's `pipe_buf_can_merge()`
+checks whether `buf->ops` is exactly `anon_pipe_buf_ops`; it does not depend on
+a nonzero merge flag. The payload's `ops` pointer and zero flags therefore
+match this kernel's merge behavior. In `pipe_write()`, a small write appends
+when the buffer uses those ops and `offset + length` stays within the page.
+In `pipe_read()`, the kernel copies from `buf->page` at `buf->offset` and
+advances the buffer length and offset.
+
+`pipe_phys_read()` temporarily substitutes the target page and offset, sets
+the buffer length to the requested read size plus one, reads the requested
+bytes, and then restores the saved 40-byte buffer. Leaving one byte avoids
+the normal empty-buffer release path during that read. `pipe_phys_write()`
+temporarily sets the length to zero so a short write can merge at the target
+offset, then restores the saved buffer. The wrapper rejects reads or writes
+that cross a page boundary. These mechanics are consistent with the vendor
+pipe implementation, but a successful source-level path is not evidence that
+the 5.4 CFI-backed configfs writes, target-page conversion, and pipe operation
+all succeed together on the handset.
+
+The 20:35 run did not call `install_pipe_physrw()`: the
+`RMG_DIAG_PIPE_RECLAIM_TRACE` branch calls `run_pipe_reclaim_diagnostic()` and
+then returns through the deliberate failure path. Its `read_ok=0` and
+`write_ok=0` fields mean “not attempted,” not failed tests. The run therefore
+does not yet explain the absence of `/dev/ksu` in a production run.
+
+One remaining evidence gap is that the trace logs the first candidate fields
+and the first four words of the slab, but not `pipebuf_addr`, its offset within
+the 32-KiB slab, or a check that the candidate data page contains the marker
+from the selected live pipe. All pipes used the same `0x61` marker; the
+length `482` strongly identifies pipe 481, but does not independently prove
+that the candidate's `page` pointer belongs to that still-open pipe. A
+read-only follow-up can log the matched buffer address/alignment and compare a
+small sample at `page_to_direct(pb.page) + pb.offset` against a unique marker
+for pipe 481.
+
+The next physical read/write self-test is not read-only: it temporarily
+rewrites the selected `pipe_buffer` and writes test strings at
+`page_base + 0x7000` and `page_base + 0x7100`, then verifies them. Keep that
+step separate from the read-only correlation check; it has not been run in
+this investigation.
