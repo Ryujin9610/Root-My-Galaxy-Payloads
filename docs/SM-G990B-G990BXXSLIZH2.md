@@ -681,3 +681,54 @@ running as `uid=2000(shell)`, and no `/dev/ksu` or `/proc/ksu`. This repeat
 confirms the same current blocker: the oracle capture succeeds, but the
 captured page is not found as a usable pipe-buffer page by this finder path.
 It is not a physical-RW or root success.
+
+### 2026-11-23 pipe-buffer reclaim trace
+
+After the previous attempt's reboot, one bounded reclaim-trace build was
+imported into RMG and run through Shizuku. Its SHA-256 was
+`2D296F6D7362211480D1AC85EAB4AACF3AEFC0B9DA7308CA74A117E8B3CACA9B`; the
+app-private local payload had the same hash. RMG history record
+`36856fd2-871b-4f3f-bbc5-e77df06008a6` confirms the selected file
+`rmg-pipe-reclaim-trace.so`, the `r9q-G990BXXSLIZH2` profile, Shizuku
+transport, and source commit `e5913bc2a7c83826f29f3caf3d80b4813922e938`.
+
+The route passed the tracefs KASLR check (slide `0x118000`), controlled
+reclaim (34/34 objects; 251/256 sends), readiness COW, and the CFI callback
+probe (35-byte write and read). The new marker sweep checked the reclaimed
+pipe rings every 32 allocations. It found no match through 480 pipes; at 512
+and every later batch through 768, `find_pipe_buffer()` consistently matched
+slot 481. The observed buffer had page pointer `ffffffff04a32c80`, ops pointer
+`ffffffc0125b4078`, length 482, flags 0, and scan counters `1/1/1`. The
+length agrees with the diagnostic's marker write for pipe 481. This is the
+first direct evidence in these runs that the selected reclaimed page appears
+in a pipe buffer after enough reclaim-pipe allocations. The earlier “no valid
+pipe buffer found” conclusion applies to the prior finder run, not this trace.
+
+This was still only a reclaim/finder success. The build deliberately skipped
+the physical read/write proof and root installation. Its summary remained
+`done=0 root=0 read_ok=0 write_ok=0 rw64=0/0`; therefore it did not establish a
+usable arbitrary physical read/write primitive and did not load KernelSU.
+RMG showed its expected diagnostic failure at “Running kernel exploit” with
+code 255. The stability keeper reported that a dirty fops page remained held
+until reboot. The phone was rebooted after the logs were saved and returned
+with `sys.boot_completed=1`, the expected G990BXXSLIZH2 fingerprint and
+5.4.289 kernel, ADB `uid=2000(shell)`, and no `/dev/ksu` or `/proc/ksu`.
+
+The full RMG run record, durable checkpoint, and failure screenshot are saved
+in `build/diagnostic-pipe-reclaim-trace/`. Their SHA-256 values are:
+
+```text
+rmg-run-history.json
+FBA69C53D4E12978F9A4E11003E5EEF9DB1704FE2D32A153FC16D55A3542FD11
+
+rmg-pipe-oracle-checkpoint.log
+78AD52E386639EEB6E5ED9270DCBF189982160CE9500DC5830EE6018412E2630
+
+failure-screen.png
+3B82626FA8777B53B79E2728068DF2B74653D978432EEBDBEEB3DF3E102D55A8
+```
+
+The next narrow step is to inspect how slot 481's candidate buffer relates to
+the captured page and then add a separate, tightly bounded read-only check of
+the pipe's data path. Keep the physical read/write proof and KernelSU load
+disabled until a safe, verified primitive exists.
