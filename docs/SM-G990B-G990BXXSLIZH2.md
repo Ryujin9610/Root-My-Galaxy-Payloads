@@ -442,8 +442,7 @@ phase at `mmcollect-leak a=43`; it never reached `pipe-after-cfi-start`.
 ADB disconnected, then returned after a reboot. Android reported
 `kernel_panic,sobugarm_watchdog_timer_exhardd_100s` as the boot reason. The
 shell user cannot read `/sys/fs/pstore` or `dmesg`, so the detailed panic trace
-is unavailable from the current ADB access. No further attempt should be made
-until this earlier collection-phase watchdog reset is reviewed offline.
+was unavailable from ADB.
 
 The offline review and a trace-enabled build prepared afterward are described
 below; neither provides a detailed panic trace or proves the watchdog cause.
@@ -457,8 +456,7 @@ each unsuccessful scan. Thus the final `mmcollect-leak a=43 b=2` indicates a
 successful leak at scan attempt 43 with two groups observed; it does not locate
 the watchdog stall precisely. Missing timing data is an instrumentation gap,
 not proof of the panic cause. The trace-enabled bounded build described below
-addresses observability, but it has not been installed or run. Do not repeat
-the unbounded diagnostic.
+addresses observability. The subsequent traced run is recorded below.
 
 The collector was then instrumented locally with a separate
 `RMG_DIAG_CONTROLLED_MM_TRACE` flag so tracing does not select the standalone
@@ -468,8 +466,8 @@ child creation, child waits, and brute force. This diagnostic build uses a
 allows for the 135-second page preparation observed in the successful route;
 durable pass and timeout markers now make a stalled stage visible. It compiled
 successfully with SHA-256
-`54F0CB0584FF2CCABD9D67FB6D00676AD30704684267574E8BC4FD31BF2538BC`. It has
-not been installed on the phone or run; source changes remain local.
+`54F0CB0584FF2CCABD9D67FB6D00676AD30704684267574E8BC4FD31BF2538BC`. Its
+single normal-route run is recorded below; the source changes remain local.
 
 The matching kernel source does not contain the boot-reason label
 `sobugarm_watchdog_timer_exhardd_100s`, so its exact meaning cannot be mapped
@@ -478,8 +476,38 @@ from this tree. The target config enables the Qualcomm apps watchdog with a
 path separately panics after 40 missed sync checks at 10-second intervals
 (about 400 seconds). Neither source entry by itself explains the reported
 `exhardd_100s` label. Since shell access cannot read pstore or dmesg, the reset
-cause remains undetermined; the durable userspace checkpoints can only narrow
-down which collector phase was active.
+cause remains undetermined.
+
+### 2026-11-23 bounded collector trace run
+
+The trace build was installed through the RMG local payload override and run
+once through the normal install route with Shizuku. The CFI-friendly ashmem
+write and read each returned 35 bytes, and the durable log reached
+`pipe-after-cfi-start`. The pipe-page collector then reached its 180-second
+scan deadline at attempt 77 with 18 groups observed. The RMG output shows a
+best group of 16/34 objects; the scan ended without a complete group, and the
+pipe child reported `controlled pipe mm group collection failed`. It never
+reached the pipe oracle, physical read/write, or root installation. The run
+returned status 255 without another watchdog reset.
+
+The trace contains `child-reaped` and `bruteforce-done` markers through attempt
+76, including the attempt range where the previous run stopped logging at 43.
+That makes a deterministic hang at attempt 43 less likely, though it does not
+explain the earlier watchdog reboot. The current evidence points to a
+stochastic collector shortfall: this pipe-preparation scan did not collect all
+34 objects from one order-3 page before its time limit. The collector's
+`CONTROLLED_RECLAIM_SCAN_MAX` is 192 attempts, while this run stopped at 77 on
+time. Consider a longer bounded scan only after reviewing its impact on the
+15-minute RMG run budget; do not repeat the unbounded variant.
+
+The checkpoint log is preserved locally at
+`build/diagnostic-pipe-after-cfi-traced/rmg-pipe-oracle-checkpoint-run-93353a1.log`
+with SHA-256
+`8225A234BC6DD02ABEED20533FE53611EAE39FB5161B9B40331DAE043C98FF89`. The
+RMG run record is saved beside it as
+`rmg-run-record-b1384848-f572-4a33-8724-77639cc83f63.json`. After the run, the
+phone was rebooted to clear the temporary ashmem file-operation state. Its
+current boot reason is `reboot,shell`, and `/dev/ksu` remains absent.
 
 ## Exact artifacts
 
