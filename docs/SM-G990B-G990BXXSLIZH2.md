@@ -862,3 +862,32 @@ The separate full-fill proof-only build is under
 `build/diagnostic-pipe-physrw-proof/`; its run record is
 `rmg-run-history.json` (SHA-256
 `A43B8CEADF03298E37A91482AC6B132F320E4AE94BE5FAA5ACA41275BE27D7F7`).
+
+### 2026-11-23 comparison of the successful and missed reclaim runs
+
+Comparing the saved logs shows that the successful correlation was a
+different allocator outcome, not a different firmware profile. All three
+runs report the same physical offset, kernel physical load, and slide-logger
+address. The successful run found the target slab at
+`ffffff8027538000`; its first page metadata identified cache
+`ffffff8000897600`, and the first pipe-buffer record plus its unique payload
+marker both matched. The proof-only miss instead used candidate base
+`ffffff8002758000`; its cache diagnostic reported `matched=0`, and the slab
+scan counters remained zero. The combined correlation/proof miss used
+`ffffff814f010000`; scans again found no candidate, and the first four words
+were repeatedly `335245444c4f4846` (little-endian bytes `FHOLDER3`).
+
+This evidence points to the controlled order-3 page not being reclaimed into
+the expected pipe-object slab on the two failed runs. It does not yet identify
+why the allocator stopped reusing that page; the successful one-run correlation
+still proves that the path can work under at least one allocation layout. The
+different KASLR slides are expected run-to-run variation and do not explain
+the missing slab-cache match by themselves. The proof remains correctly gated:
+neither miss wrote to the scratch addresses or attempted KernelSU installation.
+
+Next, keep the work read-only and compare the controlled page’s allocator
+identity and reclaim progress at each batch boundary. A future proof run
+should remain disabled unless the page metadata confirms the expected pipe
+cache and the unique marker correlates to the selected live pipe. Do not treat
+the repeated `FHOLDER3` word as a valid pipe buffer or bypass the correlation
+gate.
