@@ -776,3 +776,44 @@ rewrites the selected `pipe_buffer` and writes test strings at
 `page_base + 0x7000` and `page_base + 0x7100`, then verifies them. Keep that
 step separate from the read-only correlation check; it has not been run in
 this investigation.
+
+### 2026-11-23 unique pipe marker correlation
+
+A new build writes a unique 64-bit marker at the start of each reclaim pipe's
+data and compares the candidate page against the marker for the pipe selected
+by `find_pipe_buffer()`. At 32-pipe allocation intervals, the finder returned
+no candidate through 704 pipes. At 736 pipes it found slot 711 (the 712th
+pipe): the buffer was at slab offset 0 and object offset 0, had page
+`ffffffff03e2f480`, ops `ffffffc0124d4078`, length 712 and flags 0. The payload
+read eight bytes through its existing kernel-read primitive at the converted
+data-page address `ffffff8100bd2000`; the observed marker
+`524d4750000002c8` equalled the expected marker for pipe 711. The trace ended
+at this positive correlation and deliberately skipped the physical read/write
+proof and root installation. This closes the earlier gap: the matched live
+pipe's data page was observed to contain its own unique marker.
+
+The RMG run still ended with its expected diagnostic failure (exit 255),
+because this payload does not proceed to installation. `done=0`, `root=0`,
+`read_ok=0`, and `write_ok=0` mean that the read/write proof was not attempted;
+they do not mean it failed. KernelSU remained unloaded, and the handset had no
+`/dev/ksu` or `/proc/ksu`. The stability keeper reported that reboot was needed;
+after reboot the phone returned with `sys.boot_completed=1`, the expected
+firmware fingerprint and kernel, ADB uid 2000, and neither KSU path present.
+
+The build is `build/diagnostic-pipe-reclaim-correlation/cve-2026-43499-app.so`
+(146,952 bytes, SHA-256
+`EE694C625BA96ABB63EFA1C22894704A285C3E217811E4479E996EFE8F6859F0`). The
+RMG run ID is `8a6ff429-a06a-4d65-a50a-febdd189f10d`. Its run record and
+checkpoint are saved beside the build artifact; SHA-256 values:
+
+```text
+rmg-run-history.json
+5596C85D9475FBB136404748263FFD420D3E025240F440662E293633008B326D
+
+rmg-pipe-oracle-checkpoint.log
+4C7CDF71C7A6C72F46A6317FC6F76B5F4E4D90FC18685545BB5EF9DDA6ACDA90
+```
+
+This correlation is evidence for the candidate buffer-to-pipe data association,
+not evidence that arbitrary physical reads or writes work. Keep the
+`install_pipe_physrw()` proof and KernelSU load as separate future steps.
