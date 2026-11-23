@@ -365,6 +365,32 @@ the exploit child enters `run_exploit()`. It is not installed or run. Do not
 repeat the test until the unexplained reboot and missing run record are
 understood.
 
+### 2026-11-23 install-flow oracle run
+
+The prior `Test this phone` page was not the normal install route: it left the
+RMG run history and `attempted_payload.xml` unchanged. The correct route is
+Home → `Tap to install KernelSU` → the exact
+`Galaxy S21 FE 5G (SM-G990B) | Kernel 5.4.289` profile → Confirm. This run used
+that route, Shizuku, and the constructor-checkpoint payload
+`rmg-pipe-oracle-durable-v2.so`; the app-private active file matched its
+SHA-256 `835EAF459D3E0DF5201C8DE5A88BAE87B2F5FE84819E1C8D2ACB4D3C3C55F1FE`.
+
+The durable log confirms payload entry, KASLR discovery, and controlled
+collection. It collected 34 objects for `ffffff80c0fc0000` at outer attempt
+71, then released the order-3 group and began the oracle. Across all 512 probes,
+both endpoint reads returned `0` bytes with `errno=0` (1,024 failed reads),
+with no marker matches. RMG saved a failed run at `Running kernel exploit`;
+the phone remained booted and connected. No FOPS/root stage ran, and
+`/dev/ksu` and `/proc/ksu` remain absent.
+
+This evidence does not show whether the marker was present in the target page:
+the read oracle returned EOF for every sample. The durable checkpoint proves
+the correct payload did run. The next offline investigation should determine
+why `kernel_read_data()`/`configfs_read_once()` returns EOF in this early
+pipe-handoff stage and whether the normal install route establishes read state
+that this diagnostic skips. Do not run another attempt until a read-only
+preflight can return the expected byte count.
+
 ## Exact artifacts
 
 | Artifact | Bytes | SHA-256 |
