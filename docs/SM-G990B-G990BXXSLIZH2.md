@@ -246,6 +246,38 @@ was made on this boot. The next diagnostic should inspect why the second
 controlled mm-group collector cannot obtain its 34 objects and why its child
 does not return a base; do not repeat the reclaim attempt on the same boot.
 
+### Source-level follow-up
+
+The target collector in `port/util.c` retains leaked mm objects until it has
+all 34 slots from one order-3 page. It can scan up to 192 candidates, and it
+logs a group only when its count reaches 1, a multiple of 8, or 34. Thus the
+last observed `1/34` line does not identify whether later candidates were
+misses, duplicate slots, or slow KernelSnitch scans. The detailed
+`mmcollect stage=...` logging present in the local source is guarded by
+`RMG_DIAG_CONTROLLED_MM`; that instrumentation was not present in the captured
+run log.
+
+There is also a separate handoff ambiguity. If collection simply returns
+failure, `prepare_controlled_pipe_buffer_page_child()` returns base zero and
+the forked pipe-page child should still write the full pointer-sized zero to
+its parent. The parent instead logged that it did not receive a full base.
+The current single `read()` does not log its byte count or `errno`, and the
+child does not log its exit status at that boundary. So scan exhaustion alone
+does not explain both messages; a child exit or short/interrupted IPC read is
+also possible. The available unprivileged ADB session cannot read the kernel
+log (`dmesg` is permission denied), so an OOM or signal cause is unconfirmed.
+
+The working tree already has an opt-in `RMG_DIAG_CONTROLLED_MM` mode that
+runs after KASLR discovery, gathers only the mm slab, reports per-stage
+timings/child-wait heartbeats, and returns before FOPS or root stages. A
+diagnostic build can enable it with
+`TARGET_CFLAGS=-DRMG_DIAG_CONTROLLED_MM=1`; this has not been built or run on
+the phone. Before any new device run, make the result-pipe read retry on
+`EINTR`/short reads and log the final byte count, `errno`, returned pointer,
+and child wait status so collector failure and child handoff failure are
+distinguishable. Keep the diagnostic one-shot and do not run another reclaim
+on the current boot.
+
 ## Exact artifacts
 
 | Artifact | Bytes | SHA-256 |
