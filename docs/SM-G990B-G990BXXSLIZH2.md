@@ -48,6 +48,28 @@ uid=0(root) gid=0(root) groups=0(root) context=u:r:kernel:s0
   unsupported because its native client only scans inherited driver FDs; the
   Root My Galaxy app detects the live LKM through `/proc/modules`.
 
+## 2026-11-23 allocator diagnostic retest
+
+One isolated diagnostic build added sparse `slab_cache` and page-type samples
+at pipe-growth counts 128, 256, 384, 512, and 640. It did not change the
+reclaim order, target offsets, supported artifact, or manifest. The local
+diagnostic payload SHA-256 was
+`92a27b6360253823d536a6cb272d633228ead4d2e4001c56d435df257df7478e`.
+
+On the matching Android 16 build and kernel, RMG selected the exact
+`r9q-G990BXXSLIZH2` profile, verified the existing KernelSU service, and ran
+exactly one exploit attempt. KASLR detection succeeded. The log then showed
+controlled mm-group attempts 1 and 8 for the same base page, but no later
+progress before RMG's 900-second timeout. The helper was terminated with
+signal 9 and RMG reported exit code 255 at `Running kernel exploit`. No
+pipe-growth snapshot lines reached the app log, so this run does not establish
+whether the sampled cache ownership changed; it points to a stall before
+observable pipe-growth diagnostics.
+
+After a clean reboot, the phone returned to the expected firmware and kernel,
+ADB remained uid 2000, and neither `/dev/ksu` nor `/proc/ksu` existed. KernelSU
+was not loaded. This was one diagnostic attempt only; no retry was made.
+
 ## Exact artifacts
 
 | Artifact | Bytes | SHA-256 |
