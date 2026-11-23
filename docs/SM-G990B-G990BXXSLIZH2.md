@@ -169,6 +169,47 @@ whether the tracked direct-map page continues to be the intended page during
 reclaim and how its compound-head metadata changes as the allocator splits or
 reuses it.
 
+## 2026-11-23 page-identity diagnostic and successful RMG run
+
+A one-attempt build added direct-map page identity and `struct page` ownership
+snapshots to the pipe reclaim diagnostic. It watched the same order-3 direct-map
+page (`ffffff814dcf8000`, PFN `0x14dcf8`) through allocation counts 128, 192,
+193, 256, 384, 512, 640, and 768. Its vmemmap metadata address remained
+`ffffffff05173e00` throughout, so the observations refer to one page rather
+than a changed candidate.
+
+At counts through 512, the head's `slab_cache` field was zero and `page_type`
+was `0xffffff7f`. By count 640, the same page showed the freed-object marker
+`dead000000000100`, the expected kmalloc-1k cache pointer
+`ffffff8000897600`, and `page_type=0xffffffff`; the eight subpages also pointed
+back to the same compound head and showed that cache pointer. The transition
+therefore occurred between the 512 and 640 allocation snapshots. At 768, the
+ownership state remained consistent.
+
+With this page-identity evidence, the pipe-buffer scan found its marker at
+`ffffff814dcf8000`, index 601 (`scan=1/1/1`). The run reported successful
+physical read/write, KASLR recovery, and credential transition
+`uid=2000->0`. RMG recorded one successful attempt, a 5 min 36 s root time, and
+displayed “KernelSU active” with the app-side check successful. The run used
+profile `r9q-G990BXXSLIZH2`, payload source commit
+`ca9cae33ef85f3ec042d266a20db672221073c7a`, and a diagnostic app payload with
+SHA-256
+`c8872ae6b3c68a75d721c165a83280069187dab867c283650a9b5d18ec2a55b7`.
+
+There is a remaining verification gap: the run log said the KernelSU driver
+file descriptor was unavailable and that KernelSU was staged for the next
+boot. RMG's attempted userspace soft restart was rejected because Shizuku did
+not have root. A read-only ADB check after the run confirmed
+`sys.boot_completed=1`, but the shell remained uid 2000 and could not find
+`/dev/ksu` or `/proc/ksu`. Thus the exploit's root result and RMG's success
+screen are confirmed, while persistent KernelSU availability through its
+device node is not confirmed by the post-run shell check. No further exploit
+attempt or reboot was performed after this run.
+
+The one-off diagnostic payload and its build outputs are retained locally under
+`build/diagnostic-page-identity/`; the success-screen capture is
+`build/diagnostic-page-identity/rmg-page-identity-success.png`.
+
 ## Exact artifacts
 
 | Artifact | Bytes | SHA-256 |
