@@ -297,9 +297,29 @@ order-3 page or matching its marker in the AF_UNIX probe. This diagnostic
 calls pipe preparation immediately after KASLR discovery, so its allocator
 history differs from the normal route, which reaches pipe preparation later.
 The next local build adds sampled first/last-page read values, read-error
-counts, and an `oracle-miss` page-metadata snapshot. It has not been installed
-or run. A further controlled reclaim requires another fresh boot; no retry
-was made on this boot.
+counts, and an `oracle-miss` page-metadata snapshot. It was imported into RMG,
+but the follow-up run below used the prior payload, so the new oracle
+measurements remain untested. A further controlled reclaim requires another
+fresh boot; no retry was made after the follow-up panic.
+
+### 2026-11-23 follow-up run and payload-selection mismatch
+
+The phone was freshly rebooted before one further authorized attempt. RMG
+Settings showed `rmg-pipe-oracle-diagnostic.so` after importing it from
+Downloads, but the resulting run record says it used
+`rmg-pipe-handoff-diagnostic.so`. The saved log contains the earlier
+`pipe order-3 oracle missed target after 512 probes` result and does not contain
+the new oracle sample or page-metadata diagnostics. Treat this attempt as
+another handoff-diagnostic run; it does not test the new oracle build. The
+reason RMG selected the prior local file is undetermined.
+
+The collector again reached 34 objects for `ffffff8094118000`, then the run
+failed at the order-3 pipe-page oracle. The phone disconnected from ADB during
+the attempt and returned after a kernel panic reboot (`ro.boot.bootreason`:
+`kernel_panic,bug`). After boot, `/dev/ksu` and `/proc/ksu` were absent, and
+KernelSU was not loaded. No second attempt was made. Before any further test,
+verify the payload filename in the run log matches the intended oracle build;
+do not infer results for the new oracle diagnostics from this run.
 
 ## Exact artifacts
 
