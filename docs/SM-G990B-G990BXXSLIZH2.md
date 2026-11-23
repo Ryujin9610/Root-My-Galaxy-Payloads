@@ -341,6 +341,30 @@ payload-stage or oracle diagnostics could be recovered. The panic therefore
 does not establish whether this corrected payload reached the oracle. No
 further attempt was made.
 
+### 2026-11-23 durable-checkpoint attempt
+
+A benign self-check built from the same checkpoint writer ran as Android's
+`shell` user (`uid=2000`) and exited successfully. It created
+`/data/local/tmp/rmg-pipe-oracle-checkpoint.log`, wrote three expected records,
+and returned no write or `fdatasync` error. The self-check executable was
+removed afterward.
+
+The durable oracle payload was imported in RMG and its active
+`local-exploit.so` SHA-256 matched the build:
+`F178528AC2E47AC17D38D78E3DB41B57093C5E97746F50BF6EB2BB49BCCFDBD0`. One RMG
+test was started while the app showed Shizuku running. ADB then disconnected
+and returned after reboot. The checkpoint file remained unchanged at the
+self-check's three records, and RMG history still showed 45 runs. The reboot
+therefore yielded no evidence that the payload reached its exploit entry or
+the oracle; no new run record was saved. After reboot, Shizuku was stopped and
+`/dev/ksu` and `/proc/ksu` were absent.
+
+The next local build moves the checkpoint reset to the preload constructor and
+adds markers before/after the boot-quiet wait, at supervisor setup, and before
+the exploit child enters `run_exploit()`. It is not installed or run. Do not
+repeat the test until the unexplained reboot and missing run record are
+understood.
+
 ## Exact artifacts
 
 | Artifact | Bytes | SHA-256 |
