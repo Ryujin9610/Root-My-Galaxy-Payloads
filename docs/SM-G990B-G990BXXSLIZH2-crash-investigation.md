@@ -887,3 +887,29 @@ verify the cached daemon digest is the baseline
 `bafc40f0166418ec7564578d9f181083b33db6ae9815095a3cf67eba7ba551e9` before
 launching it. The remote manifest change alone did not replace the app's cached
 payload.
+
+### Follow-up: single baseline-service attempt (2026-11-23)
+
+After the user authorized one controlled run, RMG's source check reported the
+branch at `fa19259be4fbf5bf3b112049bc00b6c891ce3cba` and matched the phone to
+`r9q-G990BXXSLIZH2`. The run used the already-imported drain-order exploit,
+whose on-device SHA-256 remained
+`4d97a75d1201ed085c60a9fe78aa33b99837532ebe6a383b94d4c87e4850af73`. RMG
+downloaded and verified the KernelSU daemon before starting the exploit; the
+updated app cache SHA-256 was the documented baseline
+`bafc40f0166418ec7564578d9f181083b33db6ae9815095a3cf67eba7ba551e9`.
+
+The supervisor recorded exactly one attempt (`attempts=1`,
+`exploit attempt=1/1`). KASLR discovery and readiness COW succeeded, but all
+three pipe-physrw rounds failed to identify the candidate order-3 page as the
+selected kmalloc-1k slab (`cache gate=0`); the pipe scan found no candidate
+buffer. The final payload summary was `done=0 root=0`, `read_ok=0`, and
+`write_ok=0`. RMG reported failure at the exploit stage with exit code 255. It
+did not load KernelSU or obtain root.
+
+The exploit's stability keeper reported that it was retaining a dirty fops page
+and that a reboot was required. The user had authorized rebooting, so the phone
+was rebooted once after the failed attempt. It returned to the same expected
+Android 16 fingerprint and 5.4.289 kernel; `/proc/modules` no longer lists
+`kernelsu`, `/dev/ksu` and `/proc/ksu` are absent, and ADB is `uid=2000(shell)`.
+No second exploit attempt was made.
