@@ -150,6 +150,25 @@ was loaded. The device rebooted successfully and returned to the expected
 firmware and kernel; `/dev/ksu` and `/proc/ksu` remain absent. No additional
 exploit attempt was made after this diagnostic.
 
+## 2026-11-23 kernel source layout check
+
+The completed Samsung source archive contains the full `SM-G990B_16_Opensource.zip`
+tree plus a separate `G990BXXSLIZH2` update archive. The update README says to
+apply its files to the `G990BXXUGIYJ1` base source. The base tree includes
+`include/linux/mm_types.h`; the SLIZH2 update contains 35 files and does not
+replace that header.
+
+The base `r9q_eur_openx_defconfig` and the repository's saved SLIZH2 config
+both set `CONFIG_ARM64`, `CONFIG_64BIT`, `CONFIG_MEMCG`, and `CONFIG_SLUB`.
+The base `struct page` layout places `slab_cache` at `+0x18` and `page_type`
+at `+0x30`; with this configuration, `struct page` is 0x40 bytes and the
+compound-head word is at `+0x08`. These values match the target constants in
+`target.h`, so the pipe-growth diagnostic's zero `slab_cache` readings are
+not explained by an incorrect field offset. The remaining uncertainty is
+whether the tracked direct-map page continues to be the intended page during
+reclaim and how its compound-head metadata changes as the allocator splits or
+reuses it.
+
 ## Exact artifacts
 
 | Artifact | Bytes | SHA-256 |
