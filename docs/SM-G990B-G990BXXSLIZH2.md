@@ -456,9 +456,9 @@ Durable checkpoints do record successful leak results, but not the duration of
 each unsuccessful scan. Thus the final `mmcollect-leak a=43 b=2` indicates a
 successful leak at scan attempt 43 with two groups observed; it does not locate
 the watchdog stall precisely. Missing timing data is an instrumentation gap,
-not proof of the panic cause. Before any later phone run, review the collector
-and add bounded heartbeat/timing checkpoints to a build that preserves its
-scan deadline; do not repeat the current unbounded diagnostic.
+not proof of the panic cause. The trace-enabled bounded build described below
+addresses observability, but it has not been installed or run. Do not repeat
+the unbounded diagnostic.
 
 The collector was then instrumented locally with a separate
 `RMG_DIAG_CONTROLLED_MM_TRACE` flag so tracing does not select the standalone
@@ -470,6 +470,16 @@ durable pass and timeout markers now make a stalled stage visible. It compiled
 successfully with SHA-256
 `54F0CB0584FF2CCABD9D67FB6D00676AD30704684267574E8BC4FD31BF2538BC`. It has
 not been installed on the phone or run; source changes remain local.
+
+The matching kernel source does not contain the boot-reason label
+`sobugarm_watchdog_timer_exhardd_100s`, so its exact meaning cannot be mapped
+from this tree. The target config enables the Qualcomm apps watchdog with a
+14,000 ms bark time and a 9,360 ms pet interval. Samsung's `sec_debug_pwdt`
+path separately panics after 40 missed sync checks at 10-second intervals
+(about 400 seconds). Neither source entry by itself explains the reported
+`exhardd_100s` label. Since shell access cannot read pstore or dmesg, the reset
+cause remains undetermined; the durable userspace checkpoints can only narrow
+down which collector phase was active.
 
 ## Exact artifacts
 
