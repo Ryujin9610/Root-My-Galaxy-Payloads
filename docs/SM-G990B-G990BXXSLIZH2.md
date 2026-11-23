@@ -584,3 +584,40 @@ kernelsu/patches/KernelSU-v3.2.5-r9q-5.4.patch
 
 Force-reboot before every GhostLock attempt. Never run a second controlled
 reclaim on the same boot, even after a clean return.
+
+### 2026-11-23 extended route-timed pipe diagnostic
+
+After a fresh reboot, the trace-enabled build was rebuilt with the controlled
+collector scan deadline increased from 180 to 360 seconds; the per-child
+timeout remained 45 seconds. The binary SHA-256 was
+`25BD41CF9F89AEA03A7AFC6681FA1C583B52D116AEB11C5E21F4DEE4BD3FF194`. RMG
+Settings showed `rmg-pipe-after-cfi-traced-360s.so`, and the installed
+`files/local-payload/local-exploit.so` had the same SHA-256 before the run.
+The RMG install-history record confirms the exact
+`r9q-G990BXXSLIZH2` profile, the `r9q-g990b-lizh2` source, Shizuku transport,
+and the selected local payload.
+
+The normal install route passed support/download checks and the exploit
+reached KASLR discovery and the CFI-friendly ashmem callback. The controlled
+collector completed an order-3 page of 34/34 objects at attempt 73, then the
+pipe oracle matched probe 0. Both 64-byte endpoint reads matched the expected
+marker across all eight checked words. The captured skb drained successfully,
+and the reclaim snapshot reported slab count `54 -> 53`.
+
+The diagnostic then stopped at its intended boundary. It did not execute
+physical read/write or root installation; the RMG record reports
+`done=0 root=0 read_ok=0 write_ok=0`, and RMG displayed exit status 255 at
+“Running kernel exploit” because this diagnostic branch returns through its
+failure path after recording the result. This status is therefore not a
+failed pipe-oracle result, nor evidence that KernelSU loaded. The KernelSU
+service was prepared by RMG, but the driver was not loaded; after reboot,
+`/dev/ksu` and `/proc/ksu` were absent.
+
+The log also reports a stability keeper retaining the dirty fops page and
+explicitly requires reboot. The phone was rebooted after evidence collection;
+it returned with `sys.boot_completed=1` and boot reason `reboot,shell`, with no
+watchdog or kernel-panic reset. The durable checkpoint and RMG run record were
+saved under the local build output directory for this diagnostic. The next
+investigation should inspect why the controlled pipe reclaim check passes but
+the production physical read/write stage has not yet been exercised; do not
+interpret this diagnostic as a successful root attempt.
