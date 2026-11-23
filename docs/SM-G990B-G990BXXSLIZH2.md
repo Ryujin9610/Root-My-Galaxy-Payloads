@@ -891,3 +891,21 @@ should remain disabled unless the page metadata confirms the expected pipe
 cache and the unique marker correlates to the selected live pipe. Do not treat
 the repeated `FHOLDER3` word as a valid pipe buffer or bypass the correlation
 gate.
+
+The marker can now be identified more precisely. The source defines
+`PIPE_ORDER3_MAGIC` as `0x335245444c4f4847`; probe zero XORs it with one, giving
+`0x335245444c4f4846`, whose little-endian bytes are `FHOLDER3`. Each run logs
+`pipe order-3 oracle captured probe=0`, so the repeated first word in the two
+miss runs is the expected residue of the captured socket-buffer page after
+the skb was drained and freed. It remained intact after 768 reclaim-pipe
+allocations. Together with the zero slab-cache identity, this is stronger
+evidence that the freed order-3 page was not reused by the pipe-object cache;
+the failure is upstream of `find_pipe_buffer()`.
+
+The global controlled-mm slab count still decreased from 54 to 53 in all
+three runs, including the misses. That confirms the collector discarded a
+controlled slab, but does not prove that the exact captured order-3 page was
+reallocated to pipe objects. The next implementation check should make this
+page-specific reclaim condition an explicit gate and improve cache shaping or
+reclaim ordering only after studying the allocator behavior. Retrying the same
+scan, or loosening the buffer matcher, would not address this evidence.
