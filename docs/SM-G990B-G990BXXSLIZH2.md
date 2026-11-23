@@ -817,3 +817,48 @@ rmg-pipe-oracle-checkpoint.log
 This correlation is evidence for the candidate buffer-to-pipe data association,
 not evidence that arbitrary physical reads or writes work. Keep the
 `install_pipe_physrw()` proof and KernelSU load as separate future steps.
+
+### 2026-11-23 physical read/write proof attempts
+
+The first proof-only build followed the normal finder path: it filled all 768
+reclaim pipes and then searched once. `find_pipe_buffer()` returned no match,
+with counters `0/0/0`; the cache diagnostic also found no matching page. The
+proof routine returned before writing either scratch address, so its
+`read_ok=0` and `write_ok=0` mean not attempted. This run ID was
+`f4bb17d3-c91f-4cf1-b719-d006f30c4074`.
+
+A second build used the previously successful unique-marker correlation
+diagnostic and was changed to run the scratch proof immediately after a
+positive marker match. This time the finder found no candidate at any
+32-pipe checkpoint, through 768 pipes. Each scan reported zero candidate,
+ops, and length counters; the first four slab words repeatedly read
+`335245444c4f4846`. Because marker correlation failed, the proof remained
+gated off and neither the scratch seed nor the physical read/write checks ran.
+The run ID was `842745ab-307d-4d15-9313-22552684fcb4`.
+
+Both runs ended before root installation. The handset was rebooted after the
+second stability-keeper warning and returned with the expected firmware and
+kernel, shell uid 2000, and no `/dev/ksu` or `/proc/ksu`. The earlier successful
+correlation remains valid evidence for that run, but repeatability is not yet
+established. Next investigate why the candidate slab sometimes contains no
+recognizable pipe buffer, especially the `FHOLDER3`-like repeated word, before
+another proof attempt.
+
+Artifacts for the combined correlation/proof build are under
+`build/diagnostic-pipe-correlated-physrw/`:
+
+```text
+cve-2026-43499-app.so
+SHA-256 2D1B1C552B99F1EA37C2052008273447F411C79AFAE76FA81E3FFCBA4D85314E
+
+rmg-run-history.json
+SHA-256 26A264651BDE6796F05C929BE50B16C113B9E41B5B4BC7C7509D2522035FB285
+
+rmg-pipe-oracle-checkpoint.log
+SHA-256 BE140EFFDC57620E8A3B1B6E7CC42513EA396422CBC0F64EAC1A5D52E4124363
+```
+
+The separate full-fill proof-only build is under
+`build/diagnostic-pipe-physrw-proof/`; its run record is
+`rmg-run-history.json` (SHA-256
+`A43B8CEADF03298E37A91482AC6B132F320E4AE94BE5FAA5ACA41275BE27D7F7`).
