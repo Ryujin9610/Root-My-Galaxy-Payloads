@@ -217,6 +217,35 @@ The one-off diagnostic payload and its build outputs are retained locally under
 `build/diagnostic-page-identity/`; the success-screen capture is
 `build/diagnostic-page-identity/rmg-page-identity-success.png`.
 
+## 2026-11-23 follow-up single-attempt diagnostic
+
+After a full reboot, RMG `0.13+local.af081c2` was installed in place and run
+once using Shizuku, the exact `r9q-G990BXXSLIZH2` profile, and the same local
+page-identity diagnostic payload (SHA-256
+`c8872ae6b3c68a75d721c165a83280069187dab867c283650a9b5d18ec2a55b7`). The
+phone identified as `SM-G990B` on Android 16 build
+`G990BXXSLIZH2`, kernel
+`5.4.289-qgki-32192773-abG990BXXSLIZH2`.
+
+The exploit recovered the KASLR slide from tracefs and reached the pipe-based
+physical-memory path. The overlay diagnostic reported `cfi write ret=35` and
+`cfi read ret=35`, then started `pipe physrw`. It seeded 128 order-3 pages,
+but the next controlled mm-group collection stopped at `1/34` and returned
+`controlled pipe mm group collection failed`; the pipe-page child did not
+report a base address. The one independent exploit attempt exited with status
+255 after about 14 minutes. No physical read/write, credential transition,
+root handoff, or KernelSU load was reached. In particular, the added late-load
+`SYS_reboot` and `/dev/ksu` errno diagnostics did not execute because the
+exploit failed before the root helper stage.
+
+After failure, the phone remained booted (`sys.boot_completed=1`) and ADB
+connected. A read-only check found neither `/dev/ksu` nor `/proc/ksu`, and no
+`ksu` entry in `/proc/modules`. This is consistent with the failure occurring
+before KernelSU loading; it does not test the late-load handoff path. No retry
+was made on this boot. The next diagnostic should inspect why the second
+controlled mm-group collector cannot obtain its 34 objects and why its child
+does not return a base; do not repeat the reclaim attempt on the same boot.
+
 ## Exact artifacts
 
 | Artifact | Bytes | SHA-256 |
