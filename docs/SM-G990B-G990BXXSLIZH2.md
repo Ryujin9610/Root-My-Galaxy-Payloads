@@ -457,6 +457,15 @@ not proof of the panic cause. Before any later phone run, review the collector
 and add bounded heartbeat/timing checkpoints to a build that preserves its
 scan deadline; do not repeat the current unbounded diagnostic.
 
+The collector was then instrumented locally with a separate
+`RMG_DIAG_CONTROLLED_MM_TRACE` flag so tracing does not select the standalone
+mmcollect-only mode. Durable checkpoints now bracket collector passes, setup,
+child creation, child waits, and brute force. This diagnostic build uses a
+45-second child wait limit and a 90-second scan limit, both below the reported
+100-second watchdog interval. It compiled successfully with SHA-256
+`DED35C4F07633C9A68445CDC48DB4FC5767961A47DB1B377AFE50C08C1730F23`. It has
+not been installed on the phone or run; source changes remain local.
+
 ## Exact artifacts
 
 | Artifact | Bytes | SHA-256 |
