@@ -70,6 +70,31 @@ After a clean reboot, the phone returned to the expected firmware and kernel,
 ADB remained uid 2000, and neither `/dev/ksu` nor `/proc/ksu` existed. KernelSU
 was not loaded. This was one diagnostic attempt only; no retry was made.
 
+## 2026-11-23 bounded mm-collector retest
+
+A second diagnostic-only build instrumented the mm-group collector and exited
+before pipe reclaim, FOPS, or root stages. Its child wait was capped at 120
+seconds with 15-second progress messages, and the whole collection was capped
+at 240 seconds. The local payload SHA-256 was
+`47bf8645a3c9d69630c38042899578817712a72c2a1cdb079a73231e1472bfef`. RMG
+reported a failed exploit status by design: the diagnostic
+returns status 42 after recording its result so the app cannot proceed to
+KernelSU loading.
+
+The collector completed normally in 49.943 seconds and found one complete
+order-3 mm group: 34 of 34 unique slots at `ffffff8094ba8000`. All 34
+KernelSnitch children completed; their measured run times were about 0.3 to
+3.4 seconds. Setup took 1 to 4 ms per candidate, `/proc/<pid>/mem` opened in
+under 1 ms, and hinted page matches took 0 to 1 ms after the initial 149 ms
+full scan. Neither the child timeout nor the overall scan limit was reached.
+
+This does not reproduce the preceding 900-second stall. It shows that the
+collector can complete quickly on this phone and that its ordinary workload
+does not explain that earlier timeout. The exact cause of the prior stall
+remains unconfirmed. No FOPS or root stage ran; after the diagnostic, the
+phone remained booted as uid 2000 with no `/dev/ksu` or `/proc/ksu`. The
+previous local drain-order payload was restored.
+
 ## Exact artifacts
 
 | Artifact | Bytes | SHA-256 |
