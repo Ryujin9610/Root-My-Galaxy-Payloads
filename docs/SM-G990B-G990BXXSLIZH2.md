@@ -267,16 +267,39 @@ does not explain both messages; a child exit or short/interrupted IPC read is
 also possible. The available unprivileged ADB session cannot read the kernel
 log (`dmesg` is permission denied), so an OOM or signal cause is unconfirmed.
 
-The working tree already has an opt-in `RMG_DIAG_CONTROLLED_MM` mode that
-runs after KASLR discovery, gathers only the mm slab, reports per-stage
-timings/child-wait heartbeats, and returns before FOPS or root stages. A
-diagnostic build can enable it with
-`TARGET_CFLAGS=-DRMG_DIAG_CONTROLLED_MM=1`; this has not been built or run on
-the phone. Before any new device run, make the result-pipe read retry on
-`EINTR`/short reads and log the final byte count, `errno`, returned pointer,
-and child wait status so collector failure and child handoff failure are
-distinguishable. Keep the diagnostic one-shot and do not run another reclaim
-on the current boot.
+The working tree has an opt-in `RMG_DIAG_CONTROLLED_MM` mode that reports
+per-stage timings and child-wait heartbeats. `RMG_DIAG_PIPE_HANDOFF` runs the
+collector through the forked pipe-page child, then returns before FOPS or root
+stages. The later one-shot run below used both. Its result-pipe read now
+retries on `EINTR` and reports the byte count, error, and child status.
+
+### 2026-11-23 one-shot pipe-child diagnostic
+
+After a fresh reboot, the diagnostic was imported through RMG's Local payload
+setting as `rmg-pipe-handoff-diagnostic.so`; SHA-256:
+`22144344706AD5785256916F1D59881671364475E38D84B864DB06DBE3502C5C`. The run
+used Shizuku and the exact G990B profile. Its compile-time diagnostic branch
+ran after KASLR discovery and returned before FOPS and root stages.
+
+The controlled collector succeeded, filling all 34 objects for
+`ffffff8094118000` on outer attempt 55; three candidate page groups were
+observed. The child wrote all 8 result bytes (`write=8`, `expected=8`,
+`errno=0`), and the parent received the full pointer. This rules out
+collector exhaustion and a short parent handoff in this run. The pointer was
+zero because `pipe_stage_exact_order3()` logged
+`pipe order-3 oracle missed target after 512 probes`; no pipe page was
+identified. No FOPS/root work, credential transition, or KernelSU load was
+reached. RMG marked the run failed; the phone remained booted and connected,
+with no `/dev/ksu` or `/proc/ksu`.
+
+The immediate failure is downstream, in releasing/reclaiming the collected
+order-3 page or matching its marker in the AF_UNIX probe. This diagnostic
+calls pipe preparation immediately after KASLR discovery, so its allocator
+history differs from the normal route, which reaches pipe preparation later.
+The next local build adds sampled first/last-page read values, read-error
+counts, and an `oracle-miss` page-metadata snapshot. It has not been installed
+or run. A further controlled reclaim requires another fresh boot; no retry
+was made on this boot.
 
 ## Exact artifacts
 
