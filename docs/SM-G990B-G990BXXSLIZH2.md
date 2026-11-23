@@ -121,6 +121,35 @@ attempts missed, RMG started its stability keeper and marked the FOPS page as
 dirty; a reboot was required and completed. The phone returned to the expected
 firmware and kernel as uid 2000, with no `/dev/ksu` or `/proc/ksu`.
 
+## 2026-11-23 pipe-growth snapshot diagnostic
+
+A one-attempt diagnostic build added snapshots while the pipe-array reclaim
+grew. It sampled allocation counts 128, 192, 193, 256, 384, 512, 640, and
+768, including the existing drain-boundary samples. The run used the exact
+`r9q-G990BXXSLIZH2` profile and was followed by a reboot because the payload
+reported that its FOPS page was dirty. The temporary local payload was then
+replaced with the original drain-order payload; its SHA-256 was verified as
+`4d97a75d1201ed085c60a9fe78aa33b99837532ebe6a383b94d4c87e4850af73`.
+
+The exploit again passed KASLR, collected a 34-object mm group, and prepared
+the controlled target page in 101.344 seconds. Readiness COW and both CFI
+probes succeeded. All three pipe-physrw attempts then failed to find a pipe
+buffer marker. At every sampled allocation count in each attempt, the
+inspected order-3 candidate's `slab_cache` field at `+0x18` remained zero on
+all eight 4 KiB subpages. The `page_type` observation retained the head marker
+`0xffffff7f` and `0xffffffff` on the other subpages. The cache-table read
+still matched the expected normal kmalloc-1k pointer, so the zero ownership
+field is not explained by a failed cache-table lookup.
+
+This narrows the failure: the inspected candidate page has no recognized
+SLUB cache owner even during intermediate pipe-array growth, rather than
+losing that owner only at the final sample. It does not yet prove why the
+candidate page is not associated with the expected cache, or whether the
+oracle is tracking the intended physical page. No root or KernelSU driver
+was loaded. The device rebooted successfully and returned to the expected
+firmware and kernel; `/dev/ksu` and `/proc/ksu` remain absent. No additional
+exploit attempt was made after this diagnostic.
+
 ## Exact artifacts
 
 | Artifact | Bytes | SHA-256 |
