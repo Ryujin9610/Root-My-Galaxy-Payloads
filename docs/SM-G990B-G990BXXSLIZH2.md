@@ -420,8 +420,30 @@ The zero-size ashmem explanation above remains a source-level possibility for
 the early diagnostic path, not an established cause. The next useful offline
 step is to inspect the exact `try_cfi_stage()` transition and route handoff,
 then prepare a bounded diagnostic that observes pipe preparation at its normal
-call site without repeating allocator reclaim on the same boot. No further
-phone attempt has been made.
+call site without repeating allocator reclaim on the same boot. The subsequent
+route-timed attempts and their results are recorded below.
+
+### 2026-11-23 route-timed diagnostic attempts
+
+A diagnostic-only `RMG_DIAG_PIPE_AFTER_CFI` branch was added locally to run
+pipe-page preparation after the normal CFI-friendly ashmem write/readback and
+before physical read/write or root installation. The initial build used a
+30-second coordinator wait. In its one run, the normal route's ashmem write
+and read both returned 35 bytes, and the durable log reached
+`pipe-after-cfi-start`; pipe-page preparation had begun when the 30-second
+wait expired. This run did not reach the pipe oracle. The device was rebooted
+afterward to clear the temporary ashmem file-operation state.
+
+The wait was extended locally to 10 minutes and the resulting payload had
+SHA-256
+`DDA0920374AE368A8F8B641DFB1F540D80F86CA9D9BBFF2DDEB19D4F031C7A9F`. On the
+next single run, the durable log stopped during the initial page-collection
+phase at `mmcollect-leak a=43`; it never reached `pipe-after-cfi-start`.
+ADB disconnected, then returned after a reboot. Android reported
+`kernel_panic,sobugarm_watchdog_timer_exhardd_100s` as the boot reason. The
+shell user cannot read `/sys/fs/pstore` or `dmesg`, so the detailed panic trace
+is unavailable from the current ADB access. No further attempt should be made
+until this earlier collection-phase watchdog reset is reviewed offline.
 
 ## Exact artifacts
 
