@@ -321,6 +321,26 @@ KernelSU was not loaded. No second attempt was made. Before any further test,
 verify the payload filename in the run log matches the intended oracle build;
 do not infer results for the new oracle diagnostics from this run.
 
+### 2026-11-23 corrected-payload attempt
+
+The RMG Settings label still named the oracle payload, but its active
+`files/local-payload/local-exploit.so` was SHA-256
+`22144344706AD5785256916F1D59881671364475E38D84B864DB06DBE3502C5C`, the old
+handoff build. The intended oracle binary was present as
+`local-exploit.so.part` and matched the local build SHA-256
+`FA502DE327EF3111CE4518F187A4DA7A81FCCBC6E51B88FB247814FECFBFEDE0`. After
+preserving the old copy, the verified `.part` file was copied into the active
+slot. Its hash matched the build before and after the attempt.
+
+One attempt was started through RMG after it showed Shizuku running. ADB then
+disconnected, and the phone returned after another kernel-panic reboot
+(`ro.boot.bootreason`: `kernel_panic,fatal_exception`). After reboot,
+`/dev/ksu` and `/proc/ksu` were absent. RMG did not retain a new run-history
+record, and its post-reboot log only reports that Shizuku was not running; no
+payload-stage or oracle diagnostics could be recovered. The panic therefore
+does not establish whether this corrected payload reached the oracle. No
+further attempt was made.
+
 ## Exact artifacts
 
 | Artifact | Bytes | SHA-256 |
