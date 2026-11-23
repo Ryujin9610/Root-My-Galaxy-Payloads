@@ -913,3 +913,16 @@ was rebooted once after the failed attempt. It returned to the same expected
 Android 16 fingerprint and 5.4.289 kernel; `/proc/modules` no longer lists
 `kernelsu`, `/dev/ksu` and `/proc/ksu` are absent, and ADB is `uid=2000(shell)`.
 No second exploit attempt was made.
+
+Comparison with the previous successful drain-order run (same exploit SHA-256)
+shows a nondeterministic allocator result rather than a KernelSU-daemon result.
+Both runs captured the order-3 oracle at probe 0. The successful run's first
+physrw round found a pipe buffer (`found=1`) and completed read/write; this run
+found no pipe buffer in any of its three rounds and reported
+`matched=0 page_index=-1 cache_slot=-1 gate=0` each time. KASLR discovery and
+readiness COW still succeeded. The baseline `ksud` was verified on disk, but
+the exploit failed before loading it, so this attempt says nothing about
+whether the baseline service restores `/dev/ksu` control. The next work should
+focus offline on why the target order-3 pages are not reclaimed into the
+selected kmalloc-1k cache. Do not infer a KernelSU ABI regression from this
+run.
