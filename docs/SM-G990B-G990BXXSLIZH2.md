@@ -658,3 +658,26 @@ child/parent handoff, and the page contents before another device attempt.
 Checkpoint and RMG run logs are saved in the local
 `build/diagnostic-pipe-physrw-only` directory. Do not treat the result as a
 physical read/write or root success.
+
+### 2026-11-23 repeated physical read/write finder diagnostic
+
+At 19:50 local time, the same bounded physrw-only payload was selected in RMG
+and run once more after a clean reboot. The file staged by RMG was 144,816
+bytes and matched the local build SHA-256
+`BB5E57A5F5A3D38D34286056F343AC67588797AE30225243E6FC3A2A15681209`.
+The phone again passed KASLR setup, completed the controlled collector through
+pass 123, released the collected page, and matched oracle probe 0. The
+physrw-only stage then returned `done=0` with no pipe-buffer index; RMG ended
+with status 255 at “Running kernel exploit”. It did not enter the KernelSU
+load stage or write the physical-RW proof markers.
+
+The live checkpoint is saved as
+`rmg-pipe-oracle-checkpoint-live.log` in the local conversation workspace;
+its SHA-256 is
+`FC0E18F4546CFCECF32A0A5752F482439ACB024019799F43B30826A843A295DE`.
+The phone was rebooted after the run. Verification showed the expected
+G990BXXSLIZH2 fingerprint and 5.4.289 kernel, `sys.boot_completed=1`, ADB
+running as `uid=2000(shell)`, and no `/dev/ksu` or `/proc/ksu`. This repeat
+confirms the same current blocker: the oracle capture succeeds, but the
+captured page is not found as a usable pipe-buffer page by this finder path.
+It is not a physical-RW or root success.
