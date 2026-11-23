@@ -445,6 +445,18 @@ shell user cannot read `/sys/fs/pstore` or `dmesg`, so the detailed panic trace
 is unavailable from the current ADB access. No further attempt should be made
 until this earlier collection-phase watchdog reset is reviewed offline.
 
+The route-timed build did not define `RMG_DIAG_CONTROLLED_MM`. In this source,
+the `CONTROLLED_RECLAIM` environment selects `prepare_controlled_kernel_page()`
+for the initial page setup; the collector's 240-second scan deadline and
+per-leak timing messages are compiled only with `RMG_DIAG_CONTROLLED_MM`.
+Durable checkpoints do record successful leak results, but not the duration of
+each unsuccessful scan. Thus the final `mmcollect-leak a=43 b=2` indicates a
+successful leak at scan attempt 43 with two groups observed; it does not locate
+the watchdog stall precisely. Missing timing data is an instrumentation gap,
+not proof of the panic cause. Before any later phone run, review the collector
+and add bounded heartbeat/timing checkpoints to a build that preserves its
+scan deadline; do not repeat the current unbounded diagnostic.
+
 ## Exact artifacts
 
 | Artifact | Bytes | SHA-256 |
