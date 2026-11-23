@@ -970,3 +970,45 @@ failure. A useful next experiment would be a diagnostic-only change that
 records the actual cache-owner pointer/class for accounted pipe allocations
 and the point at which the released order-3 pages are reused, followed by a
 separately approved phone run.
+
+### Follow-up: page-identity success and KernelSU control path (2026-11-23)
+
+The one-attempt page-identity payload completed successfully under record
+`21a453d1-a9f1-43f1-8524-d57844bda449`. The history records `done=1 root=1`,
+KASLR and physical read/write success, followed by a `kernelsu` module-list
+entry. The RMG screen reported “KernelSU active,” but the helper printed
+`late-load: KernelSU driver fd unavailable`; the control readings explicitly
+said the native probe saw a module, Shizuku `su` did not work, and the helper
+printed no control report. The native probe checks only
+`/sys/module/kernelsu` or `/proc/modules`, so this run proves module presence,
+not a working `/dev/ksu`/`su` channel.
+
+The run history says the service was staged from the app-private path ending in
+`/ksud-s25u-kdp`. A read-only check of that exact cached file after the run
+found 4,844,920 bytes and SHA-256
+`bafc40f0166418ec7564578d9f181083b33db6ae9815095a3cf67eba7ba551e9`, matching
+the G990B profile's documented baseline daemon, not the 4,849,960-byte
+proc-fallback candidate (`1eae042ffbd70848af8ec3cad8b138b70cce14f8176b88dcb435224b4256ec77`).
+This rules out the earlier stale-candidate cache as the service used by this
+successful run. The baseline module source registers the legacy misc device
+`/dev/ksu` when `CONFIG_KSU_LEGACY_SELINUX` is enabled and logs either
+`legacy /dev/ksu control device registered` or its registration error. Static
+strings in the baseline module contain both messages. The proc-fallback
+candidate adds `/proc/ksu` only after `misc_register()` fails; that candidate
+was not the cached service for this run.
+
+The remaining live question is why the baseline module's driver FD could not be
+opened on the run's boot: module registration failure, device-node creation or
+visibility, or an access denial remain possibilities. The app-side log does
+not include the kernel's `misc_register()` result. Capturing the kernel log
+while the next controlled load is still on the same boot would distinguish
+these cases; no further exploit attempt was made here.
+
+After this investigation, the user authorized a full `adb reboot`. They
+clarified that this LKM root method survives a userspace soft reboot but not a
+full reboot, which starts a new kernel. The absent `kernelsu` module and device
+nodes after that full reboot are expected; they do not indicate that the
+same-boot load failed. RMG's separate boot-time reroot setting and outcome were
+not verified. RMG's saved local payload selection remains the one-off
+`rmg-page-identity-diagnostic.so`; restore the known drain-order payload before
+any future attempt.

@@ -203,8 +203,15 @@ not have root. A read-only ADB check after the run confirmed
 `sys.boot_completed=1`, but the shell remained uid 2000 and could not find
 `/dev/ksu` or `/proc/ksu`. Thus the exploit's root result and RMG's success
 screen are confirmed, while persistent KernelSU availability through its
-device node is not confirmed by the post-run shell check. No further exploit
-attempt or reboot was performed after this run.
+device node is not confirmed by the same-boot shell check.
+
+A later user-authorized `adb reboot` performed a full reboot. The user clarified
+that this exploit-loaded KernelSU module survives a userspace soft reboot, but
+not a full reboot, which starts a new kernel. Therefore, the post-full-reboot
+absence of `/dev/ksu`, `/proc/ksu`, and a `kernelsu` module is expected and does
+not add evidence about whether its control path worked before that reboot.
+RMG's boot-time reroot flow is a separate mechanism; its settings and outcome
+were not verified in this check.
 
 The one-off diagnostic payload and its build outputs are retained locally under
 `build/diagnostic-page-identity/`; the success-screen capture is
