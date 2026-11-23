@@ -621,3 +621,40 @@ saved under the local build output directory for this diagnostic. The next
 investigation should inspect why the controlled pipe reclaim check passes but
 the production physical read/write stage has not yet been exercised; do not
 interpret this diagnostic as a successful root attempt.
+
+### 2026-11-23 physical read/write finder diagnostic
+
+After the prior clean reboot, one bounded diagnostic build was imported through
+RMG and run with Shizuku. It combined the route-timed CFI/pipe preparation with
+`RMG_DIAG_PIPE_PHYSRW_ONLY`; its SHA-256 was
+`BB5E57A5F5A3D38D34286056F343AC67588797AE30225243E6FC3A2A15681209`, and the
+app-private local payload hash matched. RMG history record
+`528ccd93-7c38-44c7-9fb8-270d9efdf58d` confirms the intended local payload and
+`r9q-G990BXXSLIZH2` profile.
+
+The route passed the CFI-friendly ashmem write/read (35 bytes each). The
+controlled collector completed an order-3 page of 34/34 objects at attempt
+123. Its marker oracle matched probe 0, and the captured skb drained. The
+subsequent production `find_pipe_buffer()` scan did not find a pipe buffer:
+`found=0`, index `-1`, and scan counters `vmemmap/ops/len=0/0/0`. The cache-gate
+diagnostic also returned `matched=0`; the first four words still contained the
+oracle marker. Although the reclaim helper reported the slab count changing
+from 54 to 53, this did not establish that the selected page had been reused
+for the pipe-buffer structures required by the physical read/write path.
+
+The diagnostic exited before writing the physical read/write proof markers
+and before root installation. RMG returned its expected diagnostic status
+255; the run summary reports `done=0 root=0 read_ok=0 write_ok=0 rw64=0/0`.
+The KernelSU driver was not loaded. The stability keeper reported that the
+dirty fops page required reboot; the phone was rebooted and returned with
+`sys.boot_completed=1`, boot reason `reboot,shell`, and no `/dev/ksu` or
+`/proc/ksu`.
+
+This narrows the current blocker: controlled page collection and marker
+matching work, but the reclaimed page is not recognized as containing a
+valid `pipe_buffer` for the parent-side physical read/write routine. Review
+the reclaim ordering, pipe-buffer allocation ownership across the helper
+child/parent handoff, and the page contents before another device attempt.
+Checkpoint and RMG run logs are saved in the local
+`build/diagnostic-pipe-physrw-only` directory. Do not treat the result as a
+physical read/write or root success.
