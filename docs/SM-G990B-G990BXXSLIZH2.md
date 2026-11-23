@@ -500,6 +500,14 @@ stochastic collector shortfall: this pipe-preparation scan did not collect all
 time. Consider a longer bounded scan only after reviewing its impact on the
 15-minute RMG run budget; do not repeat the unbounded variant.
 
+For the most populated candidate page, the logs report 1/34 objects at attempt
+57, 8/34 at attempt 64, and 16/34 at attempt 72. This suggests the collector
+was still making progress toward a complete page when the 180-second bound
+expired. The end-to-end run took about 4 minutes 40 seconds; a 360-second
+collector bound would add at most three minutes and remain below RMG's
+15-minute total limit on a similar run. This is a timing estimate, not a
+guarantee that the page will be completed.
+
 The checkpoint log is preserved locally at
 `build/diagnostic-pipe-after-cfi-traced/rmg-pipe-oracle-checkpoint-run-93353a1.log`
 with SHA-256
