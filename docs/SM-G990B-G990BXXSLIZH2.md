@@ -401,6 +401,28 @@ runtime path, because the exploit may alter ashmem state elsewhere. Inspect
 the normal route's ashmem setup and the exact file-operation transition before
 changing the oracle or attempting another run.
 
+### 2026-11-23 diagnostic ordering correction
+
+The source comparison identified a more direct explanation for this run. The
+`RMG_DIAG_PIPE_HANDOFF` branch invokes `prepare_pipe_buffer_page()` immediately
+after KASLR discovery and returns before `prepare_good_kernel_page()`, route
+crafting, or `run_main_route_threads()`. The normal route instead reaches
+`try_cfi_stage()` only after observing the route signal; that stage verifies
+the forged ashmem file operations before `install_child_root()` reaches
+`install_pipe_physrw()`. If no pipe page exists then, `install_pipe_physrw()`
+requests `prepare_pipe_buffer_page()` from the main-route thread while the
+route is active. Thus the early diagnostic oracle ran before the normal
+ashmem read callback was installed. Its 1,024 EOF reads are expected to be
+non-diagnostic for the normal route and should not be treated as evidence that
+the normal route's read primitive fails.
+
+The zero-size ashmem explanation above remains a source-level possibility for
+the early diagnostic path, not an established cause. The next useful offline
+step is to inspect the exact `try_cfi_stage()` transition and route handoff,
+then prepare a bounded diagnostic that observes pipe preparation at its normal
+call site without repeating allocator reclaim on the same boot. No further
+phone attempt has been made.
+
 ## Exact artifacts
 
 | Artifact | Bytes | SHA-256 |
