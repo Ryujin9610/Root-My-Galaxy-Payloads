@@ -95,6 +95,32 @@ remains unconfirmed. No FOPS or root stage ran; after the diagnostic, the
 phone remained booted as uid 2000 with no `/dev/ksu` or `/proc/ksu`. The
 previous local drain-order payload was restored.
 
+## 2026-11-23 original-payload retest
+
+The original local drain-order payload (`cve-2026-43499-app-drain-order.so`,
+SHA-256 `4d97a75d1201ed085c60a9fe78aa33b99837532ebe6a383b94d4c87e4850af73`)
+was run once after a clean reboot, with battery saver off. The app used the
+exact `r9q-G990BXXSLIZH2` profile and verified the KernelSU service. Tracefs
+KASLR detection succeeded with slide `0x1e0000`. Controlled reclaim collected
+34 mm objects, prepared the target page in 120.307 seconds, and reduced the
+reported mm slab count from 39 to 38.
+
+The readiness COW walk succeeded on its first call, and the CFI write and
+read probes both returned 35 bytes. The subsequent pipe-physrw stage failed
+all three attempts. Each scan found no pipe-buffer marker; the candidate
+order-3 bases were `ffffff80025d0000`, `ffffff80657e8000`, and
+`ffffff80965c8000`. The kmalloc cache table read matched the expected 1 KiB
+cache pointer, but every candidate subpage reported `slab_cache` at `+0x18`
+as zero, so the page ownership gate matched none. The failure therefore
+remains in pipe-buffer-page reclaim, after readiness and CFI checks have
+passed; it is not a KernelSU module-load failure.
+
+RMG completed the run in 777.7 seconds and reported failure at the exploit
+stage. No root or KernelSU driver was loaded. Because all three pipe-physrw
+attempts missed, RMG started its stability keeper and marked the FOPS page as
+dirty; a reboot was required and completed. The phone returned to the expected
+firmware and kernel as uid 2000, with no `/dev/ksu` or `/proc/ksu`.
+
 ## Exact artifacts
 
 | Artifact | Bytes | SHA-256 |
