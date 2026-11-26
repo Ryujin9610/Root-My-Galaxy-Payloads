@@ -4266,7 +4266,7 @@ that request/log discrepancy before relying on that override again.
 | First `PROT_NONE` mprotect return relative to pselect start | +2,044 us | +2,073 us |
 | Waiter `D` observation | +1,128 us (poll 78) | None in 109 main-monitor polls |
 | pselect result / duration | 118 / 2,858 us | 124 / 2,147 us |
-| Total mprotect lock interval | 4,780 us | 4,426 us |
+| Total mprotect-helper elapsed | 4,780 us | 4,426 us |
 | Scheduler trigger calls / successes | 1 / 1 | 0 / 0 |
 | Reclaim stream / canary coverage | 251/256 sends / 501/512 chunks | 256/256 sends / 512/512 chunks |
 
@@ -4288,3 +4288,66 @@ remained absent. The firmware, kernel, boot ID, and `sys.boot_completed` value
 were unchanged after the run; battery saver remained off. The full RMG history,
 app screenshots/UI dumps, build log, payload, and result screenshot are saved
 under `build/pi-helper-state-sendtrace-cpu0-20261126/`.
+
+### 2026-11-27 source trace of the CPU-pinned COW window
+
+A read-only query of the running phone's `/proc/config.gz` returned
+`CONFIG_IKCONFIG_PROC=y`, `CONFIG_SPECULATIVE_PAGE_FAULT=y`, and
+`CONFIG_RWSEM_SPIN_ON_OWNER=y`. This confirms that both the speculative page
+fault path and rwsem owner spinning are enabled in the installed kernel; the
+same settings appear in Samsung's `vendor/r9q_eur_openx_defconfig`. No exploit
+or state-changing command was run for this check.
+
+The current candidate constructs `cow_out` by writing the fd set to a memfd,
+mapping it `MAP_PRIVATE`, then reading one word to install a file-backed PTE
+(`src/targets/r9q-G990BXXSLIZH2/port/fops.c`, around lines 1316-1341). It does
+not write privately to that mapping before passing it as `pselect6`'s
+`writefds` pointer. In Samsung's 5.4.289 source, `core_sys_select()` copies the
+result bitmap back with `__copy_to_user()` (`fs/select.c`, around lines
+399-404 and 691-694). That output copy is therefore the first intended private
+write and triggers COW. Because a fresh private file VMA has no prepared
+`anon_vma`, the speculative fault handler returns `VM_FAULT_RETRY`
+(`mm/memory.c`, around lines 4460-4465); arm64 then enters the ordinary
+read-side `mm->mmap_sem` path (`arch/arm64/mm/fault.c`, around lines 532-550).
+
+The event timestamps for the CPU-pinned run fit that lock sequence:
+
+| Event | Offset from pselect start |
+|---|---:|
+| First `PROT_NONE` mprotect enters | −46 us |
+| pselect starts | 0 us |
+| First mprotect returns | +2,073 us |
+| Second `PROT_READ` mprotect enters | +2,074 us |
+| Mprotect-helper observer first sees `D` | +2,101 us |
+| pselect returns 124; helper observer sees `R` again | +2,148 us |
+
+`mprotect()` takes the same mmap semaphore for writing and releases it at the
+end of the call (`mm/mprotect.c`, around lines 518-519 and 607-609). The
+waiter's rwsem read slow path tries `rwsem_optimistic_spin()` before it queues;
+only after that spin fails does it set the task's uninterruptible state and
+call `schedule()` (`kernel/locking/rwsem.c`, around lines 1015-1040 and
+1097-1118). With the live config's `CONFIG_RWSEM_SPIN_ON_OWNER=y`, it is
+therefore possible for the waiter to remain `R` while spinning on the first
+mprotect writer. Once that writer releases the semaphore, the COW copy can
+finish under the read lock. The helper's immediately following write-side
+mprotect can then block behind that reader, matching its brief `D` interval
+from +2,101 to +2,148 us.
+
+This is now the best-supported explanation for why the CPU-pinned run showed
+the helper in `D` while the waiter remained `R`; it also explains why matching
+the earlier run's effective CPU placement did not reproduce waiter `D`. One
+plausible difference is that the earlier waiter left the optimistic-spin path
+and queued, whereas the current run stayed runnable long enough to acquire the
+read lock after the writer released it. The observations do not capture a
+stack or lock owner, so they cannot prove the waiter was specifically spinning
+in `rwsem_down_read()`.
+The observed `R` state also cannot distinguish running from runnable. The
+shorter pselect duration, send-trace instrumentation, and per-run scheduling
+remain possible influences.
+
+The logged `readiness mmap locker elapsed_us` is the elapsed mprotect-helper
+loop time, not a direct measurement of mmap-semaphore ownership duration. The
+two per-call `MPTIME` intervals are the relevant syscall timings. For the next
+diagnostic, prefer an observer that records per-thread scheduling/runtime
+counters alongside state, and capture a live wait channel only when the waiter
+actually enters `D`. Do not infer a blocked waiter from the helper's `D` sample.
