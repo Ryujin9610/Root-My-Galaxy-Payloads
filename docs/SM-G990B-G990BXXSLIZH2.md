@@ -4225,3 +4225,66 @@ constant; otherwise record the effective masks and placement explicitly. Then
 choose one narrowly targeted observer or timing change. Retain the one-attempt
 cap and the pre-CFI,
 physical-read/write-disabled, and root-disabled guards.
+
+### 2026-11-26 CPU-pinned send-trace comparison: waiter stayed runnable
+
+To isolate waiter placement, one more attempt used the complete send-trace
+candidate with the waiter requested on CPU0, the consumer on CPU5, and the
+mprotect helper on CPU4. The candidate was
+`build/pi-helper-state-sendtrace-cpu0-20261126/cve-2026-43499-app.so`
+(155,832 bytes; SHA-256
+`0317e77e91750cc44a04f97291bb65ac262c8c88aaf0ac4ab5978b4f8e95bd15`). It
+kept the 512-MiB region, one payload attempt, complete send tracing, passive
+COW observation, durable logging, and the pre-CFI, physical-read/write-disabled,
+and root-disabled guards. The build included `RMG_DIAG_WAITER_CORE=0` and
+`RMG_DIAG_CONSUMER_CORE=5`.
+
+RMG selected the local candidate and the exact G990B SLIZH2 profile. Shizuku
+was ready; the attempt started at 23:45:14 and ended at 23:47:31 with code
+255 at “Running kernel exploit.” This is the expected diagnostic stop at
+`readiness-cow cfi miss ... step=42`, not a CFI result or a root attempt. The
+order-3 seed completed 128/128 sends and the reclaim stream completed 256/256
+64-KiB sends. The 16-MiB canary covered 512/512 chunks and found no mutation.
+
+The passive monitor reported waiter CPU0, observer CPU1, and predicted helper
+CPU4. Its inherited mask was `0x1`, allowed mask `0x3f`, and effective observer
+mask `0x2`. The main waiter monitor sampled 109 times, with zero blocked
+samples and first/last state `R`. The passive observer also saw the waiter as
+`R` in all 26 samples. The helper's separate state observer caught three brief
+`D` samples near the end of the first mprotect; those samples belonged to the
+mprotect helper, not the waiter. The consumer affinity log showed a request for
+CPU7, followed by fallback selection of CPU5 and effective mask `0x20`. Thus
+the effective CPU placement matches the intended `0 / 5 / 1 / 4` layout, but
+the runtime did not confirm the compiled consumer request override. Resolve
+that request/log discrepancy before relying on that override again.
+
+| Measurement | Earlier waiter-`D` run | CPU-pinned send-trace run |
+|---|---:|---:|
+| Waiter / consumer / observer / helper CPUs | 0 / 5 / 1 / 4 | 0 / 5 / 1 / 4 |
+| Observer inherited / allowed / effective masks | `0x1` / `0x3f` / `0x2` | `0x1` / `0x3f` / `0x2` |
+| First mprotect entry relative to pselect start | −46 us | −46 us |
+| First `PROT_NONE` mprotect return relative to pselect start | +2,044 us | +2,073 us |
+| Waiter `D` observation | +1,128 us (poll 78) | None in 109 main-monitor polls |
+| pselect result / duration | 118 / 2,858 us | 124 / 2,147 us |
+| Total mprotect lock interval | 4,780 us | 4,426 us |
+| Scheduler trigger calls / successes | 1 / 1 | 0 / 0 |
+| Reclaim stream / canary coverage | 251/256 sends / 501/512 chunks | 256/256 sends / 512/512 chunks |
+
+This controls effective CPU placement: the waiter was on CPU0 and the observer,
+consumer, and helper occupied the same CPUs as in the run that saw the waiter
+in `D`. Placement alone did not reproduce that state. The first mprotect
+write-side interval was also close in duration (2.119 ms here versus 2.090 ms
+in the earlier run), but pselect returned about 711 us sooner here. The earlier
+waiter's `D` sample occurred while that first mprotect was still active; this
+run kept the waiter `R` despite a similarly long interval. The changed send
+stream completeness, tracing overhead, and per-run scheduling remain possible
+contributors, so this comparison rules out CPU placement as a sufficient
+explanation but does not identify the cause of the intermittent wait state.
+
+The overlay completed (`overlay=1`); the COW mapping changed from file-backed
+to anonymous and `smaps` rose from 0 to 4 KiB anonymous memory, but there was no
+target mutation, scheduler call, or KernelSU load. `/dev/ksu` and `/proc/ksu`
+remained absent. The firmware, kernel, boot ID, and `sys.boot_completed` value
+were unchanged after the run; battery saver remained off. The full RMG history,
+app screenshots/UI dumps, build log, payload, and result screenshot are saved
+under `build/pi-helper-state-sendtrace-cpu0-20261126/`.
