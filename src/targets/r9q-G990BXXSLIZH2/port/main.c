@@ -23,6 +23,31 @@ atomic_int pipe_prepare_done;
 atomic_int consumer_nice_val;
 int memfd_leak;
 
+#ifndef RMG_DIAG_WAITER_CORE
+#define RMG_DIAG_WAITER_CORE (-1)
+#endif
+#ifndef RMG_DIAG_CONSUMER_CORE
+#define RMG_DIAG_CONSUMER_CORE CONSUMER_CORE
+#endif
+
+#if RMG_DIAG_WAITER_CORE >= 0
+#if !defined(RMG_DIAG_COW_TRACE) || !RMG_DIAG_COW_TRACE || \
+    !defined(RMG_DIAG_PASSIVE_COW_OBSERVER) || \
+    !RMG_DIAG_PASSIVE_COW_OBSERVER || \
+    !defined(RMG_DIAG_COW_CONSUMER_AFFINITY) || \
+    !RMG_DIAG_COW_CONSUMER_AFFINITY || \
+    !defined(RMG_DIAG_PI_PROBE_ONLY) || !RMG_DIAG_PI_PROBE_ONLY || \
+    !defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) || \
+    !RMG_DIAG_UCLAMP_TRIGGER_ONLY
+#error "fixed waiter affinity requires guarded PI/uclamp COW tracing"
+#endif
+#endif
+#if RMG_DIAG_CONSUMER_CORE != CONSUMER_CORE && \
+    (!defined(RMG_DIAG_COW_CONSUMER_AFFINITY) || \
+     !RMG_DIAG_COW_CONSUMER_AFFINITY)
+#error "fixed consumer affinity requires the guarded consumer affinity diagnostic"
+#endif
+
 #if defined(RMG_DIAG_COW_PARENT_AFFINITY_ONLY) && \
     RMG_DIAG_COW_PARENT_AFFINITY_ONLY
 #if !defined(RMG_DIAG_COW_ONLY) || !RMG_DIAG_COW_ONLY || \
@@ -120,7 +145,16 @@ static void ghost_usr1_handler(int sig) {
 
 void *waiter_thread(void *arg __attribute__((unused))) {
   disable_rseq_for_thread();
-  atomic_store(&route_waiter_core, pin_to_core_ex(CORE, -1));
+  int requested_core = CORE;
+#if RMG_DIAG_WAITER_CORE >= 0
+  requested_core = RMG_DIAG_WAITER_CORE;
+#endif
+  int selected_core = pin_to_core_ex(requested_core, -1);
+  atomic_store(&route_waiter_core, selected_core);
+#if RMG_DIAG_WAITER_CORE >= 0
+  pr_info("RMG_DIAG_WAITER_PIN requested=%d selected=%d sched_cpu=%d\n",
+          requested_core, selected_core, sched_getcpu());
+#endif
 
   sigset_t blocked;
   sigfillset(&blocked);
@@ -277,9 +311,10 @@ void *consumer_thread(void *arg __attribute__((unused))) {
   int waiter_core = atomic_load_explicit(&route_waiter_core,
                                          memory_order_acquire);
   rmg_diag_pin_consumer_with_allowed_affinity(
-      CONSUMER_CORE, waiter_core);
+      RMG_DIAG_CONSUMER_CORE, waiter_core);
 #else
-  pin_to_core_ex(CONSUMER_CORE, atomic_load(&route_waiter_core));
+  pin_to_core_ex(RMG_DIAG_CONSUMER_CORE,
+                 atomic_load(&route_waiter_core));
 #endif
 
   {
