@@ -4154,22 +4154,63 @@ UI XML, complete app log, run-history JSON, checkpoint log, and post-run state
 are saved under
 `build/pi-helper-state-sendtrace-uclamp-20261126/one-shot-retry-01/`.
 
-The next issue to isolate is the trigger state, not reclaim-send
-completeness. The earlier PI/uclamp state-trace run recorded the waiter in
-`D` at poll 78, with a 2,858-us pselect and 4,780-us mprotect interval; that
-allowed one successful scheduler call, although its canary was incomplete.
-This send-trace run took 626 us in pselect and 1,269 us across the mprotect
-helper, and observed no waiter `D` sample. The correlation points to a
-different timing or mmap-lock wait state, but does not prove which condition
-caused the difference.
+#### Comparison with the earlier waiter-D run
 
-CPU placement also changed between the two PI/uclamp runs. The earlier
-waiter-`D` run used waiter CPU0, consumer CPU5, observer CPU1, and helper CPU4.
-This send-trace retry used waiter CPU6, consumer CPU5, observer CPU0, and
-helper CPU4 (`COWPASSIVE` records `waiter_core=6`; the affinity trace confirms
-the consumer on CPU5). The current run had battery saver off, but the earlier
-run's cpuset did not allow requested CPU6. Different waiter placement is
-another timing confound, not proof of the cause.
+The retained RMG history JSON for the earlier run is now saved at
+`build/pi-helper-state-trace-uclamp-20261126/one-shot-run/history.json`.
+Both runs used the same firmware/kernel, 512-MiB PTE region, the same initial
+roughly 50-us mprotect-to-pselect alignment, helper CPU4, and consumer CPU5.
+The send-trace retry used the same guarded PI/uclamp route plus
+`RMG_DIAG_COW_SEND_TRACE`; its complete stream differs from the earlier
+251/256-send run, so this is not a perfectly controlled single-variable
+comparison.
+
+| Measurement | Earlier run that observed waiter `D` | Send-trace retry |
+|---|---:|---:|
+| Waiter / consumer / observer / mprotect-helper CPUs | 0 / 5 / 1 / 4 | 6 / 5 / 0 / 4 |
+| Monitor inherited / allowed / effective masks | `0x1` / `0x3f` / `0x2` | `0x40` / `0xdf` / `0x1` |
+| Consumer mask after widening | `0x3f` | `0x6f` |
+| First mprotect entry relative to pselect start | −46 us | −49 us |
+| First `PROT_NONE` mprotect return relative to pselect start | +2,044 us | +613 us |
+| Waiter `D` observation relative to pselect start | +1,128 us (poll 78) | None observed in 38 polls |
+| pselect result / duration | 118 / 2,858 us | 109 / 626 us |
+| Total mprotect helper duration | 4,780 us | 1,269 us |
+| Readiness scheduler calls / successes | 1 / 1 | 0 / 0 |
+| Canary coverage | 501/512 chunks, incomplete | 512/512 chunks, complete |
+
+These are within-run monotonic offsets; absolute timestamps are from different
+boots and are not compared. In the earlier run the waiter entered `D` about
+1.13 ms after pselect began, while the first mprotect was still holding the
+write side for about another 0.92 ms. The first mprotect returned about
+0.82 ms before pselect returned. In the retry, the first mprotect returned
+about 13 us before pselect returned; the waiter stayed `R`, and the monitor
+made no scheduler call. The passive observer sampled `R` 18 times in the
+earlier run and missed the brief `D` observation, while the main monitor
+caught it. This shows why the per-poll state trace matters.
+
+Read-only sysfs inspection on the same SM8350 phone reports CPU capacities
+325 for CPUs 0–3 (policy maximum 1.8048 GHz), 828 for CPUs 4–6 (2.4192 GHz),
+and 1024 for CPU7 (2.8416 GHz). The earlier waiter ran on CPU0; the retry's
+waiter ran on CPU6. Thus the waiter moved from the lower-capacity cluster to
+the middle cluster, while helper and consumer remained on CPUs 4 and 5. The
+per-thread affinity masks also changed: the earlier monitor widened from
+`0x1` to `0x3f`, whereas the retry's monitor widened from `0x40` to `0xdf`;
+the consumer's widened mask changed from `0x3f` to `0x6f`. These are the
+effective masks logged for each thread, not one process-wide cpuset. The
+phone reported battery saver off in both run records. The current read-only
+topology snapshot is saved at
+`build/pi-helper-state-sendtrace-uclamp-20261126/one-shot-retry-01/cpu-topology.txt`.
+
+The shorter pselect and first-mprotect windows in the retry, plus the CPU
+placement change, fit the hypothesis that the pselect COW path did not spend
+long enough waiting on the mmap semaphore to queue in `TASK_UNINTERRUPTIBLE`.
+It may have remained runnable while the rwsem owner completed, as allowed by
+the kernel's optimistic-spin path. This is still an inference: CPU placement,
+the completed versus incomplete reclaim stream, runtime frequency, and
+memory-management timing all differ, and there is no kernel stack trace.
+The retry's complete 512-chunk canary rules out a short stream as the reason
+for its zero-mutation result; it does not identify why the waiter failed to
+reach `D`.
 
 The exact Samsung source analysis already documented above shows that the
 read-side rwsem path can optimistically spin while a writer is active and
@@ -4179,9 +4220,8 @@ no kernel stack or live wait-channel symbol was captured in this run. Earlier
 COW-only delay experiments also showed that delaying mprotect by 250 us can
 miss pselect entirely, while synchronized timing can block the helper without
 blocking the waiter. Avoid another blind delay change. Before another device
-attempt, compare the current affinity and monotonic event ordering with the
-earlier waiter-`D` run and, if allowed CPUs make it possible, hold waiter and
-observer placement constant; otherwise record effective masks and placement
-explicitly. Then choose one narrowly targeted observer or timing change.
-Retain the one-attempt cap and the pre-CFI,
+attempt, if allowed CPUs make it possible, hold waiter and observer placement
+constant; otherwise record the effective masks and placement explicitly. Then
+choose one narrowly targeted observer or timing change. Retain the one-attempt
+cap and the pre-CFI,
 physical-read/write-disabled, and root-disabled guards.
