@@ -340,6 +340,11 @@ static int install_workqueue_umh_root(int fd) {
 }
 
 int install_android_root(int fd) {
+#if defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) && RMG_DIAG_UCLAMP_TRIGGER_ONLY
+  (void)fd;
+  pr_warning("uclamp-trigger-only guard: refusing Android root install\n");
+  return 0;
+#else
   root_uid_before = getuid();
   pr_info("root direct start uid=%u fd=%d\n", root_uid_before, fd);
   int installed = install_workqueue_umh_root(fd);
@@ -378,4 +383,5 @@ int install_android_root(int fd) {
   }
 #endif
   return installed;
+#endif
 }

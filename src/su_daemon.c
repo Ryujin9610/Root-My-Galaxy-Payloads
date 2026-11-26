@@ -419,12 +419,21 @@ struct ksu_get_info_cmd {
 
 static int verify_kernelsu_control(void) {
   int fd = -1;
-  syscall(SYS_reboot, 0xDEADBEEF, 0xCAFEBABE, 0, &fd);
+  errno = 0;
+  long handoff_rc = syscall(SYS_reboot, 0xDEADBEEF, 0xCAFEBABE, 0, &fd);
+  int handoff_errno = errno;
+  int handoff_fd = fd;
+  int device_errno = 0;
   if (fd < 0) {
+    errno = 0;
     fd = open("/dev/ksu", O_RDWR | O_CLOEXEC);
+    device_errno = errno;
   }
   if (fd < 0) {
-    dprintf(STDERR_FILENO, "late-load: KernelSU driver fd unavailable\n");
+    dprintf(STDERR_FILENO,
+            "late-load: KernelSU driver fd unavailable handoff_rc=%ld "
+            "handoff_errno=%d handoff_fd=%d dev_open_errno=%d\n",
+            handoff_rc, handoff_errno, handoff_fd, device_errno);
     return 13;
   }
 

