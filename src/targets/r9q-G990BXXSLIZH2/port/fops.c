@@ -1508,6 +1508,30 @@ struct readiness_monitor_state_event {
 };
 #endif
 
+#if defined(RMG_DIAG_SCHEDSTAT_TRACE) && RMG_DIAG_SCHEDSTAT_TRACE
+#define READINESS_SCHEDSTAT_TRACE_CAP 64
+struct readiness_schedstat_sample {
+  unsigned long long runtime_ns;
+  unsigned long long runqueue_wait_ns;
+  unsigned long long timeslices;
+  unsigned long long polls;
+  long long at_us;
+  int observer_cpu;
+  int pselect_active;
+  char task_state;
+};
+
+struct readiness_schedstat_trace {
+  int open_errno;
+  int last_read_errno;
+  unsigned long long samples;
+  unsigned long long read_errors;
+  unsigned int stored;
+  unsigned int truncated;
+  struct readiness_schedstat_sample events[READINESS_SCHEDSTAT_TRACE_CAP];
+};
+#endif
+
 struct readiness_block_monitor {
   int tid;
   int seq;
@@ -1577,6 +1601,12 @@ struct readiness_block_monitor {
       state_trace[READINESS_MONITOR_STATE_TRACE_CAP];
   atomic_int state_trace_count;
 #endif
+#if defined(RMG_DIAG_SCHEDSTAT_TRACE) && RMG_DIAG_SCHEDSTAT_TRACE
+  struct readiness_schedstat_trace waiter_schedstat;
+#if defined(RMG_DIAG_PI_HELPER_STATE_TRACE_ACTIVE)
+  struct readiness_schedstat_trace helper_schedstat;
+#endif
+#endif
 #if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
   int block_seen;
   int block_state;
@@ -1614,6 +1644,95 @@ static int readiness_open_task_stat(pid_t tid) {
   snprintf(path, sizeof(path), "/proc/self/task/%d/stat", tid);
   return open(path, O_RDONLY | O_CLOEXEC);
 }
+
+#if defined(RMG_DIAG_SCHEDSTAT_TRACE) && RMG_DIAG_SCHEDSTAT_TRACE
+static int readiness_open_task_schedstat(pid_t tid) {
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/self/task/%d/schedstat", tid);
+  return open(path, O_RDONLY | O_CLOEXEC);
+}
+
+static void readiness_schedstat_record(
+    struct readiness_schedstat_trace *trace, int fd, char task_state,
+    unsigned long long polls, int pselect_active) {
+  if (fd < 0)
+    return;
+
+  char buf[128];
+  ssize_t len = pread(fd, buf, sizeof(buf) - 1, 0);
+  if (len <= 0) {
+    trace->read_errors++;
+    trace->last_read_errno = len < 0 && errno ? errno : EIO;
+    return;
+  }
+  buf[len] = '\0';
+
+  struct readiness_schedstat_sample sample = {0};
+  if (sscanf(buf, "%llu %llu %llu", &sample.runtime_ns,
+             &sample.runqueue_wait_ns, &sample.timeslices) != 3) {
+    trace->read_errors++;
+    trace->last_read_errno = EINVAL;
+    return;
+  }
+
+  sample.polls = polls;
+  sample.at_us = readiness_now_us();
+  sample.observer_cpu = sched_getcpu();
+  sample.pselect_active = pselect_active;
+  sample.task_state = task_state;
+  trace->samples++;
+  if (trace->stored < READINESS_SCHEDSTAT_TRACE_CAP) {
+    trace->events[trace->stored++] = sample;
+  } else {
+    trace->events[READINESS_SCHEDSTAT_TRACE_CAP - 1] = sample;
+    trace->truncated++;
+  }
+}
+
+static void readiness_schedstat_flush(
+    const struct readiness_schedstat_trace *trace, const char *target,
+    int tid, int attempt) {
+  pr_info("COWSCHED attempt=%d target=%s tid=%d samples=%llu stored=%u "
+          "truncated=%u read_errors=%llu open_errno=%d last_read_errno=%d\n",
+          attempt, target, tid, trace->samples, trace->stored,
+          trace->truncated, trace->read_errors, trace->open_errno,
+          trace->last_read_errno);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  char summary[192];
+  snprintf(summary, sizeof(summary),
+           "target=%s,samples=%llu,stored=%u,truncated=%u,read_errors=%llu,"
+           "open_errno=%d,last_read_errno=%d",
+           target, trace->samples, trace->stored, trace->truncated,
+           trace->read_errors, trace->open_errno, trace->last_read_errno);
+  rmg_diag_checkpoint_text("readiness-schedstat-summary", tid, attempt,
+                           summary);
+#endif
+  for (unsigned int i = 0; i < trace->stored; i++) {
+    const struct readiness_schedstat_sample *sample = &trace->events[i];
+    pr_info("COWSCHED_SAMPLE attempt=%d target=%s tid=%d poll=%llu "
+            "state=%c pselect_active=%d at_us=%lld observer_cpu=%d "
+            "runtime_ns=%llu runqueue_wait_ns=%llu timeslices=%llu\n",
+            attempt, target, tid, sample->polls,
+            sample->task_state ? sample->task_state : '?',
+            sample->pselect_active, sample->at_us, sample->observer_cpu,
+            sample->runtime_ns, sample->runqueue_wait_ns,
+            sample->timeslices);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+    char detail[224];
+    snprintf(detail, sizeof(detail),
+             "target=%s,state=%c,pselect_active=%d,at_us=%lld,"
+             "observer_cpu=%d,runtime_ns=%llu,runqueue_wait_ns=%llu,"
+             "timeslices=%llu",
+             target, sample->task_state ? sample->task_state : '?',
+             sample->pselect_active, sample->at_us, sample->observer_cpu,
+             sample->runtime_ns, sample->runqueue_wait_ns,
+             sample->timeslices);
+    rmg_diag_checkpoint_text("readiness-schedstat-sample", tid,
+                             sample->polls, detail);
+#endif
+  }
+}
+#endif
 
 #if defined(RMG_DIAG_READINESS_STATE_TRACE)
 static void readiness_monitor_state_mark(
@@ -1907,6 +2026,12 @@ static void readiness_log_task_wchan(pid_t tid) {
 static void *readiness_block_monitor_thread(void *arg) {
   struct readiness_block_monitor *monitor = arg;
   disable_rseq_for_thread();
+#if defined(RMG_DIAG_SCHEDSTAT_TRACE) && RMG_DIAG_SCHEDSTAT_TRACE
+  int waiter_schedstat_fd = -1;
+#if defined(RMG_DIAG_PI_HELPER_STATE_TRACE_ACTIVE)
+  int helper_schedstat_fd = -1;
+#endif
+#endif
 
 #if defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && RMG_DIAG_PASSIVE_COW_OBSERVER
   int waiter_core = atomic_load_explicit(&route_waiter_core,
@@ -1946,6 +2071,11 @@ static void *readiness_block_monitor_thread(void *arg) {
     atomic_store_explicit(&monitor->ready, 1, memory_order_release);
     return NULL;
   }
+#if defined(RMG_DIAG_SCHEDSTAT_TRACE) && RMG_DIAG_SCHEDSTAT_TRACE
+  waiter_schedstat_fd = readiness_open_task_schedstat(monitor->tid);
+  if (waiter_schedstat_fd < 0)
+    monitor->waiter_schedstat.open_errno = errno;
+#endif
 #if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
   rmg_diag_checkpoint("readiness-monitor-open", monitor->tid, fd);
 #endif
@@ -1958,9 +2088,18 @@ static void *readiness_block_monitor_thread(void *arg) {
     __asm__ volatile("yield" ::: "memory");
   if (atomic_load_explicit(&monitor->stop, memory_order_acquire)) {
     close(fd);
+#if defined(RMG_DIAG_SCHEDSTAT_TRACE) && RMG_DIAG_SCHEDSTAT_TRACE
+    if (waiter_schedstat_fd >= 0)
+      close(waiter_schedstat_fd);
+#endif
     return NULL;
   }
   int helper_fd = monitor->helper_stat_fd;
+#if defined(RMG_DIAG_SCHEDSTAT_TRACE) && RMG_DIAG_SCHEDSTAT_TRACE
+  helper_schedstat_fd = readiness_open_task_schedstat(monitor->helper_tid);
+  if (helper_schedstat_fd < 0)
+    monitor->helper_schedstat.open_errno = errno;
+#endif
 #endif
 
 #if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
@@ -1970,6 +2109,12 @@ static void *readiness_block_monitor_thread(void *arg) {
     __asm__ volatile("yield" ::: "memory");
   if (atomic_load_explicit(&monitor->stop, memory_order_acquire)) {
     close(fd);
+#if defined(RMG_DIAG_SCHEDSTAT_TRACE) && RMG_DIAG_SCHEDSTAT_TRACE
+    if (waiter_schedstat_fd >= 0)
+      close(waiter_schedstat_fd);
+    if (helper_schedstat_fd >= 0)
+      close(helper_schedstat_fd);
+#endif
     return NULL;
   }
   int locker_fd = monitor->locker_stat_fd;
@@ -2006,7 +2151,15 @@ static void *readiness_block_monitor_thread(void *arg) {
                                                    memory_order_acquire);
     }
 #endif
+#if defined(RMG_DIAG_SCHEDSTAT_TRACE) && RMG_DIAG_SCHEDSTAT_TRACE
+    int schedstat_active_before = atomic_load_explicit(
+        &monitor->pselect_active, memory_order_acquire);
+#endif
     char task_state = readiness_task_state(fd);
+#if defined(RMG_DIAG_SCHEDSTAT_TRACE) && RMG_DIAG_SCHEDSTAT_TRACE
+    int schedstat_active_after = atomic_load_explicit(
+        &monitor->pselect_active, memory_order_acquire);
+#endif
     if (atomic_load_explicit(&monitor->stop, memory_order_acquire))
       break;
 #if defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && RMG_DIAG_PASSIVE_COW_OBSERVER
@@ -2019,13 +2172,24 @@ static void *readiness_block_monitor_thread(void *arg) {
         ? atomic_load_explicit(&monitor->pselect_active, memory_order_acquire)
         : 0;
 #endif
-#if defined(RMG_DIAG_READINESS_STATE_TRACE)
+#if defined(RMG_DIAG_READINESS_STATE_TRACE) || \
+    (defined(RMG_DIAG_SCHEDSTAT_TRACE) && RMG_DIAG_SCHEDSTAT_TRACE)
     int previous_state = last_state;
 #endif
     polls++;
     last_state = (int)(unsigned char)task_state;
     if (polls == 1)
       first_state = last_state;
+#if defined(RMG_DIAG_SCHEDSTAT_TRACE) && RMG_DIAG_SCHEDSTAT_TRACE
+    int waiter_state_changed =
+        polls == 1 || last_state != previous_state;
+    if ((schedstat_active_before || schedstat_active_after) &&
+        ((polls % 4) == 0 || waiter_state_changed || task_state == 'D')) {
+      readiness_schedstat_record(&monitor->waiter_schedstat,
+                                 waiter_schedstat_fd, task_state, polls,
+                                 schedstat_active_after);
+    }
+#endif
 #if defined(RMG_DIAG_READINESS_STATE_TRACE)
     if (polls == 1 || last_state != previous_state) {
       int gate = atomic_load_explicit(&monitor->trigger_gate,
@@ -2057,6 +2221,21 @@ static void *readiness_block_monitor_thread(void *arg) {
           monitor, 1, monitor->helper_tid, helper_state, helper_polls, gate,
           pselect_active, sched_getcpu(), readiness_now_us());
     }
+#if defined(RMG_DIAG_SCHEDSTAT_TRACE) && RMG_DIAG_SCHEDSTAT_TRACE
+    int helper_pselect_active = atomic_load_explicit(
+        &monitor->pselect_active, memory_order_acquire);
+    int helper_state_changed =
+        helper_polls == 1 ||
+        monitor->helper_last_state != previous_helper_state;
+    if ((schedstat_active_before || schedstat_active_after ||
+         helper_pselect_active) &&
+        ((helper_polls % 4) == 0 || helper_state_changed ||
+         helper_state == 'D')) {
+      readiness_schedstat_record(&monitor->helper_schedstat,
+                                 helper_schedstat_fd, helper_state,
+                                 helper_polls, helper_pselect_active);
+    }
+#endif
     if (helper_state == 'D')
       monitor->helper_blocked_samples++;
 #endif
@@ -2290,6 +2469,12 @@ static void *readiness_block_monitor_thread(void *arg) {
   monitor->first_state = first_state;
   monitor->last_state = last_state;
   close(fd);
+#if defined(RMG_DIAG_SCHEDSTAT_TRACE) && RMG_DIAG_SCHEDSTAT_TRACE
+  readiness_schedstat_flush(&monitor->waiter_schedstat, "waiter",
+                            monitor->tid, monitor->seq);
+  if (waiter_schedstat_fd >= 0)
+    close(waiter_schedstat_fd);
+#endif
 #if defined(RMG_DIAG_PI_HELPER_STATE_TRACE_ACTIVE)
   pr_info("readiness mprotect-helper observer tid=%d open_errno=%d "
           "polls=%llu blocked_samples=%llu first_state=%d last_state=%d\n",
@@ -2308,6 +2493,13 @@ static void *readiness_block_monitor_thread(void *arg) {
                            helper_detail);
 #endif
   close(helper_fd);
+#if defined(RMG_DIAG_SCHEDSTAT_TRACE) && RMG_DIAG_SCHEDSTAT_TRACE
+  readiness_schedstat_flush(&monitor->helper_schedstat,
+                            "mprotect-helper", monitor->helper_tid,
+                            monitor->seq);
+  if (helper_schedstat_fd >= 0)
+    close(helper_schedstat_fd);
+#endif
 #endif
 #if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
   close(locker_fd);
