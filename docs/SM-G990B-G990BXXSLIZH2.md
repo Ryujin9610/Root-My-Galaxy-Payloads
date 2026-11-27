@@ -4650,29 +4650,92 @@ excerpt are in
 `build/pi-helper-state-live-wchan-helperd-wchan-20261127/bugreport.zip` and
 `build/pi-helper-state-live-wchan-helperd-wchan-20261127/kernel-panic-excerpt.txt`.
 
-The source-level match is suggestive but not conclusive. The supplied
-Samsung source archive does not contain this exact
-`kernel/locking/rtmutex_common.h`, and no matching unstripped `vmlinux` or
-line table was available. In upstream Linux v5.4.289,
-`rt_mutex_top_waiter()` contains `BUG_ON(w->lock != lock)` at line 55
-([source](https://github.com/gregkh/linux/blob/v5.4.289/kernel/locking/rtmutex_common.h#L47-L58));
-the PI-chain walk calls this helper at several points
-([source](https://github.com/gregkh/linux/blob/v5.4.289/kernel/locking/rtmutex.c#L625-L750)).
-A waiter-to-lock consistency failure is therefore a plausible explanation
-for the vendor kernel's reported line 60. The five-line offset and vendor
-source difference prevent identifying that exact assertion from this
-evidence alone. What is established is that a PI-futex/rt-mutex kernel BUG
-occurred while `libpoc64.so` was executing; the evidence does not distinguish
-malformed PI state from a race or other memory corruption.
+#### Exact Samsung source match and panic-site reconstruction
 
-After reboot, ADB reports `sys.boot_completed=1`,
+The downloaded `SM-G990B.zip` contains the Samsung Android 16 kernel base
+archive `SM-G990B_16_Opensource.zip` and a firmware delta archive for
+`G990BXXSLIZH2`. The delta README instructs unpacking the `G990BXXUGIYJ1`
+base and then applying the SLIZH2 update. The base Makefile identifies Linux
+5.4.289. The delta contains 35 files and does not replace
+`kernel/locking/rtmutex_common.h`, `kernel/locking/rtmutex.c`,
+`kernel/futex.c`, or `include/linux/rtmutex.h`; those files therefore remain
+the corresponding 5.4.289 base files for this firmware source bundle.
+
+In that base, `kernel/locking/rtmutex_common.h` has SHA-256
+`c79353d84625e4d352be7d96193cf162fba7857a85171540996f499679ea3d08` and
+line 60 is exactly `BUG_ON(w->lock != lock)`. `rt_mutex_top_waiter()` gets
+the cached leftmost node from `lock->waiters`, treats it as an embedded
+`rt_mutex_waiter`, and asserts that the waiter's `lock` pointer matches the
+mutex. The panic's reported `rtmutex_common.h:60` is therefore an exact
+source match, not an inference from a five-line offset. The corresponding
+upstream 5.4.289 sources are also available for
+[`rtmutex_common.h`](https://github.com/gregkh/linux/blob/v5.4.289/kernel/locking/rtmutex_common.h#L52-L62),
+[`rtmutex.h`](https://github.com/gregkh/linux/blob/v5.4.289/include/linux/rtmutex.h#L30-L33),
+[`futex_lock_pi()`](https://github.com/gregkh/linux/blob/v5.4.289/kernel/futex.c#L2914-L2932),
+and [`futex_setup_timer()`](https://github.com/gregkh/linux/blob/v5.4.289/kernel/futex.c#L489-L503).
+
+The saved register/disassembly analysis at the panic site records `x23` as
+the rt-mutex being walked (`0xffffff80f5bca940`), `x0` as the cached
+leftmost waiter pointer (`0xffffff80f5bca950`), and `x8` as zero when the
+waiter's `lock` field is loaded. Since `x0 == x23 + 0x10`, and the ARM64 layout places
+`waiters.rb_leftmost` at offset `0x10` in the `rt_mutex` structure, the cached
+leftmost pointer points back to the address of its own field instead of to a
+waiter node. The failing comparison then sees a null
+waiter-lock value rather than `x23`; the firmware disassembly reaches
+`brk #0x800` at `rt_mutex_adjust_prio_chain+0x878`. This establishes that
+the waiter tree was malformed and self-referential at the panic. It does not
+show whether that state was deliberately forged by the exploit path or arose
+from a race or other corruption, and the crash record does not preserve the
+user futex address that led there. No matching unstripped `vmlinux` or DWARF
+line table was available; the source match comes from Samsung's base-plus-
+delta package, and the register interpretation comes from the saved firmware
+disassembly.
+
+After reboot, ADB reported `sys.boot_completed=1`,
 `ro.boot.bootreason=kernel_panic,bug`, the same Android 16 fingerprint and
 kernel `5.4.289-qgki-32192773-abG990BXXSLIZH2`, low-power mode off, shell UID
-2000, battery 100% at 21.5 C, and no `/dev/ksu` or `/proc/ksu`. This
+2000, battery 100% at 21.5 C, and no `/dev/ksu` or `/proc/ksu`. The
 post-reboot snapshot is saved as
 `build/pi-helper-state-live-wchan-helperd-wchan-20261127/phone-state-after-reboot.txt`.
+The intended helper `wchan` was not captured, so the source match does not
+identify what blocked that helper.
 
-The next useful step is offline matching against the exact Samsung
-`rtmutex_common.h` or a matching symbolized kernel build, then a source-level
-review of the payload's PI-futex setup. The intended helper `wchan` was not
-captured, so this run does not answer what blocked that helper.
+#### Payload PI-futex call review
+
+The stack's `futex_lock_pi()` frame narrows the immediate failure to the
+plain `FUTEX_LOCK_PI` slow path. It does not identify which user-space futex
+word was passed. In the 64-bit payload path, two direct contended lock calls
+fit that stack:
+
+- `owner_thread()` in `main.c:294` waits on `f_pi_chain`, after the waiter
+  thread has locked that word at `main.c:168`.
+- `route_pi_sanitize()` in `fops.c:528` waits on `f_pi_sanitize`, which is
+  held by `sanitize_holder_thread()` at `main.c:105`. The sanitizer is called
+  around the pselect route and its cleanup paths at `fops.c:861`, `3262`, and
+  `3442`.
+
+The initial `f_pi_target` lock and the sanitizer holder's initial lock are
+uncontended in this setup, so they do not match the captured
+`task_blocks_on_rt_mutex` frame. The earlier `FUTEX_WAIT_REQUEUE_PI` and
+`FUTEX_CMP_REQUEUE_PI` operations create the exploit's PI state, but the
+panic's `futex_lock_pi()` frame is the direct-lock handler. Without the
+calling TID, syscall arguments, or a checkpoint naming the futex word, the
+owner-chain call and sanitizer call cannot be distinguished.
+
+There is a separate timeout-clock bug in `route_pi_sanitize()`. It builds an
+absolute deadline by calling `clock_gettime(CLOCK_MONOTONIC)` and adding
+50 ms (`fops.c:521-528`), then passes that deadline to plain
+`FUTEX_LOCK_PI`. In the matching 5.4.289 source, `futex_lock_pi()` calls
+`futex_setup_timer(..., FLAGS_CLOCKRT, ...)`, and `futex_setup_timer()`
+selects `CLOCK_REALTIME` for that flag. The monotonic deadline is therefore
+interpreted against realtime and is already in the past. An `ETIMEDOUT`
+result from this call cannot be treated as evidence of a 50 ms wait. This
+clock mismatch may change the cleanup timing, but it does not by itself
+explain the self-referential waiter tree or prove that this call caused the
+panic.
+
+Before any future diagnostic attempt, change the sanitizer deadline to use
+`CLOCK_REALTIME` and add per-call-site logging for the calling TID and futex
+word so that a later crash can identify which contended lock was involved.
+Do not repeat the panicking image unchanged. No code, binary, or phone state
+was changed during this offline source review.
