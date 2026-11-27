@@ -4541,8 +4541,21 @@ the syscall interval does not prove when the write lock was acquired. The
 helper's sampled `R` state and unchanged schedstat counters do not settle
 that ownership question.
 
+#### Runtime tracefs access
+
+The current ADB shell (UID 2000) can read `/proc/config.gz`, which reports
+`CONFIG_TRACEPOINTS=y`, `CONFIG_EVENT_TRACING=y`, and `CONFIG_FTRACE=y`.
+However, it cannot read `/sys/kernel/tracing/available_events` or
+`set_event` (both return permission denied), and
+`/sys/kernel/debug/tracing` is absent. This does not establish which
+individual lock events are built; write access to `set_event` was not tested.
+The shell cannot inspect the tracepoint inventory, so no lock event could be
+selected or verified through this read-only check. No tracefs controls were
+changed.
+
 The build log, complete RMG UI text and XML, before/run/final screenshots, and
 profile-selection dumps are saved under
 `build/pi-helper-state-live-wchan-20261127/` (`build.log`,
 `phone-run-ui.txt`, `ui-running-80s.xml`, `phone-before.png`,
-`phone-run-final.png`, `ui-profile.xml`, and `phone-config-snippet.txt`).
+`phone-run-final.png`, `ui-profile.xml`, `phone-config-snippet.txt`,
+and `phone-tracefs-access.txt`).
