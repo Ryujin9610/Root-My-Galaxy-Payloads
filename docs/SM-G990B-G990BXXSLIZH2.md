@@ -4746,6 +4746,65 @@ r27c at
 `build/pi-futex-clockfix-calltrace-20261127/cve-2026-43499-app.so` (161,560
 bytes; SHA-256
 `85b22a502f5feb3500078f79bda25ae2036422848ed25070dc4aa91e26f320bd`). It
-retains the prior diagnostic profile and adds the PI call trace. The candidate
-has not been run on the phone; the previous panicking image should not be
-reused. No phone state was changed during this build.
+retains the prior diagnostic profile and adds the PI call trace.
+
+#### Guarded clock-fix run — 27 November 2026
+
+The candidate was imported into RMG Next `0.13+local.af081c2 (28218460)` and
+run once against the exact `r9q-G990BXXSLIZH2` profile. RMG reported Shizuku
+permission granted, selected the local file
+`rmg-pi-clockfix-calltrace-20261127.so`, verified the profile's KernelSU
+service, and logged `diagnostic=uclamp-trigger-only` with
+`cfi_write_pipe_physrw_root=disabled`. Battery saver was off. The run reached
+the exploit stage and performed one independent attempt.
+
+The new call trace distinguishes both contended `FUTEX_LOCK_PI` calls:
+
+- `route-sanitize` entered at uptime 6001.258 s and returned at 6001.309 s,
+  about 51 ms later. The trace reports `CLOCK_REALTIME` and `timeout_ms=50`;
+  the call returned `ETIMEDOUT` (110). Its subsequent unlock returned
+  `EPERM` (1), consistent with the lock call timing out before acquiring the
+  lock.
+- `owner-chain` entered at uptime 6001.060 s and returned at 6009.060 s,
+  about 8 seconds later, with return value 0 and errno 0.
+
+This run therefore verifies that the sanitizer's corrected realtime deadline
+behaves like a 50 ms timeout. It also shows the owner-chain caller can remain
+inside `FUTEX_LOCK_PI` for several seconds and later return successfully. The
+older panic capture still cannot be assigned to either call site because it
+does not contain a caller TID or futex address.
+
+The readiness observer's placement and timing differed from the 26 November
+run at
+`build/pi-helper-state-trace-uclamp-20261126/one-shot-run/checkpoint.log`:
+
+| Observation | 26 November blocked-state run | 27 November clock-fix run |
+| --- | --- | --- |
+| Observer CPU | CPU 1 | CPU 0; effective mask `0x1`, allowed mask `0x5f`, affinity error 0 |
+| Waiter samples | 78 polls; final sample `state=68` | 36 polls; samples remained `state=82`, `blocked_samples=0` |
+| pselect duration | 2,858 µs | 582 µs |
+| mprotect timing | 4,780 µs | 1,183 µs |
+
+These are observations from separate runs. They do not establish that CPU
+placement caused the different waiter state or durations. The current
+readiness COW check saw a file-backed page before pselect and an anonymous page
+after it, but did not establish dirty-page or control-page mutation; the
+canary remained unchanged, the CFI walk made zero calls, and the route ended at
+step 42. The guarded route stopped before CFI. The physical read/write summary
+reported `root=0`, `read_ok=0`, and `write_ok=0`.
+
+RMG displayed exit code 255 with its generic message about an unavailable
+privileged spawn. That message is misleading for this run: the RMG log records
+Shizuku permission granted and the full payload trace. The port's
+`preload.c` logged `exploit attempt=1/1 failed status=1`, then calls `pr_error`
+for the exhausted attempt, which exits with `-1` and is surfaced by the shell
+as 255. The payload did run; its guarded COW/CFI readiness condition did not
+pass.
+
+The attempt did not reboot the phone: ADB remained connected,
+`sys.boot_completed` stayed at 1, and uptime advanced from about 6001 to 6186
+seconds. The existing `kernel_panic,bug` boot reason therefore predates this
+run. Afterward `/dev/ksu` was absent and the RMG failure occurred before its
+KernelSU load stage. The captured RMG log and durable checkpoint are in
+`build/pi-futex-clockfix-calltrace-20261127/rmg-failure-log.txt` and
+`build/pi-futex-clockfix-calltrace-20261127/post-attempt-checkpoint.log`.
