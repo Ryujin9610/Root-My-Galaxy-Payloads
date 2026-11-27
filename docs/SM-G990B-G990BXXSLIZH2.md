@@ -5049,8 +5049,8 @@ ended in `R`. Pselect returned 100 in 2,028 microseconds. The mprotect helper
 was sampled in `D` at poll 139 while pselect was active, 19 microseconds before
 the pselect-return trace timestamp; its captured wchan value was `0`. The
 first `PROT_NONE` mprotect ran from trace time `34414180991` to `34414183009`
-(2,018 microseconds). Pselect began about 48 microseconds after that call
-started, so the call returned about 1,970 microseconds into pselect, roughly
+(2,018 microseconds). The pselect-before trace followed 46 microseconds after
+that call started, so the call returned 1,972 microseconds into pselect, roughly
 58 microseconds before pselect returned. Both helper calls completed, with
 two loop iterations and 4,008 microseconds total helper time.
 
@@ -5068,7 +5068,7 @@ same Android 16 fingerprint and kernel; the existing
 
 Compared with the 26 November blocked-waiter run, consumer placement is now
 explicitly confirmed to match, and the other three CPU roles match as well.
-The first mprotect call returned about 1,970 microseconds after pselect began,
+The first mprotect call returned about 1,972 microseconds after pselect began,
 close to the earlier 2,044-microsecond offset. However, the earlier run
 sampled the waiter in `D` at poll 78 (about 1,128 microseconds into pselect),
 whereas this run sampled the waiter in `R` throughout all 139 monitor polls
