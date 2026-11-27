@@ -5142,9 +5142,15 @@ pselect returned. The second mprotect completed 1,241 microseconds after
 pselect began. Both calls took 1,293 microseconds total.
 
 The run reported one consumer scheduler call and one success, with a
-19-microsecond call duration and scheduler return/errno `0/0`. The durable
-checkpoint has no `sched-uclamp-*` per-call records, so it does not expose
-the target's clamp values or flags. Pagemap changed from file-backed to
+19-microsecond call duration and scheduler return/errno `0/0`. The counters
+are consistent with the source: this guarded path increments `consumer_calls`
+before `sched_setattr_tid_uclamp_nochange()` and increments `consumer_success`
+only when it returns 0. The durable checkpoint has no `sched-uclamp-*`
+per-call records because logging is deliberately deferred around the timing
+window. `rmg_diag_checkpoint_defer(1)` is set before the monitor is armed,
+and `rmg_diag_checkpoint()` discards records while deferred rather than
+buffering them; deferral is cleared after pselect. The target's clamp values
+and flags are therefore not retained. Pagemap changed from file-backed to
 anonymous/exclusive and smaps anonymous memory rose from 0 to 4 KiB, but the
 complete 16-MiB canary scan found no changed data (`512/512` order-3 chunks;
 `mutated=0`). The fops readback was skipped. `readiness-cow cfi miss
