@@ -5236,13 +5236,20 @@ The in-memory trace finally captures the complete scheduler request:
 `getattr=0/0 policy=0 nice=0 flags=0->96 util=0/1024`
 `setattr attempted=1 result=0 errno=0 call=19 us`.
 
-Thus both `sched_getattr()` and the no-change `sched_setattr()` call succeeded
-without an error on this kernel. The request used the default clamp range
-(`min=0`, `max=1024`); this proves the syscall path accepted the request, but
-does not show that uclamp changed scheduling behavior or caused the waiter
-state. The 512-MiB COW trace observed a blocked waiter and the overlay geometry
-check passed, but the 16-MiB canary scan found no changed chunks
-(`mutated=0`). The fops readback was skipped. The diagnostic guard recorded
+Thus both `sched_getattr()` and the same-value `sched_setattr()` call succeeded
+without an error on this kernel. The values stayed at the default clamp range
+(`min=0`, `max=1024`), although the added flags were not a pure no-op. The
+matching Samsung source package identifies the base kernel as 5.4.289 and
+instructs applying the `G990BXXSLIZH2` update archive; that update does not
+contain `kernel/sched/core.c`. In the base source, the UAPI defines the two
+clamp flags as `0x20` and `0x40`, a same-policy request with those flags takes
+the `change` path in `__sched_setscheduler()`, and `sched_setattr()` calls it
+with PI enabled. The `change` path calls `rt_mutex_adjust_pi(p)`. This supports
+that the request entered the intended PI-adjust path, but does not prove that
+the waiter's PI tree changed or that its effective utilization changed. The
+512-MiB COW trace observed a blocked waiter and the overlay geometry check
+passed, but the 16-MiB canary scan found no changed chunks (`mutated=0`,
+`task_pi=0`). The fops readback was skipped. The diagnostic guard recorded
 `uclamp-trigger-stop-before-cfi a=0 b=0`, forced the route signal to zero, and
 set `readiness-cow cfi miss step=42` as its stop sentinel. CFI was not called.
 
@@ -5263,9 +5270,9 @@ poll 24 and 643 microseconds on 27 November. CPU placement also differed
 are not a controlled placement comparison. The key result is narrower: the
 scheduler syscall succeeds, while the canary remains unchanged and the route
 stops before CFI. Further work should inspect the canary/COW transition and
-compare the exact scheduler request with the target kernel implementation;
-the current evidence does not justify changing the request or enabling later
-exploit stages.
+capture the waiter's PI-tree links around `rt_mutex_adjust_pi()` and compare
+them with the canary scan. The current evidence does not justify changing the
+request or enabling later exploit stages.
 
 The captured UI log, durable checkpoint, result UI XML, and result screenshot
 are in `build/uclamp-memorytrace-20261128/`. Their SHA-256 values are
