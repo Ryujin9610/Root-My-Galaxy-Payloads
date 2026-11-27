@@ -4928,3 +4928,69 @@ CPU placement, while retaining the COW-only stop before FOPS, physical
 read/write, and root. Require 256/256 full sends and 512/512 canary coverage
 before interpreting a negative scan. Do not treat the readback-only route as
 tested until the readiness signal is observed.
+
+#### COW-only send-trace and passive-observer run (27 November 2026)
+
+A fresh one-attempt diagnostic combined the full reclaim send trace with the
+passive COW observer and the synchronized mprotect start. It used
+`RMG_DIAG_COW_ONLY=1`, `RMG_DIAG_COW_TRACE=1`,
+`RMG_DIAG_COW_SEND_TRACE=1`, `RMG_DIAG_PASSIVE_COW_OBSERVER=1`,
+`RMG_DIAG_PASSIVE_COW_HELPER_CORE=4`, `RMG_DIAG_DURABLE_LOG=1`, and
+`RMG_DIAG_COW_PTE_MB=512`. No mprotect delay or fixed waiter override was
+enabled. The build guard rejects fixed waiter affinity in COW-only mode; the
+target default selected waiter CPU 0. The binary was built with NDK r27c as
+`build/cow-only-sendtrace-passive-20261127/cve-2026-43499-app.so` (164,672
+bytes; SHA-256
+`6F21C26828031423A4E7C272774B0780EC8C78568EE0C1387297E5601BF79377`). The
+phone's staged copy had the same hash and RMG confirmed it was using the local
+payload. Its runtime guard reported `diagnostic=cow-only` and
+`cfi_write_pipe_physrw_root=disabled`.
+RMG's profile log showed its general route limit of 24, but the payload
+supervisor reported `attempts=1` and `exploit attempt=1/1`; only one payload
+attempt ran.
+
+The reclaim stream was complete. The order-3 seed reported 128/128 sends;
+the final reclaim requested a 16-MiB send buffer and got an effective 32-MiB
+buffer. All 256 `sendmsg()` calls returned exactly 65,536 bytes, for
+16,777,216/16,777,216 bytes and `complete=1`. The canary read the same full
+16 MiB, scanned 512/512 order-3 chunks, and reported
+`changed_chunks=0 ... mutated=0`. This makes the negative canary result
+complete for this run.
+
+CPU placement matched the earlier blocked-waiter run: waiter CPU 0, passive
+observer CPU 1, and mprotect helper CPU 4. The observer inherited CPU 0's
+affinity, widened to allowed mask `0x3f`, then pinned to CPU 1 (effective mask
+`0x2`). It recorded 11 waiter samples; the waiter remained in state `82`
+(`R`) at the sampled points, including poll 8 while the trigger gate and
+pselect were active. No waiter `D` sample occurred. The mprotect helper,
+however, was sampled in state `68` (`D`) at poll 48 with the gate and pselect
+active, at the same trace timestamp as pselect return. Pselect returned 112
+in 648 microseconds; the mprotect helper ran for 2,539 microseconds. The
+pagemap changed from present/file/exclusive to present/non-file/exclusive,
+and the smaps anonymous count changed from 0 to 4 KiB, consistent with a COW
+copyout. This does not by itself prove which lock the helper waited on.
+
+The route still reported `calls=0 success=0`, so the readiness signal stayed
+false and `try_cfi_stage()` did not run. The COW-only guard forced the signal
+off before CFI; physical read/write, root, and KernelSU loading were not
+reached. RMG reported its generic failure code 255. `/dev/ksu` remained
+absent. ADB stayed online and `/proc/uptime` was about 31,499 seconds after
+the run, so the `ro.boot.bootreason=kernel_panic,bug` value observed then
+predates this attempt and is not evidence that this run rebooted the phone.
+
+This comparison rules out CPU placement alone as the explanation for the
+missing waiter block: the prior blocked run and this run used the same waiter,
+observer, and helper CPUs, yet only the prior run sampled the waiter in `D`.
+The runs differ in their trigger configuration and timing: the prior uclamp
+trigger run's pselect lasted 2,858 microseconds and recorded the waiter in `D`
+at poll 78, while this COW-only run's pselect lasted 648 microseconds and
+only the helper entered `D`. The next source review should compare the
+pre-pselect scheduling and thread setup in those two builds, then focus any
+follow-up on the helper's block and the waiter's state around pselect return.
+Keep the complete send trace and COW-only stop for that comparison.
+
+The RMG UI log, durable checkpoint, result screen, and build are in
+`build/cow-only-sendtrace-passive-20261127/`; the checkpoint SHA-256 is
+`AD6400155BE02565FC9271FD84597F4A9EF9C0CF674664D743D2800701DBFC7A`, and the
+RMG UI log SHA-256 is
+`44450B6BA396E011B7756365C5A0DADAF55DFDE1B6C89E7F5021E70DB0F34448`.
