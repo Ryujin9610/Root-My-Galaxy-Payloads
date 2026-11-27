@@ -4859,3 +4859,72 @@ relevant entries also isolated in
 `build/pi-fops-readback-only-20261127/post-attempt-checkpoint-excerpt.log`.
 The next investigation should focus on why the readiness route produced no
 waiter calls and why the canary scan stopped short of the full reclaim stream.
+
+#### Source trace: readiness gate and short reclaim stream
+
+The `calls` field in `readiness-cow walk` is not a count of pselect calls.
+`readiness_pselect_asm()` did run once and returned 100. `consumer_calls` is
+incremented only after the monitor samples the waiter in `D` state while the
+trigger gate and pselect are active and the waiter has first been observed
+runnable after the gate. That branch then invokes `sched_setattr_tid_nochange()`.
+The route signal additionally requires `monitor.saw_block`, valid overlay
+geometry, and a successful consumer call. In the current run there was no
+monitor `D` sample, so `calls=0 success=0`, the route signal stayed false, and
+`try_cfi_stage()` never ran. The later `route-sanitize` timeout is cleanup
+after pselect and did not cause the missing consumer call.
+
+The current COW trace has no post-gate-runnable or blocked event. Its monitor
+first sampled the waiter in state `82` before pselect. Pselect reported
+711 microseconds (713 microseconds across the trace brackets) and returned
+100; the first mprotect pass lasted 746
+microseconds, and the helper loop lasted 1,448 microseconds. By comparison,
+the 26 November blocked-state run had a 2,858-microsecond pselect, a
+4,780-microsecond helper interval, and a `D` sample at poll 78 while the
+trigger gate and pselect were active. That sample was followed by one
+successful scheduler call. The blocked run logged waiter CPU 0, observer CPU
+1, helper CPU 4, and consumer CPU 5. The current candidate did not enable the
+passive observer or log its CPU, so these runs do not isolate CPU placement as
+the cause. The timing difference is consistent with an intermittent,
+scheduling-sensitive wait window, but the userspace trace does not prove
+whether or for how long the current COW fault waited on `mmap_sem`.
+
+There is also a misleading field in the current output: `[OVERLAY] ...
+sched=0/0` looks like a successful scheduler call, but the monitor struct is
+zero-initialized and `sched_ret` / `sched_errno` are assigned only inside the
+`D`-state branch. With `calls=0`, that `0/0` is the untouched default. A future
+trace should add an explicit `sched_attempted` field or initialize the return
+value to a non-success sentinel.
+
+The short canary result has a separate, directly recorded cause. The current
+run reported `sends=251/256`. Its build did not enable
+`RMG_DIAG_COW_SEND_TRACE`, so the sender uses the 8-MiB send-buffer request and
+the nonblocking loop counts any positive `sendmsg()` return as a sent chunk;
+it does not verify that the return equals the requested 65,536 bytes or record
+the byte count. Linux permits nonblocking sends to fail with `EAGAIN` when the
+send buffer is full, and a successful send reports the number of bytes sent.
+Thus 251 counted sends do not prove 251 full chunks.
+
+The canary then performs one `recv(MSG_DONTWAIT | MSG_PEEK)` on the
+`AF_UNIX/SOCK_STREAM` receiver. Stream reads ignore message boundaries and
+return currently available data without waiting for the full request, so one
+peek is not by itself a complete-stream check ([`recv(3p)`](https://www.man7.org/linux/man-pages/man3/recv.3p.html)).
+This run returned 16,420,480 of 16,777,216 requested bytes, covering 501 full
+order-3 chunks plus 3,712 trailing bytes. The stream was already short at the
+sender (`251/256`), so the zero-change result cannot establish that the
+unscanned tail was unchanged. The run also lacked per-send byte counts, so it
+cannot distinguish a failed send from a positive short send or an additional
+short peek.
+
+The earlier `RMG_DIAG_COW_SEND_TRACE` run provides a useful control: its
+16-MiB send-buffer request produced an effective 32-MiB buffer, all 256 sends
+returned exactly 65,536 bytes, and the canary read all 16,777,216 bytes
+(512/512 chunks). That run still had no blocked waiter because its delayed
+mprotect began after pselect returned. Together, the runs show that the
+reclaim-stream completeness and waiter-state gates are independent.
+
+For the next diagnostic, combine the already-tested full-send trace with the
+original synchronized mprotect start and the passive observer's separate
+CPU placement, while retaining the COW-only stop before FOPS, physical
+read/write, and root. Require 256/256 full sends and 512/512 canary coverage
+before interpreting a negative scan. Do not treat the readback-only route as
+tested until the readiness signal is observed.
