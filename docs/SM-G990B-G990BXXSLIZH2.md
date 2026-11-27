@@ -5094,3 +5094,93 @@ original XML SHA-256 is
 `0D03240FE47DBDB3B9B4973279AEE7C177B71B4920BF43BF3D858E041144611B`; and the
 result screenshot SHA-256 is
 `B7A5ADB995521458262F9A68E196FC6B5CBA147C44503C3EB9824B1210BCC272`.
+
+### 2026-11-27 matched PI/uclamp, send-trace, affinity comparison
+
+A fresh one-attempt diagnostic combined the PI/uclamp trigger with the complete
+send trace, passive waiter/helper observer, and consumer-affinity tracing. The
+build retained the 512-MiB COW region and the compile-time stop before CFI,
+physical read/write, and root. Flags were `RMG_DIAG_PI_PROBE_ONLY=1`,
+`RMG_DIAG_UCLAMP_TRIGGER_ONLY=1`, `RMG_DIAG_FOPS_READBACK_ONLY=1`,
+`RMG_DIAG_PI_HELPER_STATE_TRACE=1`, `RMG_DIAG_COW_TRACE=1`,
+`RMG_DIAG_COW_SEND_TRACE=1`, `RMG_DIAG_PASSIVE_COW_OBSERVER=1`,
+`RMG_DIAG_COW_CONSUMER_AFFINITY=1`,
+`RMG_DIAG_PASSIVE_COW_HELPER_CORE=4`, `RMG_DIAG_DURABLE_LOG=1`, and
+`RMG_DIAG_COW_PTE_MB=512`. The Android API 30 / NDK r27b build is
+`build/pi-uclamp-sendtrace-consumer-affinity-20261127/cve-2026-43499-app.so`
+(155,944 bytes; SHA-256
+`B21F34A78B50BC384F8DEAE4A3D8052C03D3507B8D3F7CD866F5C2EA46C3DDAE`). The
+staged phone copy matched. RMG selected the local file, identified the
+`r9q-G990BXXSLIZH2` profile, used Shizuku, and reported
+`diagnostic=uclamp-trigger-only`,
+`cfi_write_pipe_physrw_root=disabled`, and one exploit attempt.
+
+The phone remained on Android 16, fingerprint
+`samsung/r9qxeea/r9q:16/BP2A.250605.031.A3/G990BXXSLIZH2:user/release-keys`,
+and kernel `5.4.289-qgki-32192773-abG990BXXSLIZH2`. Power saving was off and
+battery was 100%.
+
+The consumer began with affinity mask `0x1`, widened to `0x3f`, then fell
+back from requested CPU 7 (`EINVAL`) to CPU 5 (effective mask `0x20`). The
+waiter was pinned to CPU 0, the observer to CPU 1 (effective mask `0x2`), and
+the mmap helper affinity selected CPU 4. These match the four CPU roles in
+the 26 November blocked-waiter run and the preceding 27 November COW-only
+send-trace run.
+
+Controlled reclaim completed all 256 sends of 65,536 bytes (16 MiB total);
+the 16-MiB socket-buffer request had an effective size of 32 MiB. Kernel-page
+preparation took 59,681 ms. Pselect returned 118 in 643 microseconds. The
+waiter was `R` at poll 8, then `D` at poll 24 while the trigger gate and
+pselect were active. Its last passive sample was at monotonic time
+`35730383070 us`, about 282 microseconds after pselect began. The helper
+observer saw the mprotect helper in `R` across all 24 polls, with no `D`
+samples.
+
+The first `PROT_NONE` mprotect began 49 microseconds before pselect and
+returned 587 microseconds after pselect began, 57 microseconds before
+pselect returned. The second mprotect completed 1,241 microseconds after
+pselect began. Both calls took 1,293 microseconds total.
+
+The run reported one consumer scheduler call and one success, with a
+19-microsecond call duration and scheduler return/errno `0/0`. The durable
+checkpoint has no `sched-uclamp-*` per-call records, so it does not expose
+the target's clamp values or flags. Pagemap changed from file-backed to
+anonymous/exclusive and smaps anonymous memory rose from 0 to 4 KiB, but the
+complete 16-MiB canary scan found no changed data (`512/512` order-3 chunks;
+`mutated=0`). The fops readback was skipped. `readiness-cow cfi miss
+step=42` is the sentinel assigned by the diagnostic guard; CFI did not run.
+The guard recorded
+`uclamp-trigger-stop-before-cfi a=0 b=0`, forced the route signal to zero,
+and stopped before CFI, physical-RW, and root. RMG returned code 255 at
+“Running kernel exploit”; KernelSU was not loaded, and `/dev/ksu` and
+`/proc/ksu` remain absent.
+
+| Observation | 26 Nov blocked PI/uclamp | 27 Nov COW-only matched | 27 Nov PI/uclamp matched |
+| --- | --- | --- | --- |
+| Consumer / waiter / observer / helper CPUs | 5 / 0 / 1 / 4 | 5 / 0 / 1 / 4 | 5 / 0 / 1 / 4 |
+| Waiter state | `D` at poll 78, about +1,128 us | no `D` in 139 polls; helper entered `D` | `D` at poll 24, about +282 us |
+| Pselect result and duration | 118 / 2,858 us | 100 / 2,028 us | 118 / 643 us |
+| First mprotect return after pselect start | +2,044 us | +615 us | +587 us |
+| Helper interval | 4,780 us | 4,008 us | 1,293 us |
+| Reclaim sends / page preparation | 251/256 / 133,561 ms | 256/256 / 55,220 ms | 256/256 / 59,681 ms |
+
+This rules out CPU placement alone as the reason the waiter state differed:
+the COW-only run and this PI/uclamp run used the same selected CPU roles and
+completed all sends, yet only the PI/uclamp run sampled the waiter in `D`.
+That is consistent with the trigger profile affecting the observed wait, but
+does not prove causation. Timing varied substantially: the current `D` sample
+came earlier in a much shorter pselect window, and its first mprotect ended
+about 1.46 ms earlier than in the 26 November run. The current and earlier
+PI/uclamp runs also differ in reclaim completeness and page-preparation time.
+
+The RMG UI log, durable checkpoint, result UI XML, result screenshot, and
+build are in `build/pi-uclamp-sendtrace-consumer-affinity-20261127/`. Their
+SHA-256 values are respectively
+`AC218D4BF2B6E9163411EFABA111F9D6DBAB04A24E7D0BFDBDC8C479375B468F`,
+`E6EF07B69769CCDCC3AD0202F0B9EE9D445F3DE69CD79C40C0ADB0F2D8C2E521`,
+`FE72A260629CC89B3B9A5F013DABCB5C17D2D21B214621621AB565ED6856307A67`, and
+`498DB05BC821DA918FFB4898802DEE5CB1652FF2EEBB4D8862E2ACDCD1D5F829`; the
+payload SHA-256 is recorded above. After the attempt the phone remained
+booted and ADB-responsive with the same firmware and kernel. The existing
+`ro.boot.bootreason=kernel_panic,bug` value did not change and is not evidence
+of a reboot from this attempt.
