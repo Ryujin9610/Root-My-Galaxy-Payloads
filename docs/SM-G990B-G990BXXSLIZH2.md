@@ -4789,17 +4789,20 @@ These are observations from separate runs. They do not establish that CPU
 placement caused the different waiter state or durations. The current
 readiness COW check saw a file-backed page before pselect and an anonymous page
 after it, but did not establish dirty-page or control-page mutation; the
-canary remained unchanged, the CFI walk made zero calls, and the route ended at
-step 42. The guarded route stopped before CFI. The physical read/write summary
-reported `root=0`, `read_ok=0`, and `write_ok=0`.
+canary remained unchanged. This build's `RMG_DIAG_UCLAMP_TRIGGER_ONLY` guard
+then stopped before CFI and reported step 42, the sentinel assigned by that
+guard; this is the expected diagnostic stop, not a kernel fault. The CFI walk
+made zero calls, so this run says nothing about the CFI or root stages. The
+physical read/write summary reported `root=0`, `read_ok=0`, and `write_ok=0`,
+as expected because those stages were disabled.
 
 RMG displayed exit code 255 with its generic message about an unavailable
 privileged spawn. That message is misleading for this run: the RMG log records
 Shizuku permission granted and the full payload trace. The port's
 `preload.c` logged `exploit attempt=1/1 failed status=1`, then calls `pr_error`
 for the exhausted attempt, which exits with `-1` and is surfaced by the shell
-as 255. The payload did run; its guarded COW/CFI readiness condition did not
-pass.
+as 255. The payload did run and reached the configured stop-before-CFI guard;
+the unchanged canary kept the test from advancing to CFI.
 
 The attempt did not reboot the phone: ADB remained connected,
 `sys.boot_completed` stayed at 1, and uptime advanced from about 6001 to 6186
