@@ -5190,3 +5190,28 @@ payload SHA-256 is recorded above. After the attempt the phone remained
 booted and ADB-responsive with the same firmware and kernel. The existing
 `ro.boot.bootreason=kernel_panic,bug` value did not change and is not evidence
 of a reboot from this attempt.
+
+### 2026-11-28 in-memory uclamp trace candidate
+
+The uclamp helper now writes its per-call details into a fixed-size record
+owned by the readiness monitor. It captures the waiter TID and poll, state,
+trigger-gate and pselect state before the call, `sched_getattr()` result and
+errno, policy/nice, clamp values, flags before and after adding the util-clamp
+flags, whether `sched_setattr()` was attempted, its result/errno, and call
+timestamps. The monitor prints the record and writes its checkpoint only
+after pselect returns and deferred logging is restored; no checkpoint file
+I/O was added inside the timing window.
+
+The Android API 30 candidate was built with NDK r27b
+(`27.1.12297006`):
+`build/uclamp-memorytrace-20261128/cve-2026-43499-app.so` (156,872 bytes;
+SHA-256 `B17071435ABA5BB7F60DA8668040FEAF88D8BC7C64EC7A21FE35045A3AFA76E8`).
+It is AArch64 ELF64. Binary inspection found the `UCLAMPTRACE` and
+`readiness-uclamp-call` records plus the `diagnostic=uclamp-trigger-only`,
+`cfi_write_pipe_physrw_root=disabled`, and explicit CFI/physical-RW/root
+refusal messages. Build flags are recorded in
+`build/uclamp-memorytrace-20261128/build-flags.txt`.
+
+This candidate has not been staged on or run against the phone. No additional
+exploit attempt was made; a separate explicit approval is required before
+running it.

@@ -496,7 +496,8 @@ long sched_setattr_tid_nochange(int tid) {
   return set_ret;
 }
 
-long sched_setattr_tid_uclamp_nochange(int tid) {
+long sched_setattr_tid_uclamp_nochange(
+    int tid, struct sched_uclamp_call_trace *trace) {
   /* Keep policy, nice, and requested clamp values unchanged, but include the
    * UTIL_CLAMP flags so the G990B kernel does not take its unchanged-policy
    * early return before rt_mutex_adjust_pi(). This diagnostic still enters
@@ -511,6 +512,15 @@ long sched_setattr_tid_uclamp_nochange(int tid) {
   errno = 0;
   long get_ret = syscall(SYS_sched_getattr, tid, &attr, sizeof(attr), 0);
   int get_errno = errno;
+  if (trace) {
+    trace->get_ret = get_ret;
+    trace->get_errno = get_errno;
+    trace->sched_policy = attr.sched_policy;
+    trace->sched_nice = attr.sched_nice;
+    trace->sched_flags_before = attr.sched_flags;
+    trace->sched_util_min = attr.sched_util_min;
+    trace->sched_util_max = attr.sched_util_max;
+  }
 #if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
   rmg_diag_checkpoint("sched-uclamp-getattr", (unsigned long long)get_ret,
                       (unsigned long long)get_errno);
@@ -532,12 +542,20 @@ long sched_setattr_tid_uclamp_nochange(int tid) {
   }
   attr.size = sizeof(attr);
   attr.sched_flags |= sched_flag_util_clamp_min | sched_flag_util_clamp_max;
+  if (trace) {
+    trace->sched_flags_after = attr.sched_flags;
+    trace->set_attempted = 1;
+  }
 #if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
   rmg_diag_checkpoint("sched-uclamp-setattr-enter", tid, attr.sched_flags);
 #endif
   errno = 0;
   long set_ret = syscall(SYS_sched_setattr, tid, &attr, 0);
   int set_errno = errno;
+  if (trace) {
+    trace->set_ret = set_ret;
+    trace->set_errno = set_errno;
+  }
 #if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
   rmg_diag_checkpoint("sched-uclamp-setattr-return",
                       (unsigned long long)set_ret,

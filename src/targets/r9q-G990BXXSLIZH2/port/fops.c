@@ -1611,6 +1611,9 @@ struct readiness_block_monitor {
   int open_errno;
   long sched_ret;
   int sched_errno;
+#if defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) && RMG_DIAG_UCLAMP_TRIGGER_ONLY
+  struct sched_uclamp_call_trace uclamp_trace;
+#endif
   unsigned long long polls;
   unsigned long long blocked_samples;
   int post_pselect_block;
@@ -2763,8 +2766,18 @@ static void *readiness_block_monitor_thread(void *arg) {
       long long start_us = readiness_now_us();
       errno = 0;
 #if defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) && RMG_DIAG_UCLAMP_TRIGGER_ONLY
+      struct sched_uclamp_call_trace *trace = &monitor->uclamp_trace;
+      trace->recorded = 1;
+      trace->tid = monitor->tid;
+      trace->poll = polls;
+      trace->waiter_state = (int)(unsigned char)task_state;
+      trace->trigger_gate = trigger_gate;
+      trace->runnable_after_gate = runnable_after_gate;
+      trace->pselect_active = pselect_active;
+      trace->pselect_active_after_sample = pselect_active_after_sample;
+      trace->call_start_us = start_us;
       monitor->sched_ret =
-          sched_setattr_tid_uclamp_nochange(monitor->tid);
+          sched_setattr_tid_uclamp_nochange(monitor->tid, trace);
 #else
       monitor->sched_ret = sched_setattr_tid_nochange(monitor->tid);
 #endif
@@ -2782,12 +2795,17 @@ static void *readiness_block_monitor_thread(void *arg) {
                           (unsigned long long)monitor->sched_ret,
                           monitor->sched_errno);
 #endif
-      long long walk_us = readiness_now_us() - start_us;
+      long long walk_end_us = readiness_now_us();
+      long long walk_us = walk_end_us - start_us;
       if (walk_us < 0)
         walk_us = 0;
       if (walk_us > 1000000)
         walk_us = 1000000;
       atomic_store(&consumer_walk_us, (int)walk_us);
+#if defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) && RMG_DIAG_UCLAMP_TRIGGER_ONLY
+      trace->call_end_us = walk_end_us;
+      trace->call_us = (int)walk_us;
+#endif
 #if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
       rmg_diag_checkpoint("readiness-monitor-sched-time",
                           (unsigned long long)walk_us, monitor->tid);
@@ -3394,6 +3412,46 @@ void do_readiness_pause_route(void) {
     rmg_diag_checkpoint("readiness-mprotect-summary",
                         (unsigned long long)cow_ctx.ret,
                         (unsigned long long)cow_ctx.elapsed_us);
+#endif
+#if defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) && RMG_DIAG_UCLAMP_TRIGGER_ONLY
+    if (monitor.uclamp_trace.recorded) {
+      const struct sched_uclamp_call_trace *trace = &monitor.uclamp_trace;
+      pr_info("UCLAMPTRACE attempt=%d tid=%d poll=%llu state=%d gate=%d "
+              "runnable=%d active=%d recheck=%d get=%ld/%d policy=%u "
+              "nice=%d flags=%llu>%llu util=%u/%u set_attempted=%d "
+              "set=%ld/%d start_us=%lld end_us=%lld call_us=%d\n",
+              route_attempt, trace->tid, trace->poll, trace->waiter_state,
+              trace->trigger_gate, trace->runnable_after_gate,
+              trace->pselect_active, trace->pselect_active_after_sample,
+              trace->get_ret, trace->get_errno, trace->sched_policy,
+              trace->sched_nice,
+              (unsigned long long)trace->sched_flags_before,
+              (unsigned long long)trace->sched_flags_after,
+              trace->sched_util_min, trace->sched_util_max,
+              trace->set_attempted, trace->set_ret, trace->set_errno,
+              trace->call_start_us, trace->call_end_us, trace->call_us);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+      char trace_text[256];
+      snprintf(trace_text, sizeof(trace_text),
+               "state=%d gate=%d runnable=%d active=%d recheck=%d "
+               "get=%ld/%d policy=%u nice=%d flags=%llu>%llu "
+               "util=%u/%u set=%d:%ld/%d us=%d",
+               trace->waiter_state, trace->trigger_gate,
+               trace->runnable_after_gate, trace->pselect_active,
+               trace->pselect_active_after_sample, trace->get_ret,
+               trace->get_errno, trace->sched_policy, trace->sched_nice,
+               (unsigned long long)trace->sched_flags_before,
+               (unsigned long long)trace->sched_flags_after,
+               trace->sched_util_min, trace->sched_util_max,
+               trace->set_attempted, trace->set_ret, trace->set_errno,
+               trace->call_us);
+      rmg_diag_checkpoint_text("readiness-uclamp-call", trace->tid,
+                               trace->poll, trace_text);
+      rmg_diag_checkpoint("readiness-uclamp-time",
+                          (unsigned long long)trace->call_start_us,
+                          (unsigned long long)trace->call_end_us);
+#endif
+    }
 #endif
 #if defined(RMG_DIAG_READINESS_STATE_TRACE)
     readiness_monitor_state_flush(&monitor, route_attempt);

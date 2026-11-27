@@ -327,6 +327,31 @@ struct local_sched_attr {
   uint32_t sched_util_max;
 };
 
+struct sched_uclamp_call_trace {
+  int recorded;
+  int tid;
+  unsigned long long poll;
+  int waiter_state;
+  int trigger_gate;
+  int runnable_after_gate;
+  int pselect_active;
+  int pselect_active_after_sample;
+  long long call_start_us;
+  long long call_end_us;
+  int call_us;
+  long get_ret;
+  int get_errno;
+  uint32_t sched_policy;
+  int32_t sched_nice;
+  uint64_t sched_flags_before;
+  uint64_t sched_flags_after;
+  uint32_t sched_util_min;
+  uint32_t sched_util_max;
+  int set_attempted;
+  long set_ret;
+  int set_errno;
+};
+
 struct mm_ctx {
   size_t mm_cnt;
   pid_t *childs;
@@ -455,7 +480,8 @@ long futex_op(
     const struct timespec *timeout, uint32_t *uaddr2, uint32_t val3);
 long sched_setattr_tid(int tid, int nice_value);
 long sched_setattr_tid_nochange(int tid);
-long sched_setattr_tid_uclamp_nochange(int tid);
+long sched_setattr_tid_uclamp_nochange(
+    int tid, struct sched_uclamp_call_trace *trace);
 int try_cache_ashmem_path(const char *path);
 int same_rdev_path(const char *path, dev_t rdev);
 void init_ashmem_path(void);
