@@ -44,6 +44,14 @@
 #endif
 #endif
 
+#if defined(RMG_DIAG_LIVE_HELPER_WCHAN_TRACE) && \
+    RMG_DIAG_LIVE_HELPER_WCHAN_TRACE
+#if !defined(RMG_DIAG_LIVE_WCHAN_TRACE) || !RMG_DIAG_LIVE_WCHAN_TRACE || \
+    !defined(RMG_DIAG_PI_HELPER_STATE_TRACE_ACTIVE)
+#error "live helper wchan trace requires live wchan and helper-state tracing"
+#endif
+#endif
+
 #if (defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY) || \
     (defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && \
      RMG_DIAG_PASSIVE_COW_OBSERVER)
@@ -1581,6 +1589,10 @@ struct readiness_block_monitor {
     RMG_DIAG_LIVE_HELPER_SYSCALL_TRACE
   int live_d_helper_syscall_captured;
 #endif
+#if defined(RMG_DIAG_LIVE_HELPER_WCHAN_TRACE) && \
+    RMG_DIAG_LIVE_HELPER_WCHAN_TRACE
+  int live_d_helper_wchan_captured;
+#endif
 #if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
   atomic_int locker_tid;
   atomic_int locker_stat_ready;
@@ -1735,6 +1747,90 @@ static void readiness_trace_live_helper_syscall(
            pselect_active_before, pselect_active_after, at_us, elapsed_us,
            syscall_errno, syscall_data[0] ? syscall_data : "unavailable");
   rmg_diag_checkpoint_text("readiness-live-D-helper-syscall",
+                           monitor->helper_tid, polls, detail);
+#endif
+}
+#endif
+
+#if defined(RMG_DIAG_LIVE_HELPER_WCHAN_TRACE) && \
+    RMG_DIAG_LIVE_HELPER_WCHAN_TRACE
+static void readiness_trace_live_helper_wchan(
+    struct readiness_block_monitor *monitor, unsigned long long polls,
+    int waiter_stat_fd, unsigned long long d_streak, int gate_before,
+    int pselect_active_before) {
+  char path[64];
+  char wchan[128] = {0};
+  snprintf(path, sizeof(path), "/proc/self/task/%d/wchan",
+           monitor->helper_tid);
+  long long at_us = readiness_now_us();
+  char helper_state_before =
+      readiness_task_state(monitor->helper_stat_fd);
+  char waiter_state_before = readiness_task_state(waiter_stat_fd);
+  int gate_snapshot_before = atomic_load_explicit(
+      &monitor->trigger_gate, memory_order_acquire);
+  int pselect_snapshot_before = atomic_load_explicit(
+      &monitor->pselect_active, memory_order_acquire);
+  int wchan_errno = 0;
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    wchan_errno = errno;
+  } else {
+    ssize_t len = read(fd, wchan, sizeof(wchan) - 1);
+    if (len < 0) {
+      wchan_errno = errno;
+    } else if (len == 0) {
+      wchan_errno = EIO;
+    } else {
+      for (ssize_t i = 0; i < len; i++) {
+        if (wchan[i] == '\n' || wchan[i] == '\r') {
+          wchan[i] = '\0';
+          break;
+        }
+      }
+    }
+    close(fd);
+  }
+  char helper_state_after =
+      readiness_task_state(monitor->helper_stat_fd);
+  char waiter_state_after = readiness_task_state(waiter_stat_fd);
+  int gate_snapshot_after = atomic_load_explicit(
+      &monitor->trigger_gate, memory_order_acquire);
+  int pselect_snapshot_after = atomic_load_explicit(
+      &monitor->pselect_active, memory_order_acquire);
+  long long elapsed_us = readiness_now_us() - at_us;
+  pr_info("readiness live-D helper wchan trigger=helper-D "
+          "waiter_tid=%d helper_tid=%d polls=%llu d_streak=%llu "
+          "trigger_gate=%d pselect_active=%d "
+          "helper_state_before=%c helper_state_after=%c "
+          "waiter_state_before=%c waiter_state_after=%c "
+          "gate_before=%d gate_after=%d "
+          "pselect_active_before=%d pselect_active_after=%d "
+          "at_us=%lld elapsed_us=%lld errno=%d wchan=%s\n",
+          monitor->tid, monitor->helper_tid, polls, d_streak, gate_before,
+          pselect_active_before,
+          helper_state_before ? helper_state_before : '?',
+          helper_state_after ? helper_state_after : '?',
+          waiter_state_before ? waiter_state_before : '?',
+          waiter_state_after ? waiter_state_after : '?', gate_snapshot_before,
+          gate_snapshot_after, pselect_snapshot_before,
+          pselect_snapshot_after, at_us, elapsed_us, wchan_errno,
+          wchan[0] ? wchan : "unavailable");
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  char detail[512];
+  snprintf(detail, sizeof(detail),
+           "trigger=helper-D,helper_state_before=%c,helper_state_after=%c,"
+           "waiter_state_before=%c,waiter_state_after=%c,"
+           "d_streak=%llu,gate_before=%d,gate_after=%d,"
+           "pselect_active_before=%d,pselect_active_after=%d,"
+           "at_us=%lld,elapsed_us=%lld,errno=%d,wchan=%s",
+           helper_state_before ? helper_state_before : '?',
+           helper_state_after ? helper_state_after : '?',
+           waiter_state_before ? waiter_state_before : '?',
+           waiter_state_after ? waiter_state_after : '?', d_streak,
+           gate_snapshot_before, gate_snapshot_after, pselect_snapshot_before,
+           pselect_snapshot_after, at_us, elapsed_us, wchan_errno,
+           wchan[0] ? wchan : "unavailable");
+  rmg_diag_checkpoint_text("readiness-live-D-helper-wchan",
                            monitor->helper_tid, polls, detail);
 #endif
 }
@@ -2290,6 +2386,10 @@ static void *readiness_block_monitor_thread(void *arg) {
   int first_state = 0;
   int last_state = 0;
   int armed_logged = 0;
+#if defined(RMG_DIAG_LIVE_HELPER_WCHAN_TRACE) && \
+    RMG_DIAG_LIVE_HELPER_WCHAN_TRACE
+  unsigned long long helper_d_streak = 0;
+#endif
   while (!atomic_load_explicit(&monitor->stop, memory_order_acquire)) {
     if (!atomic_load_explicit(&monitor->armed, memory_order_acquire)) {
       __asm__ volatile("yield" ::: "memory");
@@ -2398,6 +2498,23 @@ static void *readiness_block_monitor_thread(void *arg) {
       monitor->live_d_helper_syscall_captured = 1;
       readiness_trace_live_helper_syscall(monitor, helper_polls, fd,
                                           "helper-D");
+    }
+#endif
+#if defined(RMG_DIAG_LIVE_HELPER_WCHAN_TRACE) && \
+    RMG_DIAG_LIVE_HELPER_WCHAN_TRACE
+    int helper_wchan_gate = atomic_load_explicit(
+        &monitor->trigger_gate, memory_order_acquire);
+    int helper_wchan_pselect_active = atomic_load_explicit(
+        &monitor->pselect_active, memory_order_acquire);
+    if (helper_state == 'D' && helper_wchan_gate)
+      helper_d_streak++;
+    else
+      helper_d_streak = 0;
+    if (!monitor->live_d_helper_wchan_captured && helper_d_streak >= 2) {
+      monitor->live_d_helper_wchan_captured = 1;
+      readiness_trace_live_helper_wchan(
+          monitor, helper_polls, fd, helper_d_streak, helper_wchan_gate,
+          helper_wchan_pselect_active);
     }
 #endif
 #if defined(RMG_DIAG_SCHEDSTAT_TRACE) && RMG_DIAG_SCHEDSTAT_TRACE
@@ -2925,6 +3042,10 @@ void do_readiness_pause_route(void) {
 #if defined(RMG_DIAG_LIVE_HELPER_SYSCALL_TRACE) && \
     RMG_DIAG_LIVE_HELPER_SYSCALL_TRACE
     monitor.live_d_helper_syscall_captured = 0;
+#endif
+#if defined(RMG_DIAG_LIVE_HELPER_WCHAN_TRACE) && \
+    RMG_DIAG_LIVE_HELPER_WCHAN_TRACE
+    monitor.live_d_helper_wchan_captured = 0;
 #endif
 #if defined(RMG_DIAG_READINESS_STATE_TRACE)
     atomic_init(&monitor.state_trace_count, 0);

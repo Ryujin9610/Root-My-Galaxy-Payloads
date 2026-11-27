@@ -4614,3 +4614,65 @@ UID was 2000, battery was 100% at 19.4 C, and `/dev/ksu` and `/proc/ksu` were
 absent. The full RMG log, current UI hierarchy, build log, payload, and device
 state are saved under
 `build/pi-helper-state-live-wchan-helperd-syscall-20261127/`.
+
+### 2026-11-27 guarded helper-D wchan trace and PI-futex panic
+
+Built the app payload with the compile-time guard
+`RMG_DIAG_LIVE_HELPER_WCHAN_TRACE=1`, layered on the live waiter-wchan and
+helper-state tracing. After two consecutive helper `D` samples with the
+trigger gate open, this diagnostic reads
+`/proc/self/task/<helper-tid>/wchan` and records helper/waiter states plus
+gate and pselect snapshots. The candidate was
+`build/pi-helper-state-live-wchan-helperd-wchan-20261127/cve-2026-43499-app.so`
+(160,744 bytes; SHA-256
+`7F5FE4381D4ECBF4BC37ABDD843DD422CC90887773AE24BE300319F3E06598E5`). The
+device-side file
+`/sdcard/Download/rmg-live-helper-wchan-uclamp-20261127.so` matched this
+hash. The candidate retained
+`cfi_write_pipe_physrw_root=disabled`.
+
+RMG showed the exact `r9q-G990BXXSLIZH2` profile and Shizuku Running. One
+diagnostic attempt was started. ADB disconnected during the attempt and
+reconnected after the phone rebooted. RMG did not save a new history entry;
+the history remained at 138 runs. No helper-wchan record or final payload
+result was recovered. Do not repeat this image unchanged: the bug report
+shows the kernel panicked during its PI-futex path.
+
+The read-only bug report contains a pstore panic at boot uptime about 43,557
+seconds. It reports `kernel BUG at kernel/locking/rtmutex_common.h:60!` on
+CPU 4, PID/TID 29594, Comm: `libpoc64.so`, and PC
+`rt_mutex_adjust_prio_chain+0x878/0x890`. The call chain starts at
+`rt_mutex_adjust_prio_chain` and continues through `task_blocks_on_rt_mutex`,
+`__rt_mutex_start_proxy_lock`, `futex_lock_pi`, `do_futex`, and
+`__arm64_sys_futex`, followed by the arm64 syscall return path. The kernel
+then panicked with `Fatal exception`. The full bug report and extracted
+excerpt are in
+`build/pi-helper-state-live-wchan-helperd-wchan-20261127/bugreport.zip` and
+`build/pi-helper-state-live-wchan-helperd-wchan-20261127/kernel-panic-excerpt.txt`.
+
+The source-level match is suggestive but not conclusive. The supplied
+Samsung source archive does not contain this exact
+`kernel/locking/rtmutex_common.h`, and no matching unstripped `vmlinux` or
+line table was available. In upstream Linux v5.4.289,
+`rt_mutex_top_waiter()` contains `BUG_ON(w->lock != lock)` at line 55
+([source](https://github.com/gregkh/linux/blob/v5.4.289/kernel/locking/rtmutex_common.h#L47-L58));
+the PI-chain walk calls this helper at several points
+([source](https://github.com/gregkh/linux/blob/v5.4.289/kernel/locking/rtmutex.c#L625-L750)).
+A waiter-to-lock consistency failure is therefore a plausible explanation
+for the vendor kernel's reported line 60. The five-line offset and vendor
+source difference prevent identifying that exact assertion from this
+evidence alone. What is established is that a PI-futex/rt-mutex kernel BUG
+occurred while `libpoc64.so` was executing; the evidence does not distinguish
+malformed PI state from a race or other memory corruption.
+
+After reboot, ADB reports `sys.boot_completed=1`,
+`ro.boot.bootreason=kernel_panic,bug`, the same Android 16 fingerprint and
+kernel `5.4.289-qgki-32192773-abG990BXXSLIZH2`, low-power mode off, shell UID
+2000, battery 100% at 21.5 C, and no `/dev/ksu` or `/proc/ksu`. This
+post-reboot snapshot is saved as
+`build/pi-helper-state-live-wchan-helperd-wchan-20261127/phone-state-after-reboot.txt`.
+
+The next useful step is offline matching against the exact Samsung
+`rtmutex_common.h` or a matching symbolized kernel build, then a source-level
+review of the payload's PI-futex setup. The intended helper `wchan` was not
+captured, so this run does not answer what blocked that helper.
