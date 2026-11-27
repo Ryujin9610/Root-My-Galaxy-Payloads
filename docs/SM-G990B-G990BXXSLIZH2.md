@@ -4417,6 +4417,100 @@ logcat are saved locally under
 `phone-run-ui.xml`, `phone-run-final.png`, `build.log`, and
 `phone-logcat.txt`). The schedstat counters improve the state trace, but the
 helper CPU fallback and one-sample `D` observation mean this was not a fully
-controlled comparison. For another diagnostic, keep the one-attempt and
-downstream guards; the most useful next addition is a read-only wait-channel
-sample taken only when the waiter is actually observed in `D`.
+controlled comparison. The following guarded run adds the requested live
+wait-channel sample without enabling the downstream root stages.
+
+### 2026-11-27 guarded live-D wait-channel trace: `do_page_fault`
+
+Added optional `RMG_DIAG_LIVE_WCHAN_TRACE=1` support to the G990B port. Its
+compile-time guard requires `PI_PROBE_ONLY`, `UCLAMP_TRIGGER_ONLY`, the
+passive COW observer, COW trace, and durable logging, and rejects COW-only
+builds. The monitor reads
+`/proc/self/task/<waiter-tid>/wchan` once when the waiter is observed in
+`D`, after the trigger gate and while the pselect call is active. It then
+re-reads the task state and pselect-active flag. The read itself is
+instrumented with an elapsed-time and errno record.
+
+Built the AArch64 Android 30 candidate
+`build/pi-helper-state-live-wchan-20261127/cve-2026-43499-app.so` (159,080
+bytes; SHA-256
+`706EBCB4AD49B48B84E56C5773702EEF450DC89A60657302F6C0B56BDB0E7229`) with
+NDK r27c. Besides the new wait-channel flag, this retained the guarded
+`PI_PROBE_ONLY` / `UCLAMP_TRIGGER_ONLY` profile, passive COW observation,
+consumer affinity, durable and COW tracing, 512-MiB COW region, send trace,
+schedstat trace, helper-state trace, waiter CPU0, and consumer CPU5. Binary
+inspection confirmed the new logger and the
+`cfi_write_pipe_physrw_root=disabled` marker. The build completed with only
+the existing unused-function warnings.
+
+RMG Settings showed this imported local payload selected, and the exact
+`SM-G990B` / `5.4.289` profile was selected. RMG's generic parent log still
+printed `attempts=24`, but the payload's own supervisor reported
+`attempts=1`, followed by `exploit attempt=1/1`. The candidate logged
+`diagnostic=uclamp-trigger-only` and
+`cfi_write_pipe_physrw_root=disabled`; no retry was made.
+
+The effective placement matched the earlier 2026-11-27 schedstat profile:
+
+| Role or mask | Earlier schedstat run | Live-wchan run |
+|---|---:|---:|
+| Waiter | CPU0 | CPU0 |
+| Consumer | CPU5 | CPU5 |
+| State observer | CPU1, effective mask `0x2` | CPU1, effective mask `0x2` |
+| mmap helper selected CPU | CPU6 | CPU6 |
+| Observer allowed mask | `0x6f` | `0x6f` |
+
+The live run started with low power off (`global.low_power=0`). CPU4 was
+outside the observer's allowed mask, so the helper selector again chose CPU6.
+This reproduces the previous run's effective placement, including its helper
+CPU fallback.
+
+The pselect-before trace was at monotonic `39716842672 us`. The first
+mprotect entered 45 us earlier and returned at +2,095 us. The waiter was
+sampled in `R` at polls 8, 12, 16, 20, and 24, then in `D` at poll 28,
+about +440 us after pselect began. At that first active `D` sample, the new
+read reported:
+
+```text
+state_before=D state_after=D polls=28
+gate=1 runnable_after_gate=1
+pselect_active_before=1 pselect_active_after=1
+elapsed_us=71 wchan_errno=0 wchan=do_page_fault
+```
+
+The first mprotect was still in progress for about 1.65 ms after that waiter
+sample. Pselect returned `118` at +2,172 us (the overlay summary rounds this
+to `pselect_us=2170`). The second mprotect returned at +4,208 us; the
+two-mprotect helper loop reported 4,260 us total.
+
+The six schedstat snapshots show cumulative waiter runtime unchanged through
+poll 20, then increasing from 150,535,620 to 150,989,422 ns at poll 24 and
+151,019,891 ns at poll 28. Runqueue wait stayed at 7,377,764 ns through poll
+24 and reached 7,403,493 ns at poll 28; timeslices increased from 130 to 131.
+These are sparse cumulative snapshots, not precise per-poll execution times.
+The mprotect helper remained in `R` at all six samples; its reported runtime
+(183,178 ns), runqueue wait (7,663,594 ns), and timeslices (3) did not change.
+As before, `R` alone does not distinguish a running thread from one waiting
+on the run queue.
+
+The COW walk completed (`success=1`, `walk_us=23`), but the 16-MiB canary
+scan reported `512/512` chunks scanned and `changed_chunks=0`. The route
+then reported `readiness-cow cfi miss ... step=42`; the overlay summary was
+`blocked=1 sched=0/0`. Pipe-physrw ended with `done=0`, `root=0`, and no
+successful read or write. RMG ended at “Running kernel exploit” with code
+255, before KernelSU loading.
+
+Afterward, the phone remained booted with the same firmware fingerprint and
+kernel, shell UID 2000, low power off, and no reboot. `/dev/ksu` and
+`/proc/ksu` were absent. The new live-D sample reproduces
+`do_page_fault` under the guarded PI/uclamp profile and at the same effective
+CPU placement as the previous schedstat run. Its overlap with the first
+mprotect is consistent with a page-fault wait during the COW/mmap sequence,
+but `wchan` is only a symbol snapshot: this does not provide a kernel stack,
+identify a specific rwsem or lock owner, or prove the exact wait site.
+
+The build log, complete RMG UI text and XML, before/run/final screenshots, and
+profile-selection dumps are saved under
+`build/pi-helper-state-live-wchan-20261127/` (`build.log`,
+`phone-run-ui.txt`, `ui-running-80s.xml`, `phone-before.png`,
+`phone-run-final.png`, and `ui-profile.xml`).

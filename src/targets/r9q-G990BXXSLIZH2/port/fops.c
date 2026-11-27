@@ -23,6 +23,19 @@
 #define RMG_DIAG_PI_HELPER_STATE_TRACE_ACTIVE 1
 #endif
 
+#if defined(RMG_DIAG_LIVE_WCHAN_TRACE) && RMG_DIAG_LIVE_WCHAN_TRACE
+#if !defined(RMG_DIAG_PI_PROBE_ONLY) || !RMG_DIAG_PI_PROBE_ONLY || \
+    !defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) || \
+    !RMG_DIAG_UCLAMP_TRIGGER_ONLY || \
+    !defined(RMG_DIAG_PASSIVE_COW_OBSERVER) || \
+    !RMG_DIAG_PASSIVE_COW_OBSERVER || \
+    !defined(RMG_DIAG_COW_TRACE) || !RMG_DIAG_COW_TRACE || \
+    !defined(RMG_DIAG_DURABLE_LOG) || !RMG_DIAG_DURABLE_LOG || \
+    (defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY)
+#error "live D-state wchan trace requires guarded PI/uclamp COW mode"
+#endif
+#endif
+
 #if (defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY) || \
     (defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && \
      RMG_DIAG_PASSIVE_COW_OBSERVER)
@@ -1553,6 +1566,9 @@ struct readiness_block_monitor {
   unsigned long long post_pselect_block_polls;
   int first_state;
   int last_state;
+#if defined(RMG_DIAG_LIVE_WCHAN_TRACE) && RMG_DIAG_LIVE_WCHAN_TRACE
+  int live_d_wchan_captured;
+#endif
 #if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
   atomic_int locker_tid;
   atomic_int locker_stat_ready;
@@ -1638,6 +1654,62 @@ static char readiness_task_state(int fd) {
     return 0;
   return rparen[2];
 }
+
+#if defined(RMG_DIAG_LIVE_WCHAN_TRACE) && RMG_DIAG_LIVE_WCHAN_TRACE
+static void readiness_trace_live_d_wchan(
+    struct readiness_block_monitor *monitor, char task_state,
+    unsigned long long polls, int gate, int runnable_after_gate,
+    int pselect_active, int task_stat_fd) {
+  char path[64];
+  char wchan[128] = {0};
+  snprintf(path, sizeof(path), "/proc/self/task/%d/wchan", monitor->tid);
+  long long start_us = readiness_now_us();
+  int wchan_errno = 0;
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    wchan_errno = errno;
+  } else {
+    ssize_t len = read(fd, wchan, sizeof(wchan) - 1);
+    if (len < 0) {
+      wchan_errno = errno;
+    } else if (len == 0) {
+      wchan_errno = EIO;
+    } else {
+      for (ssize_t i = 0; i < len; i++) {
+        if (wchan[i] == '\n' || wchan[i] == '\r') {
+          wchan[i] = '\0';
+          break;
+        }
+      }
+    }
+    close(fd);
+  }
+  int state_after = (int)(unsigned char)readiness_task_state(task_stat_fd);
+  int pselect_active_after = atomic_load_explicit(
+      &monitor->pselect_active, memory_order_acquire);
+  long long elapsed_us = readiness_now_us() - start_us;
+  pr_info("readiness live-D wchan tid=%d state_before=%c state_after=%c "
+          "polls=%llu gate=%d runnable_after_gate=%d "
+          "pselect_active_before=%d pselect_active_after=%d "
+          "elapsed_us=%lld wchan_errno=%d wchan=%s\n",
+          monitor->tid, task_state,
+          state_after ? (char)state_after : '?', polls, gate,
+          runnable_after_gate, pselect_active, pselect_active_after,
+          elapsed_us, wchan_errno, wchan[0] ? wchan : "unavailable");
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  char detail[288];
+  snprintf(detail, sizeof(detail),
+           "state_before=%c,state_after=%c,gate=%d,"
+           "runnable_after_gate=%d,pselect_active_before=%d,"
+           "pselect_active_after=%d,elapsed_us=%lld,wchan_errno=%d,wchan=%s",
+           task_state, state_after ? (char)state_after : '?', gate,
+           runnable_after_gate, pselect_active, pselect_active_after,
+           elapsed_us, wchan_errno, wchan[0] ? wchan : "unavailable");
+  rmg_diag_checkpoint_text("readiness-live-D-wchan", monitor->tid, polls,
+                           detail);
+#endif
+}
+#endif
 
 static int readiness_open_task_stat(pid_t tid) {
   char path[64];
@@ -2325,6 +2397,15 @@ static void *readiness_block_monitor_thread(void *arg) {
           &monitor->runnable_after_gate, memory_order_acquire);
       int pselect_active = atomic_load_explicit(&monitor->pselect_active,
                                                 memory_order_acquire);
+#if defined(RMG_DIAG_LIVE_WCHAN_TRACE) && RMG_DIAG_LIVE_WCHAN_TRACE
+      if (!monitor->live_d_wchan_captured && trigger_gate &&
+          runnable_after_gate && pselect_active) {
+        monitor->live_d_wchan_captured = 1;
+        readiness_trace_live_d_wchan(monitor, task_state, polls,
+                                     trigger_gate, runnable_after_gate,
+                                     pselect_active, fd);
+      }
+#endif
 #if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
       if (!monitor->block_seen)
         readiness_record_block_sample(monitor, task_state, polls,
