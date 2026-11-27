@@ -4509,8 +4509,40 @@ mprotect is consistent with a page-fault wait during the COW/mmap sequence,
 but `wchan` is only a symbol snapshot: this does not provide a kernel stack,
 identify a specific rwsem or lock owner, or prove the exact wait site.
 
+#### Source-level correlation from the Samsung Android 16 kernel bundle
+
+The downloaded `SM-G990B_16_Opensource.zip` contains a kernel tree whose
+top-level Makefile reports Linux `5.4.289`; its kernel README names
+`vendor/r9q_eur_openx_defconfig`, matching this device family. The phone also
+allowed a read-only check of `/proc/config.gz`, which returned
+`CONFIG_SMP=y` and `CONFIG_RWSEM_SPIN_ON_OWNER=y`.
+
+The matching source provides a concrete path consistent with the observed
+symbol. In `arch/arm64/mm/fault.c`, `do_page_fault()` first tries
+`handle_speculative_fault()` (line 536). If that returns
+`VM_FAULT_RETRY`, it tries `down_read_trylock(&mm->mmap_sem)` and falls back
+to `down_read(&mm->mmap_sem)` if the read lock is contended (lines 545-549).
+In `mm/mprotect.c`, `do_mprotect_pkey()` acquires the write side with
+`down_write_killable(&current->mm->mmap_sem)` (line 518). In
+`kernel/locking/rwsem.c`, `__down_read()` invokes the slow path with
+`TASK_UNINTERRUPTIBLE` (lines 1363-1366); that path first attempts
+optimistic spinning, then queues, sets the task state, and calls
+`schedule()` (around lines 999-1113). The running kernel's
+`RWSEM_SPIN_ON_OWNER` setting permits that spin-before-sleep transition.
+
+The timing fits this path: the helper entered its first mprotect 45 us before
+pselect began, the waiter reached `D` about 440 us into pselect, and the
+mprotect did not return until +2,095 us. A page fault in `do_page_fault()`
+waiting for the read side of the same process `mm->mmap_sem` while a
+concurrent mprotect holds or is acquiring its write side is now the
+best-supported explanation for the captured `do_page_fault` wait channel.
+This remains a hypothesis: the trace has no stack or lock-owner pointer, and
+the syscall interval does not prove when the write lock was acquired. The
+helper's sampled `R` state and unchanged schedstat counters do not settle
+that ownership question.
+
 The build log, complete RMG UI text and XML, before/run/final screenshots, and
 profile-selection dumps are saved under
 `build/pi-helper-state-live-wchan-20261127/` (`build.log`,
 `phone-run-ui.txt`, `ui-running-80s.xml`, `phone-before.png`,
-`phone-run-final.png`, and `ui-profile.xml`).
+`phone-run-final.png`, `ui-profile.xml`, and `phone-config-snippet.txt`).
