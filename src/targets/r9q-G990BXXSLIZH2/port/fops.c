@@ -36,6 +36,14 @@
 #endif
 #endif
 
+#if defined(RMG_DIAG_LIVE_HELPER_SYSCALL_TRACE) && \
+    RMG_DIAG_LIVE_HELPER_SYSCALL_TRACE
+#if !defined(RMG_DIAG_LIVE_WCHAN_TRACE) || !RMG_DIAG_LIVE_WCHAN_TRACE || \
+    !defined(RMG_DIAG_PI_HELPER_STATE_TRACE_ACTIVE)
+#error "live helper syscall trace requires live wchan and helper-state tracing"
+#endif
+#endif
+
 #if (defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY) || \
     (defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && \
      RMG_DIAG_PASSIVE_COW_OBSERVER)
@@ -1569,6 +1577,10 @@ struct readiness_block_monitor {
 #if defined(RMG_DIAG_LIVE_WCHAN_TRACE) && RMG_DIAG_LIVE_WCHAN_TRACE
   int live_d_wchan_captured;
 #endif
+#if defined(RMG_DIAG_LIVE_HELPER_SYSCALL_TRACE) && \
+    RMG_DIAG_LIVE_HELPER_SYSCALL_TRACE
+  int live_d_helper_syscall_captured;
+#endif
 #if defined(RMG_DIAG_COW_ONLY) && RMG_DIAG_COW_ONLY
   atomic_int locker_tid;
   atomic_int locker_stat_ready;
@@ -1655,6 +1667,79 @@ static char readiness_task_state(int fd) {
   return rparen[2];
 }
 
+#if defined(RMG_DIAG_LIVE_HELPER_SYSCALL_TRACE) && \
+    RMG_DIAG_LIVE_HELPER_SYSCALL_TRACE
+static void readiness_trace_live_helper_syscall(
+    struct readiness_block_monitor *monitor, unsigned long long polls,
+    int waiter_stat_fd, const char *trigger) {
+  char path[64];
+  char syscall_data[256] = {0};
+  snprintf(path, sizeof(path), "/proc/self/task/%d/syscall",
+           monitor->helper_tid);
+  long long at_us = readiness_now_us();
+  char waiter_state_before = readiness_task_state(waiter_stat_fd);
+  char helper_state_before =
+      readiness_task_state(monitor->helper_stat_fd);
+  int pselect_active_before = atomic_load_explicit(
+      &monitor->pselect_active, memory_order_acquire);
+  int syscall_errno = 0;
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    syscall_errno = errno;
+  } else {
+    ssize_t len = read(fd, syscall_data, sizeof(syscall_data) - 1);
+    if (len < 0) {
+      syscall_errno = errno;
+    } else if (len == 0) {
+      syscall_errno = EIO;
+    } else {
+      for (ssize_t i = 0; i < len; i++) {
+        if (syscall_data[i] == '\n' || syscall_data[i] == '\r') {
+          syscall_data[i] = '\0';
+          break;
+        }
+      }
+    }
+    close(fd);
+  }
+  char helper_state_after =
+      readiness_task_state(monitor->helper_stat_fd);
+  char waiter_state_after = readiness_task_state(waiter_stat_fd);
+  int pselect_active_after = atomic_load_explicit(
+      &monitor->pselect_active, memory_order_acquire);
+  long long elapsed_us = readiness_now_us() - at_us;
+  pr_info("readiness live-D helper syscall trigger=%s "
+          "waiter_tid=%d helper_tid=%d polls=%llu "
+          "waiter_state_before=%c waiter_state_after=%c "
+          "helper_state_before=%c helper_state_after=%c "
+          "pselect_active_before=%d pselect_active_after=%d "
+          "at_us=%lld elapsed_us=%lld errno=%d data=%s\n",
+          trigger, monitor->tid, monitor->helper_tid, polls,
+          waiter_state_before ? waiter_state_before : '?',
+          waiter_state_after ? waiter_state_after : '?',
+          helper_state_before ? helper_state_before : '?',
+          helper_state_after ? helper_state_after : '?',
+          pselect_active_before, pselect_active_after, at_us, elapsed_us,
+          syscall_errno, syscall_data[0] ? syscall_data : "unavailable");
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  char detail[512];
+  snprintf(detail, sizeof(detail),
+           "trigger=%s,waiter_state_before=%c,waiter_state_after=%c,"
+           "helper_state_before=%c,helper_state_after=%c,"
+           "pselect_active_before=%d,pselect_active_after=%d,"
+           "at_us=%lld,elapsed_us=%lld,errno=%d,data=%s",
+           trigger, waiter_state_before ? waiter_state_before : '?',
+           waiter_state_after ? waiter_state_after : '?',
+           helper_state_before ? helper_state_before : '?',
+           helper_state_after ? helper_state_after : '?',
+           pselect_active_before, pselect_active_after, at_us, elapsed_us,
+           syscall_errno, syscall_data[0] ? syscall_data : "unavailable");
+  rmg_diag_checkpoint_text("readiness-live-D-helper-syscall",
+                           monitor->helper_tid, polls, detail);
+#endif
+}
+#endif
+
 #if defined(RMG_DIAG_LIVE_WCHAN_TRACE) && RMG_DIAG_LIVE_WCHAN_TRACE
 static void readiness_trace_live_d_wchan(
     struct readiness_block_monitor *monitor, char task_state,
@@ -1707,6 +1792,14 @@ static void readiness_trace_live_d_wchan(
            elapsed_us, wchan_errno, wchan[0] ? wchan : "unavailable");
   rmg_diag_checkpoint_text("readiness-live-D-wchan", monitor->tid, polls,
                            detail);
+#endif
+#if defined(RMG_DIAG_LIVE_HELPER_SYSCALL_TRACE) && \
+    RMG_DIAG_LIVE_HELPER_SYSCALL_TRACE
+  if (!monitor->live_d_helper_syscall_captured) {
+    monitor->live_d_helper_syscall_captured = 1;
+    readiness_trace_live_helper_syscall(monitor, polls, task_stat_fd,
+                                        "waiter-D");
+  }
 #endif
 }
 #endif
@@ -2293,6 +2386,20 @@ static void *readiness_block_monitor_thread(void *arg) {
           monitor, 1, monitor->helper_tid, helper_state, helper_polls, gate,
           pselect_active, sched_getcpu(), readiness_now_us());
     }
+#if defined(RMG_DIAG_LIVE_HELPER_SYSCALL_TRACE) && \
+    RMG_DIAG_LIVE_HELPER_SYSCALL_TRACE
+    int helper_trigger_gate = atomic_load_explicit(
+        &monitor->trigger_gate, memory_order_acquire);
+    int helper_trigger_pselect_active = atomic_load_explicit(
+        &monitor->pselect_active, memory_order_acquire);
+    if (!monitor->live_d_helper_syscall_captured &&
+        helper_state == 'D' && helper_trigger_gate &&
+        helper_trigger_pselect_active) {
+      monitor->live_d_helper_syscall_captured = 1;
+      readiness_trace_live_helper_syscall(monitor, helper_polls, fd,
+                                          "helper-D");
+    }
+#endif
 #if defined(RMG_DIAG_SCHEDSTAT_TRACE) && RMG_DIAG_SCHEDSTAT_TRACE
     int helper_pselect_active = atomic_load_explicit(
         &monitor->pselect_active, memory_order_acquire);
@@ -2814,6 +2921,10 @@ void do_readiness_pause_route(void) {
     monitor.helper_blocked_samples = 0;
     monitor.helper_first_state = 0;
     monitor.helper_last_state = 0;
+#endif
+#if defined(RMG_DIAG_LIVE_HELPER_SYSCALL_TRACE) && \
+    RMG_DIAG_LIVE_HELPER_SYSCALL_TRACE
+    monitor.live_d_helper_syscall_captured = 0;
 #endif
 #if defined(RMG_DIAG_READINESS_STATE_TRACE)
     atomic_init(&monitor.state_trace_count, 0);

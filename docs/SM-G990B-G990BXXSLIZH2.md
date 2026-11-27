@@ -4559,3 +4559,58 @@ profile-selection dumps are saved under
 `phone-run-ui.txt`, `ui-running-80s.xml`, `phone-before.png`,
 `phone-run-final.png`, `ui-profile.xml`, `phone-config-snippet.txt`,
 and `phone-tracefs-access.txt`).
+
+### 2026-11-27 guarded helper-D syscall snapshot
+
+Built the app payload with `RMG_DIAG_LIVE_HELPER_SYSCALL_TRACE=1`, layered on
+the live waiter `wchan` and helper-state diagnostics. The candidate is
+`build/pi-helper-state-live-wchan-helperd-syscall-20261127/cve-2026-43499-app.so`
+(160,888 bytes; SHA-256
+`B426D0A44AA3D7154A0DF2FC0652E2B4D05A4E08602FC1B1772360F304711B96`). The
+device-side staged file matched that hash. RMG used the exact
+`r9q-G990BXXSLIZH2` profile and ran one attempt with
+`diagnostic=uclamp-trigger-only` and
+`cfi_write_pipe_physrw_root=disabled`.
+
+Effective placement matched the latest waiter-`D` run that captured
+`do_page_fault`: waiter CPU0, consumer CPU5, observer CPU1 (effective mask
+`0x2`), and mmap helper CPU6 (allowed mask `0x6f`). This contrasts with the
+older comparison run whose helper was on CPU4 with allowed mask `0x3f`; the
+current run therefore matches the most recent confirmed trace's placement,
+though not every historical run's helper placement.
+
+The event timing differs from the waiter-`D` capture. Relative to pselect start,
+the first mprotect entered at −46 us and returned at +2,043 us; the second
+mprotect entered immediately at +2,043 us. The helper was first sampled in
+`D` at +2,086 us, during the second mprotect and 4 us before pselect returned
+115 at +2,090 us. The gated passive observer's 29 pselect-active samples all
+reported the waiter as `R`; the route reported `blocked_samples=0`.
+
+The one-shot `/proc/self/task/<helper-tid>/syscall` read began at +2,089 us and
+took 95 us. It returned successfully (`errno=0`) but its data was the literal
+`running`, not a syscall number or argument set. By the time the snapshot read
+the task, the helper state was `R` both before and after and the pselect-active
+flag was already clear. The snapshot also read the waiter as `R` before and
+`D` afterward, with the flag clear both times. This is a race after the helper
+`D` edge, not evidence that the waiter blocked during pselect; it does not
+identify which syscall or wait site held up the helper. The helper's D sample
+close to the second mprotect is compatible with mmap-semaphore contention, but
+this run provides no helper `wchan`, stack, or lock-owner evidence to prove it.
+
+For comparison, the immediately preceding waiter-`D`/live-wchan run used the
+same effective CPU placement. It observed the waiter in `D` about 443 us after
+pselect started, while the first mprotect was still active, and captured
+`wchan=do_page_fault`; that mprotect returned at about +2,095 us. This run saw
+the helper's brief `D` 43 us into the second mprotect, after the first mprotect
+had returned, while its pselect-qualified waiter samples stayed `R`. Matching
+CPU placement therefore did not reproduce the same event ordering.
+
+The diagnostic stopped at the guarded pre-CFI miss (`step=42`): the COW walk
+reported zero calls and zero successes, the canary reported no changed chunks,
+and pipe physical read/write and root remained disabled (`done=0`, `root=0`).
+RMG ended with code 255. Afterward the phone remained booted on the same
+Android 16 fingerprint and 5.4.289 kernel, low-power mode remained off, shell
+UID was 2000, battery was 100% at 19.4 C, and `/dev/ksu` and `/proc/ksu` were
+absent. The full RMG log, current UI hierarchy, build log, payload, and device
+state are saved under
+`build/pi-helper-state-live-wchan-helperd-syscall-20261127/`.
