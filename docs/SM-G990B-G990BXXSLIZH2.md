@@ -4989,6 +4989,24 @@ pre-pselect scheduling and thread setup in those two builds, then focus any
 follow-up on the helper's block and the waiter's state around pselect return.
 Keep the complete send trace and COW-only stop for that comparison.
 
+The first `PROT_NONE` mprotect interval gives a sharper timing contrast. In
+this run it began about 49 microseconds before pselect and returned 615
+microseconds after pselect began; pselect returned about 34 microseconds
+later. In the earlier blocked run, the first mprotect returned 2,044
+microseconds after pselect began, and the waiter was sampled in `D` at
+1,128 microseconds while that mprotect was still active. This points to a
+substantially shorter overlap in the current run, but it does not identify
+why the mprotect interval changed.
+
+The comparison is not a single-variable timing control. The earlier run used
+the PI/uclamp trigger profile and did not enable send tracing; this run used
+the COW-only profile with send tracing. The traced sender requested a 16-MiB
+socket buffer and received 32 MiB, whereas the non-trace source path requests
+8 MiB. The different reclaim stream and buffer can change the memory and
+scheduling conditions before pselect. Matching waiter, observer, and helper
+CPUs rules out placement alone, but does not isolate the cause of the shorter
+mprotect overlap or the missing waiter `D` sample.
+
 The RMG UI log, durable checkpoint, result screen, and build are in
 `build/cow-only-sendtrace-passive-20261127/`; the checkpoint SHA-256 is
 `AD6400155BE02565FC9271FD84597F4A9EF9C0CF674664D743D2800701DBFC7A`, and the
