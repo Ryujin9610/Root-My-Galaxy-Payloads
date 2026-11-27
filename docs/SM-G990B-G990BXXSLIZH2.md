@@ -5212,6 +5212,65 @@ It is AArch64 ELF64. Binary inspection found the `UCLAMPTRACE` and
 refusal messages. Build flags are recorded in
 `build/uclamp-memorytrace-20261128/build-flags.txt`.
 
-This candidate has not been staged on or run against the phone. No additional
-exploit attempt was made; a separate explicit approval is required before
-running it.
+### 2026-11-28 one-shot in-memory uclamp trace run
+
+The candidate was staged in RMG Next as
+`rmg-uclamp-memorytrace-20261128.so`; the phone-side SHA-256 matched the local
+build. RMG selected the `r9q-G990BXXSLIZH2` profile, used Shizuku, verified the
+KernelSU service, and reported `diagnostic=uclamp-trigger-only` with
+`cfi_write_pipe_physrw_root=disabled`. The phone was on Android 16,
+fingerprint
+`samsung/r9qxeea/r9q:16/BP2A.250605.031.A3/G990BXXSLIZH2:user/release-keys`,
+and kernel `5.4.289-qgki-32192773-abG990BXXSLIZH2`. Battery saver was off.
+The payload supervisor and exploit child each ran one attempt.
+
+KASLR discovery succeeded from tracefs. Controlled reclaim completed all 256
+64-KiB sends (16 MiB), and the readiness path reached pselect. The call
+returned 118 in 2,970 microseconds. The waiter was in state `R` before the
+trigger gate and in state `D` at poll 32 while pselect was active; the
+checkpoint records waiter CPU 6, observer CPU 0, and helper CPU 5.
+
+The in-memory trace finally captures the complete scheduler request:
+
+`tid=12274 poll=32 state=68 gate=1 runnable=1 active=1 recheck=1`
+`getattr=0/0 policy=0 nice=0 flags=0->96 util=0/1024`
+`setattr attempted=1 result=0 errno=0 call=19 us`.
+
+Thus both `sched_getattr()` and the no-change `sched_setattr()` call succeeded
+without an error on this kernel. The request used the default clamp range
+(`min=0`, `max=1024`); this proves the syscall path accepted the request, but
+does not show that uclamp changed scheduling behavior or caused the waiter
+state. The 512-MiB COW trace observed a blocked waiter and the overlay geometry
+check passed, but the 16-MiB canary scan found no changed chunks
+(`mutated=0`). The fops readback was skipped. The diagnostic guard recorded
+`uclamp-trigger-stop-before-cfi a=0 b=0`, forced the route signal to zero, and
+set `readiness-cow cfi miss step=42` as its stop sentinel. CFI was not called.
+
+RMG displayed the generic `Failed at: Running kernel exploit` result with code
+255. Its final counters were `done=0 root=0`, `read_ok=0`, `write_ok=0`, and
+`rw64=0/0`; no physical-RW or root operation succeeded, and KernelSU was not
+loaded. `/dev/ksu` and `/proc/ksu` were absent, as expected for this guarded
+run. The phone stayed booted and ADB-responsive with the same fingerprint and
+kernel; `sys.boot_completed` remained `1`. This was the single approved run;
+there was no retry.
+
+Compared with the 27 November matched PI/uclamp run, this run captured the
+actual scheduler attributes rather than only the return counters. Both runs
+reported a successful scheduler call and a blocked waiter, but this run
+observed the waiter at poll 32 and pselect lasted 2,970 microseconds, versus
+poll 24 and 643 microseconds on 27 November. CPU placement also differed
+(waiter/observer/helper 6/0/5 here versus 0/1/4 there), so the timing results
+are not a controlled placement comparison. The key result is narrower: the
+scheduler syscall succeeds, while the canary remains unchanged and the route
+stops before CFI. Further work should inspect the canary/COW transition and
+compare the exact scheduler request with the target kernel implementation;
+the current evidence does not justify changing the request or enabling later
+exploit stages.
+
+The captured UI log, durable checkpoint, result UI XML, and result screenshot
+are in `build/uclamp-memorytrace-20261128/`. Their SHA-256 values are
+`AE198E445734165FFC541C16D056B5DAB31127F36016DF95F5A584FBA8BC2BE7`,
+`6296BD8FAA9ABA2EDD92F4E68980E15BA5ACA4422E648C5307D2836D462A33C4`,
+`0205ED07F816A861C42DC8A73D7E12A7FD8A0EAC9212B0589CE66239CBF9A96B`, and
+`C4A570BCC1D2044E8155A080BAEFB0E1D18090F16DDD8636A60CF0D337656F36`,
+respectively.
