@@ -84,6 +84,9 @@ void rmg_diag_checkpoint_text(const char *stage,
 #ifndef RMG_DIAG_PIPE_RECLAIM_TRACE
 #define RMG_DIAG_PIPE_RECLAIM_TRACE 0
 #endif
+#ifndef RMG_DIAG_PI_FUTEX_CALL_TRACE
+#define RMG_DIAG_PI_FUTEX_CALL_TRACE 0
+#endif
 #ifndef RMG_DIAG_PIPE_PHYSRW_PROOF_AFTER_CORRELATION
 #define RMG_DIAG_PIPE_PHYSRW_PROOF_AFTER_CORRELATION 0
 #endif

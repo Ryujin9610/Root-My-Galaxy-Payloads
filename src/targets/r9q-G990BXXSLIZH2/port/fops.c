@@ -517,20 +517,55 @@ static int route_craft_block_socket(void) {
 }
 
 static void route_pi_sanitize(void) {
+#if RMG_DIAG_PI_FUTEX_CALL_TRACE
+  int caller_tid = (int)syscall(SYS_gettid);
+#endif
   struct timespec timeout;
-  SYSCHK(clock_gettime(CLOCK_MONOTONIC, &timeout));
+  SYSCHK(clock_gettime(CLOCK_REALTIME, &timeout));
   timeout.tv_nsec += 50000000L;
   if (timeout.tv_nsec >= 1000000000L) {
     timeout.tv_sec += 1;
     timeout.tv_nsec -= 1000000000L;
   }
+#if RMG_DIAG_PI_FUTEX_CALL_TRACE
+  pr_info("pi-futex call=route-sanitize phase=enter tid=%d uaddr=%p "
+          "deadline=realtime:%lld.%09ld\n",
+          caller_tid, (void *)&f_pi_sanitize, (long long)timeout.tv_sec,
+          timeout.tv_nsec);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint_text(
+      "pi-futex-sanitize-enter", caller_tid,
+      (unsigned long long)(uintptr_t)&f_pi_sanitize,
+      "call=route-sanitize,op=FUTEX_LOCK_PI,phase=enter,"
+      "clock=CLOCK_REALTIME,timeout_ms=50");
+#endif
+#endif
+#if RMG_DIAG_PI_FUTEX_CALL_TRACE
+  errno = 0;
+#endif
   long lock_ret =
       futex_op(&f_pi_sanitize, FUTEX_LOCK_PI, 0, &timeout, NULL, 0);
   int lock_errno = errno;
+#if RMG_DIAG_PI_FUTEX_CALL_TRACE
+  errno = 0;
+#endif
   long unlock_ret =
       futex_op(&f_pi_sanitize, FUTEX_UNLOCK_PI, 0, NULL, NULL, 0);
+  int unlock_errno = errno;
+#if RMG_DIAG_PI_FUTEX_CALL_TRACE
+  pr_info("pi-futex call=route-sanitize phase=exit tid=%d uaddr=%p "
+          "lock=%ld lock_errno=%d unlock=%ld unlock_errno=%d\n",
+          caller_tid, (void *)&f_pi_sanitize, lock_ret, lock_errno,
+          unlock_ret, unlock_errno);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint_text("pi-futex-sanitize-return", caller_tid,
+                           (unsigned long long)(uintptr_t)&f_pi_sanitize,
+                           "call=route-sanitize,phase=return");
+#endif
+#else
   pr_info("route pi sanitize lock=%ld errno=%d unlock=%ld errno=%d\n",
-          lock_ret, lock_errno, unlock_ret, errno);
+          lock_ret, lock_errno, unlock_ret, unlock_errno);
+#endif
 }
 
 void prepare_pselect_fdsets(fd_set *in, fd_set *out, fd_set *ex) {

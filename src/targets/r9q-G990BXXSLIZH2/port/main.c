@@ -291,7 +291,30 @@ void *owner_thread(void *arg __attribute__((unused))) {
   }
 
   atomic_store(&owner_started, 1);
+#if RMG_DIAG_PI_FUTEX_CALL_TRACE
+  int owner_tid = (int)syscall(SYS_gettid);
+  pr_info("pi-futex call=owner-chain phase=enter tid=%d uaddr=%p\n",
+          owner_tid, (void *)&f_pi_chain);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint_text(
+      "pi-futex-owner-enter", owner_tid,
+      (unsigned long long)(uintptr_t)&f_pi_chain,
+      "call=owner-chain,op=FUTEX_LOCK_PI,phase=enter");
+#endif
+  errno = 0;
+  long chain_ret = futex_op(&f_pi_chain, FUTEX_LOCK_PI, 0, NULL, NULL, 0);
+  int chain_errno = errno;
+  pr_info("pi-futex call=owner-chain phase=exit tid=%d uaddr=%p "
+          "ret=%ld errno=%d\n",
+          owner_tid, (void *)&f_pi_chain, chain_ret, chain_errno);
+#if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
+  rmg_diag_checkpoint_text("pi-futex-owner-return", owner_tid,
+                           (unsigned long long)(uintptr_t)&f_pi_chain,
+                           "call=owner-chain,phase=return");
+#endif
+#else
   futex_op(&f_pi_chain, FUTEX_LOCK_PI, 0, NULL, NULL, 0);
+#endif
   atomic_store(&owner_chain_done, 1);
 
   for (;;) {

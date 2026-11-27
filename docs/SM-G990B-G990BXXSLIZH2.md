@@ -4707,12 +4707,12 @@ plain `FUTEX_LOCK_PI` slow path. It does not identify which user-space futex
 word was passed. In the 64-bit payload path, two direct contended lock calls
 fit that stack:
 
-- `owner_thread()` in `main.c:294` waits on `f_pi_chain`, after the waiter
+- `owner_thread()` in `main.c:305` waits on `f_pi_chain`, after the waiter
   thread has locked that word at `main.c:168`.
-- `route_pi_sanitize()` in `fops.c:528` waits on `f_pi_sanitize`, which is
+- `route_pi_sanitize()` in `fops.c:546` waits on `f_pi_sanitize`, which is
   held by `sanitize_holder_thread()` at `main.c:105`. The sanitizer is called
-  around the pselect route and its cleanup paths at `fops.c:861`, `3262`, and
-  `3442`.
+  around the pselect route and its cleanup paths at `fops.c:895`, `3296`, and
+  `3476`.
 
 The initial `f_pi_target` lock and the sanitizer holder's initial lock are
 uncontended in this setup, so they do not match the captured
@@ -4724,7 +4724,7 @@ owner-chain call and sanitizer call cannot be distinguished.
 
 There is a separate timeout-clock bug in `route_pi_sanitize()`. It builds an
 absolute deadline by calling `clock_gettime(CLOCK_MONOTONIC)` and adding
-50 ms (`fops.c:521-528`), then passes that deadline to plain
+50 ms (`fops.c:525-546`), then passes that deadline to plain
 `FUTEX_LOCK_PI`. In the matching 5.4.289 source, `futex_lock_pi()` calls
 `futex_setup_timer(..., FLAGS_CLOCKRT, ...)`, and `futex_setup_timer()`
 selects `CLOCK_REALTIME` for that flag. The monotonic deadline is therefore
@@ -4734,8 +4734,18 @@ clock mismatch may change the cleanup timing, but it does not by itself
 explain the self-referential waiter tree or prove that this call caused the
 panic.
 
-Before any future diagnostic attempt, change the sanitizer deadline to use
-`CLOCK_REALTIME` and add per-call-site logging for the calling TID and futex
-word so that a later crash can identify which contended lock was involved.
-Do not repeat the panicking image unchanged. No code, binary, or phone state
-was changed during this offline source review.
+The source correction now uses `CLOCK_REALTIME` for the sanitizer deadline.
+When `RMG_DIAG_PI_FUTEX_CALL_TRACE=1` is enabled, both contended call sites
+log their TID and futex address; with durable logging enabled, they also
+`fdatasync` a checkpoint immediately before the lock call. The two entry
+stages are `pi-futex-owner-enter` and `pi-futex-sanitize-enter` in
+`/data/local/tmp/rmg-pipe-oracle-checkpoint.log`.
+
+The guarded PI-probe/uclamp diagnostic candidate built successfully with NDK
+r27c at
+`build/pi-futex-clockfix-calltrace-20261127/cve-2026-43499-app.so` (161,560
+bytes; SHA-256
+`85b22a502f5feb3500078f79bda25ae2036422848ed25070dc4aa91e26f320bd`). It
+retains the prior diagnostic profile and adds the PI call trace. The candidate
+has not been run on the phone; the previous panicking image should not be
+reused. No phone state was changed during this build.
