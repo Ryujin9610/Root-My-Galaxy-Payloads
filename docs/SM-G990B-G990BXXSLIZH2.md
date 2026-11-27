@@ -4811,3 +4811,51 @@ run. Afterward `/dev/ksu` was absent and the RMG failure occurred before its
 KernelSU load stage. The captured RMG log and durable checkpoint are in
 `build/pi-futex-clockfix-calltrace-20261127/rmg-failure-log.txt` and
 `build/pi-futex-clockfix-calltrace-20261127/post-attempt-checkpoint.log`.
+
+#### Guarded FOPS readback candidate — 27 November 2026
+
+The next candidate was built with NDK r27c at
+`build/pi-fops-readback-only-20261127/cve-2026-43499-app.so` (159,032 bytes;
+SHA-256
+`248211d2375c8d257d63c1c490e4c87a422c6f1ea0ce024eeeccf929631b6697`). Its
+`RMG_DIAG_FOPS_READBACK_ONLY` and `RMG_DIAG_CFI_ONLY` guards allow only the
+ashmem FOPS readback after a successful readiness route. The CFI write,
+physical read/write, and root-install paths are disabled. The build also
+enables durable checkpoints, COW tracing, PI futex call tracing, scheduler
+statistics, and a 512 MiB PTE cap.
+
+The candidate was imported into RMG Next `0.13+local.af081c2 (28218460)` and
+run once with Shizuku against the exact `r9q-G990BXXSLIZH2` profile. RMG
+confirmed it used `rmg-pi-fops-readback-only-20261127.so`, verified the
+KernelSU service, and prepared that service before starting the exploit. The
+phone was boot-complete with battery saver off before and after the run.
+
+The attempt leaked the kernel slide through tracefs, then stopped earlier in
+the readiness route:
+
+- The readiness COW check saw the page change from file-backed to anonymous,
+  but `dirty=0`, `control_write=0`, and `blocked_samples=0`; the last waiter
+  sample remained `state=82`.
+- `route-sanitize` returned `ETIMEDOUT` (110), and its unlock returned
+  `EPERM` (1). The readiness walk recorded `calls=0 success=0`.
+- The canary scan read 16,420,480 of 16,777,216 requested bytes, scanning 501
+  of 512 order-3 chunks. It reported an incomplete negative result,
+  `changed_chunks=0`, and `mutated=0`.
+- The route ended at step 33 with no waiter calls. Consequently,
+  `try_cfi_stage()` was never entered and there is no FOPS readback result in
+  this run. It does not establish whether the readback itself works.
+
+The payload log reports `exploit attempt=1/1 failed status=1`; RMG rendered
+the failure as its generic exit code 255. The `pipe-physrw-summary` reported
+`done=0 root=0 read_ok=0 write_ok=0`. RMG did not reach its KernelSU load
+stage, `/dev/ksu` remained absent, and the phone stayed online with
+`sys.boot_completed=1`.
+
+The run log is in
+`build/pi-fops-readback-only-20261127/rmg-failure-log.txt`. The durable
+checkpoint file is cumulative; the current run is identified by PID 32269 in
+`build/pi-fops-readback-only-20261127/post-attempt-checkpoint.log`, with the
+relevant entries also isolated in
+`build/pi-fops-readback-only-20261127/post-attempt-checkpoint-excerpt.log`.
+The next investigation should focus on why the readiness route produced no
+waiter calls and why the canary scan stopped short of the full reclaim stream.
