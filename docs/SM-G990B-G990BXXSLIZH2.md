@@ -5012,3 +5012,85 @@ The RMG UI log, durable checkpoint, result screen, and build are in
 `AD6400155BE02565FC9271FD84597F4A9EF9C0CF674664D743D2800701DBFC7A`, and the
 RMG UI log SHA-256 is
 `44450B6BA396E011B7756365C5A0DADAF55DFDE1B6C89E7F5021E70DB0F34448`.
+
+#### COW-only send-trace follow-up with consumer affinity (27 November 2026)
+
+To resolve the unmeasured consumer placement, a fresh one-attempt payload
+added `RMG_DIAG_COW_CONSUMER_AFFINITY=1` to the previous guarded COW-only,
+send-trace profile. It retained the 512-MiB COW region, passive observer,
+CPU-4 mprotect-helper preference, durable checkpoints, and the forced stop
+before CFI, physical read/write, and root. The exact flags were
+`RMG_DIAG_COW_ONLY=1`, `RMG_DIAG_COW_TRACE=1`,
+`RMG_DIAG_COW_SEND_TRACE=1`, `RMG_DIAG_PASSIVE_COW_OBSERVER=1`,
+`RMG_DIAG_COW_CONSUMER_AFFINITY=1`,
+`RMG_DIAG_PASSIVE_COW_HELPER_CORE=4`, `RMG_DIAG_DURABLE_LOG=1`, and
+`RMG_DIAG_COW_PTE_MB=512`. It was built for Android API 30 with NDK r27b
+(`27.1.12297006`) as
+`build/cow-only-sendtrace-consumer-affinity-20261127/cve-2026-43499-app.so`
+(165,736 bytes; SHA-256
+`E7B5DAABB3A4BDEA2E4B3CE1A77DE213486C91DD7E1124F1C2AA6508955683B6`). The
+phone's staged file had the same SHA-256. RMG displayed the exact new local
+payload name and reported `diagnostic=cow-only`,
+`cfi_write_pipe_physrw_root=disabled`, and `attempt=1/1`.
+
+The affinity trace confirms that the consumer started with inherited mask
+`0x1`, widened to the cpuset-allowed mask `0x3f`, then fell back from requested
+CPU 7 to CPU 5 (effective mask `0x20`). The waiter selected CPU 0, the passive
+observer CPU 1 (effective mask `0x2`), and the mprotect helper CPU 4. This
+matches all four measured CPU roles from the 26 November blocked-waiter run.
+The controlled order-3 seed completed 128/128 sends; controlled reclaim
+completed all 256 sends of 65,536 bytes each. The traced socket-buffer request
+was 16 MiB and its effective size was 32 MiB. Kernel-page preparation took
+55,220 ms.
+
+The passive monitor sampled the waiter for 139 polls and recorded no `D`
+state (`blocked_samples=0`); its 33 samples during pselect also began and
+ended in `R`. Pselect returned 100 in 2,028 microseconds. The mprotect helper
+was sampled in `D` at poll 139 while pselect was active, 19 microseconds before
+the pselect-return trace timestamp; its captured wchan value was `0`. The
+first `PROT_NONE` mprotect ran from trace time `34414180991` to `34414183009`
+(2,018 microseconds). Pselect began about 48 microseconds after that call
+started, so the call returned about 1,970 microseconds into pselect, roughly
+58 microseconds before pselect returned. Both helper calls completed, with
+two loop iterations and 4,008 microseconds total helper time.
+
+Pagemap changed from present/file/exclusive to present/non-file/exclusive,
+and smaps anonymous memory rose from 0 to 4 KiB, consistent with COW copyout.
+The full 16-MiB canary scan covered 512/512 order-3 chunks, found zero changed
+chunks, and reported `mutated=0`. The readiness route reported `calls=0`;
+the COW-only guard forced the route signal to zero and stopped before
+`try_cfi_stage()`. The trailing physical-RW summary reported `root=0`,
+`read_ok=0`, and `write_ok=0`; KernelSU was not loaded. RMG returned code 255
+at “Running kernel exploit,” as expected when this guarded diagnostic found
+no readiness mutation. The phone remained awake and ADB-responsive on the
+same Android 16 fingerprint and kernel; the existing
+`ro.boot.bootreason=kernel_panic,bug` value was not a reboot from this run.
+
+Compared with the 26 November blocked-waiter run, consumer placement is now
+explicitly confirmed to match, and the other three CPU roles match as well.
+The first mprotect call returned about 1,970 microseconds after pselect began,
+close to the earlier 2,044-microsecond offset. However, the earlier run
+sampled the waiter in `D` at poll 78 (about 1,128 microseconds into pselect),
+whereas this run sampled the waiter in `R` throughout all 139 monitor polls
+and found the mprotect helper in `D` near pselect return. Pselect was 830
+microseconds shorter than the earlier 2,858-microsecond run. Matching all
+four CPUs and nearly matching the first-mprotect overlap show that consumer
+placement alone does not reproduce the waiter block.
+
+The runs still differ in reclaim and trigger behavior: the earlier PI/uclamp
+profile completed 251/256 reclaim sends and took 133,561 ms to prepare the
+kernel page; this COW-only send-trace run completed 256/256 and took 55,220
+ms. The earlier profile also called the uclamp scheduler operation only after
+observing the waiter in `D`; this COW-only build skips that operation. The
+current evidence therefore leaves reclaim-stream completeness and the
+PI/uclamp trigger as unresolved differences. The helper's `D` sample with
+wchan `0` does not identify the lock it waited on.
+
+The RMG UI log extraction, original result UI XML, result screenshot, and
+build are in `build/cow-only-sendtrace-consumer-affinity-20261127/`. The
+extracted UI-log SHA-256 is
+`7E7BA11765428EA1485F5CD636399249453FE007DA3A743638CB7BECE20D1036`; the
+original XML SHA-256 is
+`0D03240FE47DBDB3B9B4973279AEE7C177B71B4920BF43BF3D858E041144611B`; and the
+result screenshot SHA-256 is
+`B7A5ADB995521458262F9A68E196FC6B5CBA147C44503C3EB9824B1210BCC272`.
