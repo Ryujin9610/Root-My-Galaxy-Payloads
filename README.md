@@ -11,6 +11,8 @@ This repository contains the device-specific native side of
 
 It intentionally does not contain Android application source code.
 
+> **Warning:** This project was ported with AI assistance. Review and verify the code before use.
+
 ## Supported payloads
 
 | Payload | Compatible models | Kernel version | Status |
