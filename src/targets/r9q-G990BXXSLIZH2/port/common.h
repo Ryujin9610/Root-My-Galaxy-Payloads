@@ -104,6 +104,15 @@ void rmg_diag_checkpoint_text(const char *stage,
      !defined(RMG_DIAG_DURABLE_LOG) || !RMG_DIAG_DURABLE_LOG)
 #error "uclamp trigger diagnostic requires PI-probe, fops-readback, and durable-log guards"
 #endif
+#if defined(RMG_DIAG_UCLAMP_NICE_STEP) && RMG_DIAG_UCLAMP_NICE_STEP && \
+    (!defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) || \
+     !RMG_DIAG_UCLAMP_TRIGGER_ONLY || \
+     !defined(RMG_DIAG_PI_PROBE_ONLY) || !RMG_DIAG_PI_PROBE_ONLY || \
+     !defined(RMG_DIAG_FOPS_READBACK_ONLY) || \
+     !RMG_DIAG_FOPS_READBACK_ONLY || \
+     !defined(RMG_DIAG_DURABLE_LOG) || !RMG_DIAG_DURABLE_LOG)
+#error "uclamp nice-step probe requires the guarded PI/uclamp diagnostic"
+#endif
 #if defined(RMG_DIAG_CONTROLLED_MM) && RMG_DIAG_CONTROLLED_MM && \
     (!defined(RMG_DIAG_DURABLE_LOG) || !RMG_DIAG_DURABLE_LOG)
 #error "controlled-mm-only diagnostic requires durable checkpoints"
@@ -343,6 +352,7 @@ struct sched_uclamp_call_trace {
   int get_errno;
   uint32_t sched_policy;
   int32_t sched_nice;
+  int32_t sched_nice_after;
   uint64_t sched_flags_before;
   uint64_t sched_flags_after;
   uint32_t sched_util_min;

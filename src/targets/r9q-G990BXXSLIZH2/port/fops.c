@@ -3418,13 +3418,13 @@ void do_readiness_pause_route(void) {
       const struct sched_uclamp_call_trace *trace = &monitor.uclamp_trace;
       pr_info("UCLAMPTRACE attempt=%d tid=%d poll=%llu state=%d gate=%d "
               "runnable=%d active=%d recheck=%d get=%ld/%d policy=%u "
-              "nice=%d flags=%llu>%llu util=%u/%u set_attempted=%d "
+              "nice=%d->%d flags=%llu>%llu util=%u/%u set_attempted=%d "
               "set=%ld/%d start_us=%lld end_us=%lld call_us=%d\n",
               route_attempt, trace->tid, trace->poll, trace->waiter_state,
               trace->trigger_gate, trace->runnable_after_gate,
               trace->pselect_active, trace->pselect_active_after_sample,
               trace->get_ret, trace->get_errno, trace->sched_policy,
-              trace->sched_nice,
+              trace->sched_nice, trace->sched_nice_after,
               (unsigned long long)trace->sched_flags_before,
               (unsigned long long)trace->sched_flags_after,
               trace->sched_util_min, trace->sched_util_max,
@@ -3434,12 +3434,13 @@ void do_readiness_pause_route(void) {
       char trace_text[256];
       snprintf(trace_text, sizeof(trace_text),
                "state=%d gate=%d runnable=%d active=%d recheck=%d "
-               "get=%ld/%d policy=%u nice=%d flags=%llu>%llu "
+               "get=%ld/%d policy=%u nice=%d->%d flags=%llu>%llu "
                "util=%u/%u set=%d:%ld/%d us=%d",
                trace->waiter_state, trace->trigger_gate,
                trace->runnable_after_gate, trace->pselect_active,
                trace->pselect_active_after_sample, trace->get_ret,
                trace->get_errno, trace->sched_policy, trace->sched_nice,
+               trace->sched_nice_after,
                (unsigned long long)trace->sched_flags_before,
                (unsigned long long)trace->sched_flags_after,
                trace->sched_util_min, trace->sched_util_max,

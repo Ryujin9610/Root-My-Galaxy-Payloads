@@ -5284,3 +5284,30 @@ are in `build/uclamp-memorytrace-20261128/`. Their SHA-256 values are
 `0205ED07F816A861C42DC8A73D7E12A7FD8A0EAC9212B0589CE66239CBF9A96B`, and
 `C4A570BCC1D2044E8155A080BAEFB0E1D18090F16DDD8636A60CF0D337656F36`,
 respectively.
+
+### 2026-11-28 guarded nice-step candidate prepared
+
+The matching `rtmutex.c` source shows that `rt_mutex_waiter_equal()` returns
+true for non-deadline tasks when waiter priority equals the task's current
+priority. `rt_mutex_adjust_pi()` returns immediately in that case, before the
+PI-chain walk. `task_blocks_on_rt_mutex()` initializes the proxy waiter's
+priority from the task's current priority. Since the previous diagnostic
+preserved policy and nice, the successful scheduler call could still have
+returned from `rt_mutex_adjust_pi()` before walking the stale PI chain. This
+is consistent with the unchanged canary, but remains an inference: the
+userspace trace does not expose effective `p->prio` or `p->pi_blocked_on`.
+
+A follow-up candidate adds a compile-time guarded nice step of `0 -> 1` to the
+same scheduler request and records both values. It retains the `0..1024`
+clamp range and the compile-time stop before CFI, physical-RW, and root. The
+build is `build/uclamp-priority-step-20261128/cve-2026-43499-app.so` (157,024
+bytes; SHA-256
+`2FABCFD3954E7A26E129713EA8E7BC6EED8F84BE2067891114D54827DF9A97B2`). Its
+startup identity includes `nice_step=+1` and
+`cfi_write_pipe_physrw_root=disabled`; build flags are recorded in the same
+directory. This candidate has not been staged on or run against the phone.
+
+Changing nice may make the stale PI waiter unequal to the task and drive the
+chain walker into the corrupted waiter/lock state; a future run could freeze
+or reboot the phone. The earlier approval covered only the previous candidate
+and was used once. Do not run this follow-up without fresh approval.

@@ -498,11 +498,11 @@ long sched_setattr_tid_nochange(int tid) {
 
 long sched_setattr_tid_uclamp_nochange(
     int tid, struct sched_uclamp_call_trace *trace) {
-  /* Keep policy, nice, and requested clamp values unchanged, but include the
-   * UTIL_CLAMP flags so the G990B kernel does not take its unchanged-policy
-   * early return before rt_mutex_adjust_pi(). This diagnostic still enters
-   * the scheduler's dequeue/re-enqueue path and marks the clamp requests as
-   * user-defined; it is deliberately isolated behind a compile-time guard. */
+  /* Include UTIL_CLAMP flags so the G990B kernel does not take its
+   * unchanged-policy early return before rt_mutex_adjust_pi(). The optional
+   * nice-step build changes nice by +1 to test whether equal waiter/task
+   * priorities are causing rt_mutex_adjust_pi() to return before walking the
+   * PI chain. This diagnostic remains behind compile-time guards. */
   const uint64_t sched_flag_util_clamp_min = 1ULL << 5;
   const uint64_t sched_flag_util_clamp_max = 1ULL << 6;
   const uint32_t sched_capacity_scale = 1024;
@@ -542,7 +542,17 @@ long sched_setattr_tid_uclamp_nochange(
   }
   attr.size = sizeof(attr);
   attr.sched_flags |= sched_flag_util_clamp_min | sched_flag_util_clamp_max;
+#if defined(RMG_DIAG_UCLAMP_NICE_STEP) && RMG_DIAG_UCLAMP_NICE_STEP
+  if (attr.sched_nice >= 19) {
+    if (trace)
+      trace->sched_nice_after = attr.sched_nice;
+    errno = ERANGE;
+    return -1;
+  }
+  attr.sched_nice += 1;
+#endif
   if (trace) {
+    trace->sched_nice_after = attr.sched_nice;
     trace->sched_flags_after = attr.sched_flags;
     trace->set_attempted = 1;
   }

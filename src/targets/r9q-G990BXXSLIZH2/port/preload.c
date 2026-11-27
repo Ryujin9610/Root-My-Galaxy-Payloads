@@ -194,10 +194,17 @@ __attribute__((constructor)) static void load(void) {
              RMG_DIAG_COW_PTE_MB);
 #elif defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) && \
     RMG_DIAG_UCLAMP_TRIGGER_ONLY
+#if defined(RMG_DIAG_UCLAMP_NICE_STEP) && RMG_DIAG_UCLAMP_NICE_STEP
+  pr_success("validated route controlled_reclaim=on readiness_pause=on "
+             "pte_mb=%d diagnostic=uclamp-trigger-only nice_step=+1 "
+             "cfi_write_pipe_physrw_root=disabled\n",
+             RMG_DIAG_COW_PTE_MB);
+#else
   pr_success("validated route controlled_reclaim=on readiness_pause=on "
              "pte_mb=%d diagnostic=uclamp-trigger-only "
              "cfi_write_pipe_physrw_root=disabled\n",
              RMG_DIAG_COW_PTE_MB);
+#endif
 #elif defined(RMG_DIAG_PI_PROBE_ONLY) && RMG_DIAG_PI_PROBE_ONLY
   pr_success("validated route controlled_reclaim=on readiness_pause=on "
              "pte_mb=%d diagnostic=pi-probe-only cfi_root=disabled\n",
