@@ -4347,7 +4347,76 @@ remain possible influences.
 
 The logged `readiness mmap locker elapsed_us` is the elapsed mprotect-helper
 loop time, not a direct measurement of mmap-semaphore ownership duration. The
-two per-call `MPTIME` intervals are the relevant syscall timings. For the next
-diagnostic, prefer an observer that records per-thread scheduling/runtime
-counters alongside state, and capture a live wait channel only when the waiter
-actually enters `D`. Do not infer a blocked waiter from the helper's `D` sample.
+two per-call `MPTIME` intervals are the relevant syscall timings. The
+following schedstat run adds per-thread scheduling/runtime counters. A live
+wait channel still needs to be captured only when the waiter enters `D`; do
+not infer a blocked waiter from the helper's state.
+
+### 2026-11-27 guarded schedstat trace: waiter briefly entered `D`
+
+Built one local candidate with `RMG_DIAG_SCHEDSTAT_TRACE=1`, retaining the
+single-attempt limit and the pre-CFI, physical-read/write-disabled, and
+root-disabled guards. The candidate was
+`build/pi-helper-state-schedstat-20261127/cve-2026-43499-app.so` (158,040
+bytes; SHA-256
+`3f757baa3c7f3b2c59380e50b515d6315b4ad4a9ca024d26483e9a357304011c`). RMG
+confirmed it was using the imported local file and selected the exact
+`r9q-G990BXXSLIZH2` profile. The run log reported
+`diagnostic=uclamp-trigger-only` and
+`cfi_write_pipe_physrw_root=disabled`.
+
+The effective placement was mostly the same as the earlier run that caught the
+waiter blocked, but the mmap helper moved. The passive observer widened its
+affinity and reported allowed mask `0x6f`; this mask excludes CPU4, so the
+helper selector fell back from its preferred CPU4 to CPU6. The low-power
+setting was off (`global.low_power=0`).
+
+| Role or mask | Earlier waiter-`D` run | Schedstat run |
+|---|---:|---:|
+| Waiter | CPU0 | CPU0 |
+| Consumer | CPU5 | CPU5 |
+| State observer | CPU1, effective mask `0x2` | CPU1, effective mask `0x2` |
+| mmap helper selected CPU | CPU4 | CPU6 (CPU4 unavailable in allowed mask `0x6f`) |
+| Observer allowed mask | `0x3f` | `0x6f` |
+
+`pselect` began at monotonic `11921270448 us`. The first mprotect entered
+46 us earlier and returned 2,185 us after pselect began. The waiter was first
+sampled in `D` at poll 40, 670 us after pselect began; the state-transition
+trace marker followed at +673 us. This is about 458 us earlier than the
+earlier waiter-`D` run's +1,128-us observation (poll 78). The first mprotect
+was still in progress for about another 1.5 ms after the current `D` sample.
+The current pselect returned `112` after 2,294 us; the earlier run returned
+`118` after 2,858 us. The second mprotect returned at +4,358 us, and the
+reported total helper-loop duration was 4,412 us versus 4,780 us previously.
+
+The new per-thread counters cover the first 605 us of the active pselect
+window. The waiter was sampled as `R` at polls 8 through 36 and as `D` at poll
+40. Its cumulative runtime rose from 145,290,839 to 145,812,506 ns, runqueue
+wait rose from 6,599,061 to 6,861,509 ns, and timeslices rose from 114 to
+116. Those totals are cumulative snapshots, not a precise decomposition of
+each 75-us polling interval. The mprotect helper was sampled as `R` at polls
+8 through 40; its counters stayed at 1,159,062 ns runtime, 7,922,970 ns
+runqueue wait, and four timeslices in all nine samples. Thus the trace confirms
+that the waiter reached `D` during this run, but it does not reveal the exact
+wait channel or prove whether an `R`-state thread was executing versus merely
+runnable. The helper's unchanged snapshots also do not resolve its CPU-time
+behavior.
+
+The readiness route completed its overlay diagnostic and reported
+`readiness-cow cfi miss ... step=42`; the 16-MiB canary scan covered 512/512
+chunks with no changed chunks. RMG ended at “Running kernel exploit” with code
+255, before KernelSU loading. The pipe-physrw summary had `done=0`, `root=0`,
+and no successful read or write. Afterward the phone still reported firmware
+`G990BXXSLIZH2` and kernel `5.4.289-qgki-32192773-abG990BXXSLIZH2`,
+`sys.boot_completed=1`, and shell UID 2000; `/dev/ksu` and `/proc/ksu` were
+absent. There was no reboot or flash.
+
+The full RMG log and UI dump, result screenshot, build log, and the captured
+logcat are saved locally under
+`build/pi-helper-state-schedstat-20261127/` (`phone-run-ui.txt`,
+`phone-run-ui.xml`, `phone-run-final.png`, `build.log`, and
+`phone-logcat.txt`). The schedstat counters improve the state trace, but the
+helper CPU fallback and one-sample `D` observation mean this was not a fully
+controlled comparison. For another diagnostic, keep the one-attempt and
+downstream guards; the most useful next addition is a read-only wait-channel
+sample taken only when the waiter is actually observed in `D`.
