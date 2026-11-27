@@ -5244,9 +5244,12 @@ instructs applying the `G990BXXSLIZH2` update archive; that update does not
 contain `kernel/sched/core.c`. In the base source, the UAPI defines the two
 clamp flags as `0x20` and `0x40`, a same-policy request with those flags takes
 the `change` path in `__sched_setscheduler()`, and `sched_setattr()` calls it
-with PI enabled. The `change` path calls `rt_mutex_adjust_pi(p)`. This supports
-that the request entered the intended PI-adjust path, but does not prove that
-the waiter's PI tree changed or that its effective utilization changed. The
+with PI enabled. The `change` path calls `rt_mutex_adjust_pi(p)`. That
+function returns without walking the PI chain if `p->pi_blocked_on` is null or
+points to the task's own waiter. This user-space trace cannot read that field,
+so it confirms the scheduler request but not whether the PI-chain walk
+occurred, whether the waiter's PI tree changed, or whether effective
+utilization changed. The
 512-MiB COW trace observed a blocked waiter and the overlay geometry check
 passed, but the 16-MiB canary scan found no changed chunks (`mutated=0`,
 `task_pi=0`). The fops readback was skipped. The diagnostic guard recorded
