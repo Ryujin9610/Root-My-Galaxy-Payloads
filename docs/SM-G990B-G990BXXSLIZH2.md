@@ -5363,3 +5363,47 @@ The next useful work is to explain the readiness timing difference that
 prevented any blocked waiter sample, using the existing COW-only versus
 PI/uclamp traces. Do not treat another nice-step run as informative until the
 trigger path is shown to reach the gated setter.
+
+### 2026-11-28 readiness timing comparison
+
+The earlier `uclamp-memorytrace` run and the guarded nice-step run used the
+same CPU placement: consumer on CPU 5, waiter on CPU 6, passive observer on
+CPU 0, and mprotect helper on CPU 5. CPU affinity therefore does not explain
+why only the earlier run observed a blocked waiter.
+
+In the earlier run, `pselect()` lasted 2,970 microseconds. The waiter was
+sampled in state `D` at poll 32, about 514 microseconds after `pselect()`
+began. The first mprotect interval ran from about 48 microseconds before
+`pselect()` to +1,660 microseconds; the second ran from +1,660 to +3,712
+microseconds. Thus `pselect()` returned while the second mprotect call was
+still in progress. In the nice-step run, `pselect()` returned in 611
+microseconds. The waiter was sampled as `R` at +46 and +575 microseconds, and
+the two mprotect intervals were approximately -48 to +602 and +602 to +1,172
+microseconds. No blocked sample was observed, so the guarded nice setter did
+not run. These user-space intervals bracket whole syscalls and do not reveal
+the exact point at which mprotect held the memory-map semaphore.
+
+The matching Samsung source gives a plausible lock path: `core_sys_select()`
+copies its result sets to user memory through `set_fd_set()` and
+`__copy_to_user()`; a write-protection fault in that COW output mapping can
+enter the arm64 page-fault path, which takes `mmap_sem` for reading. Meanwhile,
+`do_mprotect_pkey()` takes `mmap_sem` for writing. If the faulting copyout
+arrives while that write lock is held, the waiter can block. The source review
+and observed timing are consistent with this explanation, but do not prove
+that this overlap caused the earlier `D` sample.
+
+Evidence is in `build/uclamp-memorytrace-20261128/` and
+`build/uclamp-priority-step-20261128/`; the matching extracted source review is
+in `build/select-cow-source-review-20261128/`. Both runs completed the
+readiness COW transition, neither changed the canary, and neither reached
+CFI, physical read/write, or root. The latest run therefore provides no result
+about the proposed nice-step/PI-chain hypothesis.
+
+The next diagnostic should focus on making the copyout fault and the mprotect
+write-lock window measurably overlap, and log each event independently. First
+review whether the existing payload can bracket the COW output copy and each
+mprotect call more precisely; if it cannot observe lock acquisition directly,
+keep that limitation explicit and use controlled timing variations as a
+correlation test. Re-run the nice-step candidate only after a blocked waiter
+sample reaches its guarded scheduler hook. Keep the diagnostic stop before
+CFI, physical read/write, and root, and use one attempt per run.
