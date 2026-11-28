@@ -5580,8 +5580,12 @@ For this run, `/proc` reported `Cpus_allowed=ff` and
 cpuset. The device reported CPUs `0-7` online, root and top-app cpusets
 `0-7`, foreground `0-2,4-7`, background `0-2`, and battery saver off. Thus
 CPU hotplug and the visible cpuset masks do not explain the narrower
-`sched_getaffinity()` result. The mismatch between the `/proc` fields and the
-syscall result remains unresolved.
+`sched_getaffinity()` result. A later review of the exact firmware source
+explained why the `/proc` and syscall masks can differ: `/proc` prints
+`task->cpus_ptr`, while `sched_getaffinity()` intersects the task mask with
+the active CPU mask and, when WALT is enabled, removes WALT's isolated-CPU
+mask for user tasks. The specific runtime mask responsible for each missing
+CPU in a Shizuku run remains unresolved; see the source review below.
 
 The phone stayed booted on the expected Android 16 fingerprint and
 5.4.289 kernel, ADB remained UID 2000, and `/dev/ksu` and `/proc/ksu` remained
@@ -5674,3 +5678,53 @@ Evidence and SHA-256 hashes are recorded under
 (`B1A0E88423FC7809D2BFF4636FB5922D2D58D977115628A5DE1605C36AA934CC`),
 and `device-post-run.txt`
 (`BCEE29DBE1A839CF23DD7D234487F470E3C5509A8F831CFDD72287D2AA34F279`).
+
+#### Firmware source review and repeat preflight
+
+The downloaded kernel bundle contains the exact
+`SM-G990BXXSLIZH2` source package. In `fs/proc/array.c`,
+`task_cpus_allowed()` formats `/proc/<pid>/status` from `task->cpus_ptr`.
+In `kernel/sched/core.c`, `sched_getaffinity()` instead starts with
+`p->cpus_mask & cpu_active_mask`; with `CONFIG_SCHED_WALT`, it also removes
+`cpu_isolated_mask` for non-kernel threads. The live `/proc/config.gz`
+reports `CONFIG_SCHED_WALT=y`. This means `Cpus_allowed=ff` and
+`Cpus_allowed_list=0-7` are not proof that a user process can pin to every
+online CPU. The preflight's `sched_getaffinity()` result and exact pin checks
+are the relevant placement evidence.
+
+A second run of the same parent-only artifact used RMG record
+`75c54cc6-382c-497a-b014-5dc1b590a529`. Child PID 14234 and Shizuku
+supervisor PID 14231 again showed `Cpus_allowed=ff`, but the scheduler mask
+was now `0xdf` (CPUs 0-4, 6, and 7). Exact pins to waiter CPU 6, consumer
+CPU 7, and observer CPU 0 succeeded; helper CPU 5 was absent from the
+effective mask. The preflight restored `0xdf` and verified the match. It
+returned status 42 before KASLR, route setup, or COW. Thus CPU 7 was
+unavailable in the first run but available in this one; CPU 5 blocked both
+strict preflights. This confirms that the effective mask can change between
+Shizuku launches, while the `/proc` fields remained `0xff`.
+
+After restarting the host ADB server, a fresh interactive ADB shell returned
+mask `0xff` on eight repeated `taskset` queries, matching its `/proc` status.
+That shell is a different launch context from RMG through Shizuku and does
+not establish the current Shizuku mask. Online, possible, and present CPUs
+were `0-7`; the standard `/sys/devices/system/cpu/isolated` file was empty,
+and the visible root and top-app cpusets were `0-7`. Those interfaces do not
+expose the scheduler's active mask or WALT's internal isolated mask, so the
+specific reason for the per-launch differences is still unknown.
+
+The phone remained responsive on the expected firmware and kernel, ADB
+remained UID 2000, battery saver was off, and no KernelSU module or `/dev/ksu`
+or `/proc/ksu` node appeared. The previous every-poll payload was restored
+again with the app-private baseline hash
+`F33CADDAEC9CEDB0B07161D42FEA400CF9B0416E4B7DCD0DFCE13B42F78F009A`.
+Evidence for the repeat run is under
+`build/affinity-mask-investigation-20261128/`: `install-history-latest.json`
+(`564E69A7C7D82706D8861C169D364EB9FB009DB4E462F51710AB53A9CA665922`),
+`result-ui.xml`
+(`AE456D9A36B1AA0AA69C42EF0079A334B5407256021891DEA786E8498AF9E835`),
+`device-post-run.txt`
+(`BCEE29DBE1A839CF23DD7D234487F470E3C5509A8F831CFDD72287D2AA34F279`),
+and `cpu-mask-source-review.txt`
+(`08010B76DE726CA48C873B84ED50DA97998295C821495DE6C97786ABFE9565E2`).
+The downloaded source bundle's SHA-256 is
+`FDDDAD4657D0947106CF6CC6BBFB99C0C495ED48259F7FFB9290E92E7FBFFABE`.
