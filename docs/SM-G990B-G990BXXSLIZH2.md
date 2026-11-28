@@ -5728,3 +5728,37 @@ and `cpu-mask-source-review.txt`
 (`08010B76DE726CA48C873B84ED50DA97998295C821495DE6C97786ABFE9565E2`).
 The downloaded source bundle's SHA-256 is
 `FDDDAD4657D0947106CF6CC6BBFB99C0C495ED48259F7FFB9290E92E7FBFFABE`.
+
+#### CPU 4 helper candidate
+
+Built a new parent-only artifact with the mprotect-helper assignment changed
+from CPU 5 to CPU 4. Its SHA-256 is
+`9F8CB53BA357C68081E4830B95C9556E9119CE77C9E6FF2A4A523D3F783BE966`;
+build flags are under `build/strict-cpu4-preflight-20261128/`. RMG run
+`4cb58a2e-2987-42db-b22f-4963b4ae7997` again showed `Cpus_allowed=ff` for
+the child and supervisor, while `sched_getaffinity()` returned `0x6f`
+(CPUs 0-3, 5, and 6). The waiter pin to CPU 6 and observer pin to CPU 0
+succeeded; the consumer CPU 7 and helper CPU 4 were unavailable. The
+preflight restored `0x6f`, verified the match, and returned status 42 before
+KASLR, route setup, or COW.
+
+Across the three strict Shizuku preflights, the effective masks were
+`0x5f`, `0xdf`, and `0x6f`, despite all three reporting `/proc` mask `0xff`.
+Their common CPUs were 0-3 and 6. CPU 7 appeared only in `0xdf`; CPU 4 was
+present in `0x5f` and `0xdf`, while CPU 5 appeared in `0x6f`. Neither fixed
+helper assignment (4 or 5) was available in every launch, and the CPU 7
+consumer role was also intermittent. The assignment change therefore did
+not make the strict layout reliable. The latest active payload was restored
+to the previous every-poll diagnostic with app-private hash
+`F33CADDAEC9CEDB0B07161D42FEA400CF9B0416E4B7DCD0DFCE13B42F78F009A`; the
+phone remained unrooted with no KernelSU module or device nodes.
+
+Evidence is in `build/strict-cpu4-preflight-20261128/`:
+`install-history-latest.json`
+(`1194E09521E83556BDC3715EC23FE50C1D0696AD3F83003143620B8441B6225B`),
+`result-ui.xml`
+(`AA138B94E864AF4114818DC95722502DF4B47A66AEA41849E3259C6CDAC1907C`),
+`device-post-run.txt`
+(`BCEE29DBE1A839CF23DD7D234487F470E3C5509A8F831CFDD72287D2AA34F279`),
+and `cpu4-mask-review.txt`
+(`A879A45B02D860D8F0DFAD02510433FD9E1F73BD5F02D13C14BE11404EE9B577`).
