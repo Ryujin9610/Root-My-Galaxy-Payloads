@@ -5606,3 +5606,71 @@ verify the consumer, mprotect helper, and observer each reached their
 assigned CPUs. Keep the COW-only guard and skip the run whenever any required
 CPU is missing. Capture each thread's effective mask so later timing
 comparisons use the same placement.
+
+### 2026-11-28 strict COW CPU placement guard
+
+Added `RMG_DIAG_COW_STRICT_PLACEMENT=1` for guarded COW-only app builds. The
+fixed roles are route thread and waiter on CPU 6, consumer on CPU 7, mprotect
+helper on CPU 5, and passive observer on CPU 0. The preflight widens the
+current thread only long enough to check the effective allowed mask, attempts
+each exact CPU pin, then restores and verifies the inherited mask. Missing or
+unverifiable role CPUs stop before KASLR.
+
+After that preflight, the route thread widens its own mask and pins to CPU 6
+after kernel-page and route-craft setup. The waiter must verify CPU 6; the
+consumer widens its own mask and must verify CPU 7. The passive observer and
+mprotect helper independently widen and verify CPUs 0 and 5. Each role logs
+the effective mask and current CPU. There is no fallback to another core in
+strict mode. Waiter or consumer pin failures stop before `CMP_REQUEUE_PI`;
+observer or helper failures abort setup before the readiness `pselect()` COW
+trigger. The build forces the readiness route and rejects alternate or later
+exploit stages at compile time.
+
+The initial artifact was built with
+`RMG_DIAG_COW_PARENT_AFFINITY_ONLY=1`, so it returns immediately after the
+preflight even if every CPU check passes. It therefore cannot reach KASLR,
+route setup, or the COW operation. The 171,656-byte Android API 30 artifact
+has SHA-256
+`8E4532D1C2964A172C71C128C85D7C762FE4930677ADE172EDD8B012745706BA`.
+Build flags are recorded in
+`build/strict-cpu-placement-20261128/build-flags.txt`. The build completed
+with only the existing unused-static-function warnings.
+
+#### On-device preflight
+
+RMG run record `db44916c-fdf9-4b74-8edc-fa7add95799e` used this local
+artifact once through Shizuku. Its app-private payload hash matched the
+artifact before execution. The child (PID 16122) and its direct Shizuku
+supervisor (PID 16119) both reported `sched_getaffinity()` mask `0x5f` even
+though each `/proc/<pid>/status` showed `Cpus_allowed=ff` and
+`Cpus_allowed_list=0-7`. The CPU 6 waiter probe and CPU 0 observer probe
+successfully pinned and verified their singleton masks. The allowed-mask
+checks found CPUs 7 and 5 unavailable, so the consumer and mprotect-helper
+roles could not be placed. The preflight restored the inherited `0x5f` mask
+and verified it (`restore=0/0`, `verify=0/0`, `match=1`).
+
+The parent-only stop returned diagnostic status 42 before KASLR discovery,
+route setup, or the COW operation; RMG displayed its generic code 255. The
+log records `strict_roles=0` and `strict_pin_tests=0`, so this run validates
+the safe preflight and affinity restoration only. It does not exercise the
+later route, waiter, consumer, observer-thread, or mprotect-helper placement
+code. No root was gained and KernelSU did not load. The phone remained on
+the expected Android 16 build and 5.4.289 kernel, ADB remained UID 2000,
+`/dev/ksu` and `/proc/ksu` were absent, and no KernelSU module appeared in
+`/proc/modules`.
+
+After the run, the app's local payload was restored to the previous
+every-poll COW diagnostic; its app-private hash is
+`F33CADDAEC9CEDB0B07161D42FEA400CF9B0416E4B7DCD0DFCE13B42F78F009A`.
+The strict preflight artifact remains in Downloads but is not active.
+Evidence and SHA-256 hashes are recorded under
+`build/strict-cpu-placement-20261128/`: `rmg-ui-log.txt`
+(`67E07A076D66F471723D42D5EB33505C5E5CC9D6E5F9E4AADF924D22290C9840`),
+`install-history.json`
+(`B499966C28E74254F8193EC79AA8E6AD182217C3C5DF44BC8C0801274C4AD6FD`),
+`result-ui.xml`
+(`F52D49FDED8FAAB895B999EAB82A4DFC08B46E1E06CE51DAD04A518791DAF8EA`),
+`result-screen.png`
+(`B1A0E88423FC7809D2BFF4636FB5922D2D58D977115628A5DE1605C36AA934CC`),
+and `device-post-run.txt`
+(`BCEE29DBE1A839CF23DD7D234487F470E3C5509A8F831CFDD72287D2AA34F279`).

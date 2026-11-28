@@ -994,6 +994,13 @@ struct readiness_cow_ctx {
   int err;
   unsigned long iterations;
   long long elapsed_us;
+#if RMG_DIAG_COW_STRICT_PLACEMENT
+  atomic_int affinity_ready;
+  int affinity_errno;
+  int affinity_core;
+  int affinity_cpu;
+  unsigned long long affinity_mask;
+#endif
 };
 
 static long long readiness_now_us(void) {
@@ -1179,6 +1186,11 @@ static unsigned long long readiness_affinity_mask64(const cpu_set_t *mask) {
 #if defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && RMG_DIAG_PASSIVE_COW_OBSERVER
 static int readiness_select_passive_helper_core(const cpu_set_t *allowed,
                                                 int waiter_core) {
+#if RMG_DIAG_COW_STRICT_PLACEMENT
+  int preferred = RMG_DIAG_COW_HELPER_CPU;
+  return preferred < CPU_SETSIZE && preferred != waiter_core &&
+         CPU_ISSET(preferred, allowed) ? preferred : -1;
+#else
 #if defined(RMG_DIAG_PASSIVE_COW_HELPER_CORE) && \
     RMG_DIAG_PASSIVE_COW_HELPER_CORE >= 0
   int preferred = RMG_DIAG_PASSIVE_COW_HELPER_CORE;
@@ -1191,6 +1203,7 @@ static int readiness_select_passive_helper_core(const cpu_set_t *allowed,
       return cpu;
   }
   return -1;
+#endif
 }
 
 static int readiness_pin_passive_observer(
@@ -1234,6 +1247,49 @@ static int readiness_pin_passive_observer(
     return -1;
   }
 
+#if RMG_DIAG_COW_STRICT_PLACEMENT
+  int observer_target = RMG_DIAG_COW_OBSERVER_CPU;
+  if (waiter_core != RMG_DIAG_COW_WAITER_CPU ||
+      observer_target >= CPU_SETSIZE || observer_target == waiter_core ||
+      observer_target == *helper_core ||
+      !CPU_ISSET(observer_target, &allowed)) {
+    errno = ENODEV;
+    return -1;
+  }
+
+  CPU_ZERO(&requested);
+  CPU_SET(observer_target, &requested);
+  errno = 0;
+  int pin_ret = sched_setaffinity(0, sizeof(requested), &requested);
+  int pin_errno = pin_ret == 0 ? 0 : errno;
+  errno = 0;
+  int effective_ret = sched_getaffinity(0, sizeof(effective), &effective);
+  int effective_errno = effective_ret == 0 ? 0 : errno;
+  int current_cpu = sched_getcpu();
+  int effective_count = 0;
+  if (effective_ret == 0) {
+    for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+      effective_count += CPU_ISSET(cpu, &effective) ? 1 : 0;
+  }
+  *effective_bits = effective_ret == 0
+      ? readiness_affinity_mask64(&effective) : 0;
+  int verified = pin_ret == 0 && effective_ret == 0 &&
+                 effective_count == 1 &&
+                 CPU_ISSET(observer_target, &effective) &&
+                 current_cpu == observer_target;
+  pr_info("RMG_COW_CPU_PIN role=observer requested=%d set=%d/%d "
+          "effective=%016llx/%d current=%d verified=%d "
+          "helper=%d waiter=%d\n",
+          observer_target, pin_ret, pin_errno, *effective_bits,
+          effective_errno, current_cpu, verified, *helper_core, waiter_core);
+  if (!verified) {
+    errno = pin_errno ? pin_errno :
+            effective_errno ? effective_errno : EINVAL;
+    return -1;
+  }
+  *observer_core = observer_target;
+  return 0;
+#else
   int last_errno = ENODEV;
   for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
     if (cpu == waiter_core || cpu == *helper_core ||
@@ -1262,6 +1318,7 @@ static int readiness_pin_passive_observer(
   }
   errno = last_errno;
   return -1;
+#endif
 }
 #endif
 
@@ -1285,9 +1342,63 @@ static void *readiness_mmap_lock_thread(void *arg) {
   int restore_errno = restore_ret == 0 ? 0 : errno;
   int restored_ret = sched_getaffinity(0, sizeof(restored_mask),
                                        &restored_mask);
+  int restored_errno = restored_ret == 0 ? 0 : errno;
   unsigned long long restored_bits = restored_ret == 0
       ? readiness_affinity_mask64(&restored_mask) : 0;
   int locker_core = -1;
+#if RMG_DIAG_COW_STRICT_PLACEMENT
+  int target_core = RMG_DIAG_COW_HELPER_CPU;
+  cpu_set_t requested_mask, effective_mask;
+  CPU_ZERO(&requested_mask);
+  CPU_ZERO(&effective_mask);
+  int pin_ret = -1;
+  int pin_errno = restore_ret != 0 ? restore_errno :
+                  restored_ret != 0 ? restored_errno : ENODEV;
+  int effective_ret = -1;
+  int effective_errno = 0;
+  int current_cpu = -1;
+  int effective_count = 0;
+  if (restore_ret == 0 && restored_ret == 0 &&
+      target_core < CPU_SETSIZE &&
+      CPU_ISSET(target_core, &restored_mask)) {
+    CPU_SET(target_core, &requested_mask);
+    errno = 0;
+    pin_ret = sched_setaffinity(0, sizeof(requested_mask), &requested_mask);
+    pin_errno = pin_ret == 0 ? 0 : errno;
+    errno = 0;
+    effective_ret = sched_getaffinity(0, sizeof(effective_mask),
+                                      &effective_mask);
+    effective_errno = effective_ret == 0 ? 0 : errno;
+    current_cpu = sched_getcpu();
+    if (effective_ret == 0) {
+      for (int cpu = 0; cpu < CPU_SETSIZE; cpu++)
+        effective_count += CPU_ISSET(cpu, &effective_mask) ? 1 : 0;
+    }
+    if (pin_ret == 0 && effective_ret == 0 && effective_count == 1 &&
+        CPU_ISSET(target_core, &effective_mask) &&
+        current_cpu == target_core) {
+      locker_core = target_core;
+    } else if (!pin_errno) {
+      pin_errno = effective_errno ? effective_errno : EINVAL;
+    }
+  }
+  ctx->affinity_errno = locker_core == target_core ? 0 : pin_errno;
+  ctx->affinity_core = locker_core;
+  ctx->affinity_cpu = current_cpu;
+  ctx->affinity_mask = effective_ret == 0
+      ? readiness_affinity_mask64(&effective_mask) : 0;
+  atomic_store_explicit(&ctx->affinity_ready, 1, memory_order_release);
+  pr_info("RMG_COW_CPU_PIN role=mprotect_helper requested=%d "
+          "set=%d/%d effective=%016llx/%d current=%d verified=%d "
+          "allowed=%016llx inherited=%016llx\n",
+          target_core, pin_ret, pin_errno, ctx->affinity_mask,
+          effective_errno, current_cpu, locker_core == target_core,
+          restored_bits,
+          inherited_ret == 0
+              ? readiness_affinity_mask64(&inherited_mask) : 0);
+  if (ctx->affinity_errno != 0)
+    return NULL;
+#else
   if (restore_ret == 0) {
 #if defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && \
     RMG_DIAG_PASSIVE_COW_OBSERVER
@@ -1303,6 +1414,7 @@ static void *readiness_mmap_lock_thread(void *arg) {
     if (locker_core < 0)
       locker_core = sched_pin_highest_allowed(waiter_core);
   }
+#endif
   pr_info("readiness mmap locker affinity inherited=%016llx/%d "
           "restore=%d/%d allowed=%016llx/%d core=%d waiter_core=%d\n",
           inherited_ret == 0
@@ -3028,6 +3140,13 @@ void do_readiness_pause_route(void) {
     atomic_init(&cow_ctx.mprotect_started, 0);
     atomic_init(&cow_ctx.stop_mprotect, 0);
     atomic_init(&cow_ctx.done, 0);
+#if RMG_DIAG_COW_STRICT_PLACEMENT
+    atomic_init(&cow_ctx.affinity_ready, 0);
+    cow_ctx.affinity_errno = 0;
+    cow_ctx.affinity_core = -1;
+    cow_ctx.affinity_cpu = -1;
+    cow_ctx.affinity_mask = 0;
+#endif
 #if defined(RMG_DIAG_DURABLE_LOG) && RMG_DIAG_DURABLE_LOG
     rmg_diag_checkpoint("readiness-cow-setup-start", route_attempt,
                         cow_len);
@@ -3172,17 +3291,26 @@ void do_readiness_pause_route(void) {
         while (!(locker_tid = atomic_load_explicit(&cow_ctx.tid,
                                                     memory_order_acquire)))
           __asm__ volatile("yield" ::: "memory");
-        atomic_store_explicit(&monitor.locker_tid, locker_tid,
-                              memory_order_release);
-        monitor.locker_stat_fd = readiness_open_task_stat(locker_tid);
-        if (monitor.locker_stat_fd < 0) {
-          monitor.locker_open_errno = errno;
-          thread_err = monitor.locker_open_errno;
-        } else {
-          atomic_store_explicit(&monitor.locker_stat_ready, 1,
+#if RMG_DIAG_COW_STRICT_PLACEMENT
+        while (!atomic_load_explicit(&cow_ctx.affinity_ready,
+                                     memory_order_acquire))
+          __asm__ volatile("yield" ::: "memory");
+        if (cow_ctx.affinity_errno != 0)
+          thread_err = cow_ctx.affinity_errno;
+#endif
+        if (thread_err == 0) {
+          atomic_store_explicit(&monitor.locker_tid, locker_tid,
                                 memory_order_release);
-          pr_info("readiness monitor task ids waiter=%d mprotect_helper=%d\n",
-                  monitor.tid, locker_tid);
+          monitor.locker_stat_fd = readiness_open_task_stat(locker_tid);
+          if (monitor.locker_stat_fd < 0) {
+            monitor.locker_open_errno = errno;
+            thread_err = monitor.locker_open_errno;
+          } else {
+            atomic_store_explicit(&monitor.locker_stat_ready, 1,
+                                  memory_order_release);
+            pr_info("readiness monitor task ids waiter=%d mprotect_helper=%d\n",
+                    monitor.tid, locker_tid);
+          }
         }
 #endif
 #if defined(RMG_DIAG_PI_HELPER_STATE_TRACE_ACTIVE)
