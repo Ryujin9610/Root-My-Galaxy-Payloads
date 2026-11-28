@@ -5434,3 +5434,59 @@ read/write, or root stages. Treat the result as timing correlation, since the
 kernel lock interval itself is not directly traced. Only after a `D` sample
 reaches the guarded setter would a separate one-attempt nice-step run test the
 priority hypothesis.
+
+### 2026-11-28 one-shot 75-microsecond COW timing run
+
+The COW-only build used `RMG_DIAG_COW_MPROTECT_DELAY_USEC=75`, a 512-MiB PTE
+region, and the passive COW observer. It was built for Android API 30 with NDK
+r27b. Its SHA-256 is
+`99165DD918FDB0A3F78C70B5CE64B63E04E10ECE391F30B72DFFA0F718464D5C` (165,880
+bytes). The build strings include the COW trace and
+`readiness-cow-only-stop-before-cfi`; the build used no PI/uclamp or nice-step
+flags. RMG's app-private `files/local-payload/local-exploit.so` matched the
+candidate hash before execution.
+
+RMG logged `exploit attempt=1/1`, used the local payload, and completed tracefs
+KASLR discovery. It also verified and staged its KernelSU service before
+starting the diagnostic. The readiness COW mapping changed from present,
+file-backed to present, anonymous. The diagnostic stopped at
+`readiness-cow cfi miss`; it did not obtain temporary root, load KernelSU, or
+perform physical read/write. RMG reported code 255 at the kernel-exploit step.
+
+The 75-microsecond delay moved the first mprotect syscall entry to about +27
+microseconds after the `pselect()`-before trace marker. That call lasted 653
+microseconds and returned around +680 microseconds. The pselect-after marker
+was around +690 microseconds (reported `pselect_us=685`). A second mprotect
+call started around +680 microseconds and ended around +1,243 microseconds.
+This is a tighter timing alignment than the 250-microsecond-delay run, where
+mprotect began after pselect had returned.
+
+No waiter `D` state was sampled: the passive observer recorded 11 samples,
+all `R` (ASCII 82), from about +47 to +639 microseconds; the helper observer
+also recorded zero blocked samples. The COW-only monitor samples passively
+once every four polls. Its final sample was about 51 microseconds before the
+pselect-after marker, so a short blocked interval could have gone unsampled;
+that is a possibility, not proof that the waiter blocked. The longer
+685-microsecond pselect duration and the syscall timing are suggestive of
+changed event alignment, but the run does not establish that `mmap_sem`
+contention caused the delay.
+
+The phone remained on the same Android 16 fingerprint and 5.4.289 kernel,
+ADB-responsive with battery saver off. The ADB shell remained UID 2000, and
+`kernelsu` was absent from `/proc/modules`; `/dev/ksu` and `/proc/ksu` were
+absent. The staged KernelSU service was not loaded.
+
+Evidence is in `build/cow-mprotect-delay75-20261128/`: `rmg-ui-log.txt`
+(SHA-256
+`136D6F632BE7F06D144D72B0407B843F5DFDC1164EB434428F49D214E2A398A6`),
+`result-ui.xml` (SHA-256
+`88585EBB5297421E07D05927DD72E2909A96C2FB6C5202EC9A2A3EDE6469DFF9`), and
+`result-screen.png` (SHA-256
+`4715D62AD2749ECA78F44DE9A69F0ADED7C657A52FD3E662C2DFBEE4F1293807`).
+
+The next diagnostic should keep the 75-microsecond timing and sample the
+waiter on every monitor poll instead of every fourth poll. This may catch a
+brief `D` window; the added sampling load could also affect timing, so preserve
+the trace markers and compare the syscall intervals again. Keep it one-shot
+and COW-only. Do not enable the nice step unless a blocked sample reaches its
+guarded setter.
