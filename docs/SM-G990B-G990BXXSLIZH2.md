@@ -5904,3 +5904,19 @@ The captured samples are in
 (SHA-256
 `AB0AA4EC2DAA0916B4C341972FA9EE75FB3E0B015FDE543782DCF84EDA4EF163`).
 No payload or scheduler state was changed.
+
+#### Recurrence of CPU 6/7 isolation
+
+A further read-only paired check at 15:41:28 +01:00 took 12 samples with a
+250 ms pause between queries. Shizuku PID 13005 and all 17 threads stayed
+at affinity mask `0x3f`; WALT marked CPUs 6 and 7 isolated in every sample.
+Both CPUs remained online and in the root cpuset (`0-7`), and the generic
+isolated-CPU list remained empty. CPU 4 (helper) and CPU 0 (observer) were
+available, but CPU 6 (waiter) and CPU 7 (consumer) were absent. The strict
+preflight was not run.
+
+Samples are saved in
+`build/parent-affinity-walt-snapshot-20261128/paired-cpu-mask-check-20261128-154128.txt`
+(SHA-256
+`A035BC2FC3ACAFD8109122AF1A2302E6D4A236C7CD635921C91ABBDD8C3F3F3E`).
+No payload or scheduler state was changed.
