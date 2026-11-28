@@ -5545,3 +5545,64 @@ selected waiter/helper cores changed between these two runs. Then hold the
 placement constant so a future timing comparison tests one variable at a
 time. Keep the payload COW-only and one-shot until a waiter `D` sample is
 observed.
+
+### 2026-11-28 parent-affinity CPU context preflight
+
+To investigate the placement changes without entering the exploit route, a
+COW-only parent-affinity preflight was built with
+`RMG_DIAG_COW_REQUIRE_CPUS_67=1` and
+`RMG_DIAG_COW_PARENT_AFFINITY_ONLY=1`. It logs `/proc` status and cgroup
+context for the child and its direct parent, queries the parent's scheduler
+affinity, checks the child's inherited and expanded masks, restores the
+inherited mask, and then exits before KASLR discovery or the COW route. The
+166,456-byte Android API 30 AArch64 artifact has SHA-256
+`A219910387E7C001F55F22BC6605505CB9A01A4F652258F46F5506872340AB13`.
+RMG Next's app-private payload hash matched before execution.
+
+RMG run record `e44892c0-bb17-4f3f-aba9-fef75febe214` used Shizuku and the
+local preflight payload. Child PID 11413 inherited mask `0x5f`; the direct
+Shizuku shell supervisor, PID 11410, also returned mask `0x5f` from
+`sched_getaffinity()`. The preflight verified restoration (`restore=0/0`,
+`verify=0/0`, `match=1`) and found CPU 6 available but CPU 7 unavailable, so
+it returned status 42 before the exploit route. RMG displayed its generic
+code 255 for that deliberate stop. No KASLR discovery, COW operation, root,
+or KernelSU load occurred.
+
+The direct parent's scheduler mask differs from the `0x6f` recorded by the
+2026-11-26 parent-affinity preflight. The timed runs also recorded different
+thread masks and placements (`0x6f` versus `0x3f`, with the consumer thread
+separately reporting `0xbf`). This confirms placement varies across
+Shizuku-launched runs and threads. It does not yet identify which launch or
+scheduler step changes the mask.
+
+For this run, `/proc` reported `Cpus_allowed=ff` and
+`Cpus_allowed_list=0-7` for both child and parent; both were in the root
+cpuset. The device reported CPUs `0-7` online, root and top-app cpusets
+`0-7`, foreground `0-2,4-7`, background `0-2`, and battery saver off. Thus
+CPU hotplug and the visible cpuset masks do not explain the narrower
+`sched_getaffinity()` result. The mismatch between the `/proc` fields and the
+syscall result remains unresolved.
+
+The phone stayed booted on the expected Android 16 fingerprint and
+5.4.289 kernel, ADB remained UID 2000, and `/dev/ksu` and `/proc/ksu` remained
+absent. The active RMG local payload was restored to
+`rmg-cow-mprotect-delay75-every-poll-20261128.so` and its app-private hash
+again matched `F33CADDAEC9CEDB0B07161D42FEA400CF9B0416E4B7DCD0DFCE13B42F78F009A`.
+The preflight binary remains in Downloads but is not active.
+
+Evidence is in `build/parent-affinity-cpu-context-20261128/`:
+`rmg-ui-log.txt` (SHA-256
+`1DBF909ED2FCCDA256A87C3095EC57CEE039104E4660F4891CF22638696FB170`),
+`install-history.json` (SHA-256
+`0972A742AC72DDDD7AD6479AC2D8F82F50CC230E45FE83EA2B02EF3B2219396E`),
+`result-ui.xml` (SHA-256
+`DB147D1A574712E8749736E788F01D898D53E4AD09B5552C069EB2692931BB65`),
+and `result-screen.png` (SHA-256
+`60F5C206F7D58F5FAB219198E7FFE76F58506BCDC42254B3CB6647FB15FEA555`).
+
+Before another timing attempt, make placement fail closed: widen the guarded
+route thread only after the preflight, pin it to the intended waiter CPU, and
+verify the consumer, mprotect helper, and observer each reached their
+assigned CPUs. Keep the COW-only guard and skip the run whenever any required
+CPU is missing. Capture each thread's effective mask so later timing
+comparisons use the same placement.

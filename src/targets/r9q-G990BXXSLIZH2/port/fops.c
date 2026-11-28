@@ -1218,9 +1218,9 @@ static int readiness_pin_passive_observer(
     return -1;
   *inherited_bits = readiness_affinity_mask64(&inherited);
 
-  /* pthread_create inherited the waiter's CPU-6 mask. Widen only this
-   * monitor thread so we can discover its cpuset, then keep it off both the
-   * waiter and the selected COW mmap helper CPU. */
+  /* pthread_create inherited the waiter's selected CPU mask. Widen only
+   * this monitor thread to discover its effective allowed mask, then keep it
+   * off both the waiter and the selected COW mmap helper CPU. */
   if (sched_setaffinity(0, sizeof(all_cpus), &all_cpus) != 0)
     return -1;
   if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0)
