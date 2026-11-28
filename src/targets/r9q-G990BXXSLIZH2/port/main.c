@@ -1084,6 +1084,80 @@ static void rmg_diag_log_sched_affinity(const char *label, pid_t pid) {
           label, (long)pid, ret, saved_errno, bits);
 }
 
+#if defined(RMG_DIAG_COW_PARENT_AFFINITY_ONLY) && \
+    RMG_DIAG_COW_PARENT_AFFINITY_ONLY
+static int rmg_diag_read_proc_ppid(pid_t pid, pid_t *ppid_out) {
+  char path[64];
+  int path_len = snprintf(path, sizeof(path), "/proc/%ld/status", (long)pid);
+  if (path_len <= 0 || (size_t)path_len >= sizeof(path)) {
+    pr_warning("RMG_COW_CPU_CHAIN_PPARENT pid=%ld error=path\n", (long)pid);
+    return 0;
+  }
+
+  FILE *fp = fopen(path, "r");
+  if (fp == NULL) {
+    pr_warning("RMG_COW_CPU_CHAIN_PPARENT pid=%ld path=%s open_errno=%d\n",
+               (long)pid, path, errno);
+    return 0;
+  }
+
+  char line[256];
+  int found = 0;
+  while (fgets(line, sizeof(line), fp) != NULL) {
+    int parent_pid = -1;
+    if (sscanf(line, "PPid:%d", &parent_pid) == 1 && parent_pid >= 0) {
+      *ppid_out = (pid_t)parent_pid;
+      found = 1;
+      break;
+    }
+  }
+  int read_errno = errno;
+  if (ferror(fp))
+    pr_warning("RMG_COW_CPU_CHAIN_PPARENT pid=%ld path=%s read_errno=%d\n",
+               (long)pid, path, read_errno);
+  fclose(fp);
+  if (!found)
+    pr_warning("RMG_COW_CPU_CHAIN_PPARENT pid=%ld path=%s field_missing=PPid\n",
+               (long)pid, path);
+  return found;
+}
+
+static void rmg_diag_log_parent_affinity_chain(pid_t first_pid) {
+  pr_info("RMG_COW_CPU_CHAIN_BEGIN first_pid=%ld max_depth=8\n",
+          (long)first_pid);
+  pid_t pid = first_pid;
+  for (int depth = 0; depth < 8 && pid > 1; depth++) {
+    char label[32];
+    char status_path[64];
+    char cgroup_path[64];
+    pid_t parent_pid = -1;
+    int label_len = snprintf(label, sizeof(label), "chain%d", depth);
+    int status_len = snprintf(status_path, sizeof(status_path),
+                              "/proc/%ld/status", (long)pid);
+    int cgroup_len = snprintf(cgroup_path, sizeof(cgroup_path),
+                              "/proc/%ld/cgroup", (long)pid);
+    int parent_read = rmg_diag_read_proc_ppid(pid, &parent_pid);
+    pr_info("RMG_COW_CPU_CHAIN_STEP depth=%d pid=%ld ppid=%ld "
+            "ppid_read=%d\n",
+            depth, (long)pid, (long)parent_pid, parent_read);
+    if (label_len <= 0 || (size_t)label_len >= sizeof(label) ||
+        status_len <= 0 || (size_t)status_len >= sizeof(status_path) ||
+        cgroup_len <= 0 || (size_t)cgroup_len >= sizeof(cgroup_path)) {
+      pr_warning("RMG_COW_CPU_CHAIN_STEP depth=%d pid=%ld path_error=1\n",
+                 depth, (long)pid);
+      break;
+    }
+    rmg_diag_log_proc_status(label, status_path, 0);
+    rmg_diag_log_proc_cgroup(label, cgroup_path);
+    rmg_diag_log_sched_affinity(label, pid);
+    if (!parent_read || parent_pid <= 1 || parent_pid == pid)
+      break;
+    pid = parent_pid;
+  }
+  pr_info("RMG_COW_CPU_CHAIN_END\n");
+}
+#endif
+
 static void rmg_diag_log_process_context(void) {
   pid_t pid = getpid();
   pid_t ppid = getppid();
@@ -1094,7 +1168,10 @@ static void rmg_diag_log_process_context(void) {
 
   rmg_diag_log_proc_status("self", "/proc/self/status", 1);
   rmg_diag_log_proc_cgroup("self", "/proc/self/cgroup");
-
+#if defined(RMG_DIAG_COW_PARENT_AFFINITY_ONLY) && \
+    RMG_DIAG_COW_PARENT_AFFINITY_ONLY
+  rmg_diag_log_parent_affinity_chain(ppid);
+#else
   if (ppid > 0) {
     char parent_status[64];
     char parent_cgroup[64];
@@ -1108,6 +1185,7 @@ static void rmg_diag_log_process_context(void) {
       rmg_diag_log_proc_cgroup("parent", parent_cgroup);
     rmg_diag_log_sched_affinity("parent", ppid);
   }
+#endif
 }
 
 static int rmg_diag_cpu67_preflight(void) {

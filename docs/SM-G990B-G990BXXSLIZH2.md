@@ -5762,3 +5762,53 @@ Evidence is in `build/strict-cpu4-preflight-20261128/`:
 (`BCEE29DBE1A839CF23DD7D234487F470E3C5509A8F831CFDD72287D2AA34F279`),
 and `cpu4-mask-review.txt`
 (`A879A45B02D860D8F0DFAD02510433FD9E1F73BD5F02D13C14BE11404EE9B577`).
+
+#### Shizuku ancestor affinity trace
+
+Extended the parent-only preflight with a bounded ancestry trace. For each
+readable ancestor, it records PID/PPID, `/proc/<pid>/status`, cgroup, and
+`sched_getaffinity()`. The extra chain walk is compiled only when
+`RMG_DIAG_COW_PARENT_AFFINITY_ONLY=1`; other CPU-preflight builds retain the
+previous direct-parent logging. The diagnostic still returns before KASLR,
+route setup, or any COW operation.
+
+The 172,608-byte Android API 30 artifact has SHA-256
+`8F696F03A8ACC1EC43D2E118C3E9AD336E94F748FEAF054665924283DBC63E16`.
+Build settings are recorded in
+`build/parent-affinity-chain-preflight-20261128/build-flags.txt`. The binary
+was copied to the phone's Downloads folder, verified there, imported as the
+local payload, and verified in the app before the run.
+
+RMG run `710379a7-2a53-46b7-8e16-1a5a2b62c844` ran once through Shizuku.
+The payload child PID 17844 and its direct shell supervisor PID 17841 both
+had UID 2000. The supervisor's PPID was Shizuku `main` PID 13005, also UID
+2000, whose PPID was 1. `sched_getaffinity()` returned `0x6f` for the child,
+supervisor, and Shizuku `main` process. All three `/proc` status records
+still reported `Cpus_allowed=ff` and `Cpus_allowed_list=0-7`. The supervisor
+and Shizuku `main` also shared cgroup path
+`/system/uid_0/pid_12980`.
+
+This places the restricted effective mask at or before Shizuku's `main`
+process; the trace does not identify where it first originated. PID 1 was
+the last reported parent, and the diagnostic intentionally stopped before
+querying it. The mask `0x6f` contains CPUs 0-3, 5, and 6. The strict
+preflight successfully pinned the waiter probe to CPU 6 and observer probe
+to CPU 0, but CPU 7 (consumer) and CPU 4 (mprotect helper) were unavailable.
+It restored and verified the inherited `0x6f` mask, then returned status 42
+before KASLR or the exploit route. RMG translated this diagnostic stop to
+its generic failure code 255. No root was gained and KernelSU did not load.
+
+The phone stayed on Android 16 build `G990BXXSLIZH2` and kernel
+`5.4.289-qgki-32192773-abG990BXXSLIZH2`; battery saver remained off and ADB
+remained UID 2000. After capture, the app's local payload was restored to
+`rmg-cow-mprotect-delay75-every-poll-20261128.so`, with app-private SHA-256
+`F33CADDAEC9CEDB0B07161D42FEA400CF9B0416E4B7DCD0DFCE13B42F78F009A`. The
+trace artifact remains in Downloads but is not active.
+
+Evidence is under `build/parent-affinity-chain-preflight-20261128/`:
+`install-history-latest.json` (SHA-256
+`C4BECCB048BDC39F024B499F97ED87084C462072FB17AFEB021FB4B5386E0C10`),
+`cpu-chain-review.txt` (`BCA5060D56B670B49D75BB9F12A5FE091C0BE9C9890851F8F20644EFC1DAC115`),
+`result-ui.xml` (`D54F18418B396A79E826447263163F7CEF4D504DBFAE02C9C7BE11C4BDE47D01`),
+`result-screen.png` (`C119E46953BC9D6BEDBC8424C3DF00B99842DDAA6CBEB1C183F6B76A2112977D`),
+and `device-post-run.txt` (`CD8C8DB9A033FB9018F2D75CA797CE480D18DC1DE8487BC9324AE944E2AD2085`).
