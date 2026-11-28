@@ -5813,6 +5813,7 @@ Evidence is under `build/parent-affinity-chain-preflight-20261128/`:
 `result-screen.png` (`C119E46953BC9D6BEDBC8424C3DF00B99842DDAA6CBEB1C183F6B76A2112977D`),
 and `device-post-run.txt` (`CD8C8DB9A033FB9018F2D75CA797CE480D18DC1DE8487BC9324AE944E2AD2085`).
 
+
 #### Time-aligned WALT core-isolation trace
 
 Added read-only snapshots of WALT's `core_ctl/global_state`, the root
@@ -5868,3 +5869,21 @@ Evidence is under `build/parent-affinity-walt-snapshot-20261128/`:
 `result-ui.xml` (`49FD6CD9DECB0F1C0A456C4280006F28D52D9D4071732E20CF931807BB54D7F0`),
 `result-screen.png` (`C8891D0AB433C5494D5219B995F85FCDC05B3E7C2E5AD98A75057FE255A5018E`),
 and `device-post-run.txt` (`CD8C8DB9A033FB9018F2D75CA797CE480D18DC1DE8487BC9324AE944E2AD2085`).
+
+#### Follow-up affinity check
+
+A second read-only paired sample on 2026-11-28 at 15:10:55 +01:00 queried
+Shizuku PID 13005 and WALT `core_ctl/global_state` 12 times at 250 ms
+intervals. The main thread and all 18 Shizuku threads consistently reported
+affinity mask `0x3f`; WALT marked CPUs 6 and 7 isolated in every sample.
+Both CPUs remained online and in the root cpuset (`0-7`), while the generic
+isolated-CPU list remained empty. The required CPU 6 waiter and CPU 7 consumer
+were unavailable; CPU 4 helper and CPU 0 observer were available. The strict
+preflight was not started. This reproduces the earlier time-aligned `0x3f`
+observation and confirms that the intervening `0x5f` sample was transient.
+
+The captured samples are in
+`build/parent-affinity-walt-snapshot-20261128/paired-cpu-mask-check-20261128-rerun.txt`
+(SHA-256
+`10EA7731F1D5888CE193BC8B6B0BBB8DC0AE2071B7999901B016BCBB6E90B129`).
+No payload or scheduler state was changed.
