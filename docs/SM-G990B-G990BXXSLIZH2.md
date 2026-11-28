@@ -5887,3 +5887,20 @@ The captured samples are in
 (SHA-256
 `10EA7731F1D5888CE193BC8B6B0BBB8DC0AE2071B7999901B016BCBB6E90B129`).
 No payload or scheduler state was changed.
+
+#### Later affinity sample
+
+A further read-only paired check on 2026-11-28 at 15:24:02 +01:00 took 12
+samples, with a 250 ms pause between queries. Shizuku PID 13005 and all 17
+of its threads consistently reported mask `0x6f`. WALT marked CPUs 4 and 7
+isolated in every sample, matching the absent mask bits. CPU 6 (waiter) and
+CPU 0 (observer) were available; CPU 4 (helper) and CPU 7 (consumer) were
+not. CPUs 0-7 remained online and in the root cpuset, and the generic
+isolated-CPU list remained empty. The strict preflight was not run because
+the required CPU 4 and CPU 7 placements were unavailable.
+
+The captured samples are in
+`build/parent-affinity-walt-snapshot-20261128/paired-cpu-mask-check-20261128-152402.txt`
+(SHA-256
+`AB0AA4EC2DAA0916B4C341972FA9EE75FB3E0B015FDE543782DCF84EDA4EF163`).
+No payload or scheduler state was changed.
