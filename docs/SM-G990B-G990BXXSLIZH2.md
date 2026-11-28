@@ -5988,8 +5988,9 @@ and verified absent after the check.
 
 A post-load snapshot at 16:35:51 +01:00 showed all 17 Shizuku threads back
 at `0x5f`, with CPU 7 isolated and its cluster at `active_cpus=0` and
-`need_cpus=0`. Availability is therefore transient and demand-driven. The
-parent-only preflight has not yet been run.
+`need_cpus=0`. Availability is therefore transient and demand-driven.
+The parent-only preflight was later run during a reproduced `0xff` window;
+the actual parent mask changed before the diagnostic sampled it (see below).
 
 Load-time evidence: `build/parent-affinity-walt-snapshot-20261128/three-worker-cpu-policy-20261128-163237.txt`
 (SHA-256
@@ -5998,3 +5999,56 @@ Post-load evidence: `build/parent-affinity-walt-snapshot-20261128/after-three-wo
 (SHA-256
 `8B6FF023F60333A16A372C5DCBA7E4B2BCB31E3DFBFD4A81B6EC2BD7103AB0CB`).
 No CPU policy or payload was changed.
+
+#### Parent-only preflight during a reproduced availability window
+
+The local diagnostic file imported in RMG was
+`rmg-parent-walt-snapshot-20261128.so` (SHA-256
+`C94696FAC07D7627F682C9822A118861CD514D7CDBED2474809EAFC4F361C82A`).
+It is built with the parent-affinity-only guard and returns before the
+exploit route.
+
+A bounded on-device load reproduced the availability window. The first
+sample showed Shizuku PID 13005 at `0x6f` with CPUs 4 and 7 WALT-isolated;
+the second sample showed mask `0xff` with CPUs 4, 6, and 7 unisolated.
+RMG was confirmed once at that point. The app then prepared and verified
+the KernelSU service before invoking the imported diagnostic.
+
+By the time the diagnostic ran, both the Shizuku supervisor (PID 8503) and
+its parent, Shizuku PID 13005, had affinity mask `0xbf`. WALT reported CPU
+4 unisolated, CPU 6 isolated (`active_cpus=2`, `need_cpus=2`), and CPU 7
+unisolated (`active_cpus=1`, `need_cpus=1`). The diagnostic recorded
+`inherited=0xbf`, `allowed=0xbf`, `cpu6=0`, and `cpu7=1`. Its CPU 7
+consumer, CPU 4 helper, and CPU 0 observer pin checks succeeded; the CPU 6
+waiter role failed because CPU 6 had disappeared from the effective mask.
+The diagnostic restored its original affinity (`match=1`).
+
+The parent-only guard returned status `42` and logged that it was skipping
+before the exploit route. RMG displayed wrapper code `255` at “Running kernel
+exploit”; the KernelSU load stage was not reached. A read-only check confirmed
+`/dev/ksu` is absent.
+The source guard stopped before the exploit route; no kernel modification,
+flash, or reboot occurred. All temporary load workers were stopped and
+verified absent.
+
+The evidence indicates that the `0xff` placement window closed between the
+host confirmation and the diagnostic’s actual affinity check. The next
+placement experiment should keep the bounded load active until the
+`RMG_COW_CPU_PREFLIGHT` record is observed. After the run, RMG offered a
+one-minute wait before retry and marked immediate retry “Not recommended”;
+no second run was launched.
+
+Evidence:
+
+- `build/parent-affinity-walt-snapshot-20261128/parent-affinity-preflight-20261128.txt`
+  (SHA-256 `B1434768560DA809DA8373C85947D8426DBC5620669C046ABF514D7208B13FD2`).
+- `build/parent-affinity-walt-snapshot-20261128/parent-window-samples-20261128.txt`
+  (SHA-256 `49388A1CC185E0A4ADE6D35C367383020EB0F2A77E8E80D31424DE5865D915D3`).
+- `build/parent-affinity-walt-snapshot-20261128/recreated-preflight-current.xml`
+  (SHA-256 `6486E04A2B4ED6AC54A8956EF9E03FFF5EE79167E0846D88E84D174539F5A437`).
+- `build/parent-affinity-walt-snapshot-20261128/result-parent-only-20261128.png`
+  (SHA-256 `466B6DA41AB777E34DFC83FD9991F4DB5DBC99B7993AA0540D3B946EB50E4C11`).
+- Retry-dialog capture: `build/parent-affinity-walt-snapshot-20261128/parent-preflight-run2-20261128-175023.txt`
+  (SHA-256 `0854D4C3F0A53AF2D3B659F7148A872FB2A2994E58837DFB36B33765067FB00C`).
+
+No core_ctl policy or kernel state was changed.
