@@ -5973,3 +5973,28 @@ Evidence: `build/parent-affinity-walt-snapshot-20261128/cpu6-cpu7-current-load-2
 (SHA-256
 `0E848060D2415646C09FCA7E6D0F8B9DFC1E9D4733947A3EE318AC1AD632723D`).
 No payload or scheduler state was changed.
+
+#### Temporary CPU 6/7 availability under bounded load
+
+A controlled 3-process `/system/bin/yes` load ran over eight paired samples
+(about two seconds of sampling). The initial sample was still `0x3f`, with
+CPUs 6 and 7 isolated. From samples 2 through 8, Shizuku's main thread
+reported `0xff`, and all 17 threads reported `0xff` at the end of the
+burst. WALT marked CPUs 4, 5, 6, and 7 unisolated; the CPU 4-6 cluster
+reported `active_cpus=3`, `need_cpus=3`, and the CPU 7 cluster reported
+`active_cpus=1`, `need_cpus=1`. Thus all required placement CPUs 0, 4, 6,
+and 7 were available during that window. All three workers were stopped
+and verified absent after the check.
+
+A post-load snapshot at 16:35:51 +01:00 showed all 17 Shizuku threads back
+at `0x5f`, with CPU 7 isolated and its cluster at `active_cpus=0` and
+`need_cpus=0`. Availability is therefore transient and demand-driven. The
+parent-only preflight has not yet been run.
+
+Load-time evidence: `build/parent-affinity-walt-snapshot-20261128/three-worker-cpu-policy-20261128-163237.txt`
+(SHA-256
+`8C5F6FCBC39F8E21559315AAA50B774D99320B4C1375C63FFD31C2AFBAC75E8E`).
+Post-load evidence: `build/parent-affinity-walt-snapshot-20261128/after-three-worker-state-20261128-163551.txt`
+(SHA-256
+`8B6FF023F60333A16A372C5DCBA7E4B2BCB31E3DFBFD4A81B6EC2BD7103AB0CB`).
+No CPU policy or payload was changed.
