@@ -5490,3 +5490,58 @@ brief `D` window; the added sampling load could also affect timing, so preserve
 the trace markers and compare the syscall intervals again. Keep it one-shot
 and COW-only. Do not enable the nice step unless a blocked sample reaches its
 guarded setter.
+
+### 2026-11-28 one-shot every-poll observer run
+
+The follow-up build retained the 75-microsecond mprotect delay and enabled
+`RMG_DIAG_PASSIVE_COW_OBSERVER_EVERY_POLL=1`. It remained a one-attempt
+COW-only diagnostic and stopped before CFI, physical read/write, and root.
+The 165,816-byte Android API 30 build has SHA-256
+`F33CADDAEC9CEDB0B07161D42FEA400CF9B0416E4B7DCD0DFCE13B42F78F009A`.
+RMG Next's app-private local-payload copy matched that hash before the run.
+
+RMG logged `exploit attempt=1/1`, used the local payload, and completed tracefs
+KASLR discovery. The readiness COW mapping again changed from present,
+file-backed to present, anonymous. The waiter remained `R` in all 129
+every-poll observer samples; `blocked_samples=0`. The samples span about +19
+to +2,172 microseconds relative to the pselect-before marker. The reported
+`pselect_us` was 2,203 microseconds.
+
+The mprotect helper, rather than the waiter, was observed once in state `D`
+while `pselect()` was still active: helper TID 10328, poll 134, about +2,185
+microseconds from the pselect-before marker. The helper's wait channel was
+reported as `0`, so the reason for that state is unknown. The first mprotect
+syscall ran from about +29 to +2,150 microseconds; the second began at +2,151
+and ended at +4,113 microseconds. The pselect-after marker was about +2,206
+microseconds. This confirms a helper-side blocked sample during the pselect
+window, but it does not show that the waiter blocked or explain why the helper
+was waiting.
+
+CPU placement also differed from the preceding 75-microsecond run. This run
+reported waiter CPU 0, observer CPU 1, helper CPU 4, and allowed mask `0x3f`;
+the preceding run reported waiter CPU 6, observer CPU 0, helper CPU 5, and
+allowed mask `0x6f`. Therefore the two runs do not isolate sampling cadence
+from CPU placement. A very short waiter-state change between polls also
+cannot be ruled out, but the earlier every-fourth-poll gap is no longer a
+good explanation for a sustained blocked interval.
+
+The COW-only guard stopped at `readiness-cow cfi miss`; canary mutation was
+zero, and the final summary reported `done=0`, `root=0`, and no physical
+read/write. RMG returned code 255. The phone stayed on the same Android 16
+fingerprint and 5.4.289 kernel, remained ADB-responsive as UID 2000, and had
+no `kernelsu` module, `/dev/ksu`, or `/proc/ksu`. RMG verified and staged its
+KernelSU service before the attempt but did not load it.
+
+Evidence is in `build/cow-mprotect-delay75-every-poll-20261128/`:
+`rmg-ui-log.txt` (SHA-256
+`5A1E2922814DD05BCDC9F2F3D034840403207BC6597FE09D2FAD2A3DDD520691`),
+`result-ui.xml` (SHA-256
+`64D9610F21F83210B1FE31E963E7B7E4FC5BC95CFA30C41130D296613FB95300`), and
+`result-screen.png` (SHA-256
+`C039D339A95BB9536327DE802173BC3CEE6AF5D693341D2A9C9C382AFA0F9724`).
+
+Before another phone attempt, review why the task's allowed CPU mask and
+selected waiter/helper cores changed between these two runs. Then hold the
+placement constant so a future timing comparison tests one variable at a
+time. Keep the payload COW-only and one-shot until a waiter `D` sample is
+observed.

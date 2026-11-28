@@ -58,6 +58,15 @@
 #define RMG_DIAG_READINESS_STATE_TRACE 1
 #endif
 
+#if defined(RMG_DIAG_PASSIVE_COW_OBSERVER_EVERY_POLL) && \
+    RMG_DIAG_PASSIVE_COW_OBSERVER_EVERY_POLL
+#if !defined(RMG_DIAG_COW_ONLY) || !RMG_DIAG_COW_ONLY || \
+    !defined(RMG_DIAG_PASSIVE_COW_OBSERVER) || \
+    !RMG_DIAG_PASSIVE_COW_OBSERVER
+#error "every-poll passive observer requires COW-only passive tracing"
+#endif
+#endif
+
 #if defined(RMG_DIAG_COW_MPROTECT_DELAY_USEC) && \
     RMG_DIAG_COW_MPROTECT_DELAY_USEC > 0
 #if !defined(RMG_DIAG_COW_ONLY) || !RMG_DIAG_COW_ONLY || \
@@ -2444,7 +2453,12 @@ static void *readiness_block_monitor_thread(void *arg) {
 #endif
     }
 #if defined(RMG_DIAG_PASSIVE_COW_OBSERVER) && RMG_DIAG_PASSIVE_COW_OBSERVER
+#if defined(RMG_DIAG_PASSIVE_COW_OBSERVER_EVERY_POLL) && \
+    RMG_DIAG_PASSIVE_COW_OBSERVER_EVERY_POLL
+    int passive_sample_due = 1;
+#else
     int passive_sample_due = ((polls + 1) % 4) == 0;
+#endif
     int passive_gate_before = 0;
     int passive_active_before = 0;
     if (passive_sample_due) {
