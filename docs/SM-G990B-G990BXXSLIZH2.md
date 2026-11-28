@@ -5959,3 +5959,17 @@ Evidence: `build/parent-affinity-walt-snapshot-20261128/core-ctl-policy-20261128
 (SHA-256
 `25A7E5CB98428D61F4840C7F42A7F7044980907108C6F660CE49A9848E32502D`).
 No CPU policy, payload, or exploit state was changed.
+
+#### Current CPU 6/7 check
+
+At 15:59:19 +01:00, 12 paired samples again showed Shizuku PID 13005 and
+all 17 threads at affinity mask `0x6f`. CPU 6 remained allowed and not
+isolated. CPU 7 remained unavailable and WALT-isolated in every sample;
+its cluster reported `active_cpus=0` and `need_cpus=0` throughout. CPUs 0-7
+were online and in the root cpuset, with no CPUs in the generic isolated
+list. The strict preflight was not run.
+
+Evidence: `build/parent-affinity-walt-snapshot-20261128/cpu6-cpu7-current-load-20261128-155918.txt`
+(SHA-256
+`0E848060D2415646C09FCA7E6D0F8B9DFC1E9D4733947A3EE318AC1AD632723D`).
+No payload or scheduler state was changed.
