@@ -5934,3 +5934,28 @@ Evidence: `build/parent-affinity-walt-snapshot-20261128/cpu6-cpu7-availability-2
 (SHA-256
 `3D305D36A2A63D7215FEEB398D133F35F1B6E784ACD81DF5865B51630232824F`).
 No payload or scheduler state was changed.
+
+#### CPU 7 core_ctl demand policy
+
+A read-only snapshot at 15:54:07 +01:00 showed Shizuku PID 13005 and all 17
+threads at `0x5f`: CPU 6 was allowed and CPU 7 was not. WALT reported CPU 7
+online but isolated, with its cluster at `active_cpus=0` and `need_cpus=0`.
+The same snapshot showed the CPU 7 cluster enabled with `min_cpus=0`,
+`max_cpus=1`, `busy_up_thres=60`, `busy_down_thres=30`,
+`offline_delay_ms=100`, and `task_thres=1`. Its root cpuset and online CPU
+mask both remained `0-7`; the generic isolated-CPU list was empty.
+
+The common base source archive's `Kernel.tar.gz` contains
+`kernel/sched/walt/core_ctl.c`.
+Its `eval_need()` derives cluster demand from WALT busy/utilization and task
+run-queue information; `apply_task_need()` requests the cluster's CPUs when
+the run-queue need reaches `task_thres`. The core-control worker unisolates
+CPUs when that demand exceeds the active count. In `kernel/sched/core.c`,
+`sched_getaffinity()` removes `cpu_isolated_mask` from userspace task masks.
+This explains why CPU 7 can be online yet unavailable to Shizuku while the
+cluster reports no demand.
+
+Evidence: `build/parent-affinity-walt-snapshot-20261128/core-ctl-policy-20261128-155405.txt`
+(SHA-256
+`25A7E5CB98428D61F4840C7F42A7F7044980907108C6F660CE49A9848E32502D`).
+No CPU policy, payload, or exploit state was changed.
