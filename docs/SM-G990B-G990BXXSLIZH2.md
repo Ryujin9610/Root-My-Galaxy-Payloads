@@ -5305,9 +5305,61 @@ bytes; SHA-256
 `2FABCFD3954E7A26E129713EA8E7BC6EED8F84BE2067891114D54827DF9A97B2`). Its
 startup identity includes `nice_step=+1` and
 `cfi_write_pipe_physrw_root=disabled`; build flags are recorded in the same
-directory. This candidate has not been staged on or run against the phone.
+directory. It was imported into RMG Next as a local payload and run once on
+the phone; see the result below.
 
 Changing nice may make the stale PI waiter unequal to the task and drive the
-chain walker into the corrupted waiter/lock state; a future run could freeze
-or reboot the phone. The earlier approval covered only the previous candidate
-and was used once. Do not run this follow-up without fresh approval.
+chain walker into the corrupted waiter/lock state. This attempt did not
+exercise the nice change because the trigger gate was not reached.
+
+### 2026-11-28 one-shot guarded nice-step run
+
+The candidate above was pushed to `/sdcard/Download/` and imported through
+RMG Next's Local payload setting. The imported app-private copy had the same
+SHA-256 as the local build. RMG selected the `r9q-G990BXXSLIZH2` profile,
+received Shizuku permission, verified the KernelSU service, and reported the
+local filename `rmg-uclamp-priority-step-20261128.so`. The run used the
+guarded `diagnostic=uclamp-trigger-only`, `nice_step=+1` build with
+`cfi_write_pipe_physrw_root=disabled`. Although RMG's generic route setting
+listed 24 attempts, the payload supervisor and exploit child each logged a
+limit of one; the trace confirms exactly `exploit attempt=1/1`.
+
+Tracefs KASLR discovery succeeded. Controlled reclaim completed the selected
+34-object group and all 256 64-KiB sends (16 MiB). The readiness path then
+returned from pselect with result 106 in 611 microseconds. During the active
+gate, the waiter was sampled at state 82, but `blocked_samples=0`; the passive
+observer's first and last recorded states were also 82, with zero blocked
+samples across its ten samples. The mprotect helper had zero blocked samples.
+The 16-MiB canary scan covered 512/512 order-3 chunks and found no changed
+chunks (`mutated=0`, `task_pi=0`); fops readback was skipped. The compile-time
+guard stopped at the expected `readiness-cow cfi miss step=42`, before CFI,
+physical read/write, or root.
+
+Crucially, this run did **not** test the proposed priority-equality explanation:
+the gated helper `sched_setattr_tid_uclamp_nochange()` was not called. The
+durable checkpoint has no `sched-uclamp-*` records, the UI trace has no
+`UCLAMPTRACE`, and the readiness scheduler summary is `0/0`. The earlier
+`sched-nochange-*` records are from the consumer's baseline self-scheduling
+call and do not show the new `nice +1` request. Since the waiter was never
+observed blocked during the gate, the `0 -> 1` nice step was not applied. The
+unchanged canary therefore does not confirm or refute whether a changed
+priority would advance the PI chain.
+
+RMG displayed `Failed at: Running kernel exploit` with code 255. The phone
+remained ADB-responsive and booted on the same Android 16 fingerprint and
+kernel; `sys.boot_completed` stayed `1`. `/dev/ksu` and `/proc/ksu` remained
+absent, as expected because this guarded run never gained root or reached the
+KernelSU load stage. No retry was made.
+
+The local evidence is in
+`build/uclamp-priority-step-20261128/`: `rmg-ui-log.txt` (SHA-256
+`8AE6CD7F0A0065B5D159F2E6E2CD3F89C9514E4C31922B1900AD171482527E90`),
+`post-attempt-checkpoint.log` (SHA-256
+`3A167370D63D12FC0B4AB374793BFAC3467BF9F882166CE0EDBF07932EB81B5A`), and
+`result-screen.png` (SHA-256
+`CBFEF61EECE339108D19E7B803708DB0E822B35033E1ED08DB672F795305DD50`).
+
+The next useful work is to explain the readiness timing difference that
+prevented any blocked waiter sample, using the existing COW-only versus
+PI/uclamp traces. Do not treat another nice-step run as informative until the
+trigger path is shown to reach the gated setter.
