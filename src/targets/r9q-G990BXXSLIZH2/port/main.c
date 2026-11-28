@@ -1156,6 +1156,29 @@ static void rmg_diag_log_parent_affinity_chain(pid_t first_pid) {
   }
   pr_info("RMG_COW_CPU_CHAIN_END\n");
 }
+
+static void rmg_diag_log_readonly_file(const char *label, const char *path) {
+  FILE *fp = fopen(path, "r");
+  if (fp == NULL) {
+    pr_warning("RMG_COW_CPU_SYSFS label=%s path=%s open_errno=%d\n",
+               label, path, errno);
+    return;
+  }
+
+  char line[512];
+  errno = 0;
+  pr_info("RMG_COW_CPU_SYSFS_BEGIN label=%s path=%s\n", label, path);
+  while (fgets(line, sizeof(line), fp) != NULL) {
+    line[strcspn(line, "\r\n")] = '\0';
+    pr_info("RMG_COW_CPU_SYSFS label=%s %s\n", label, line);
+  }
+  int read_errno = errno;
+  if (ferror(fp))
+    pr_warning("RMG_COW_CPU_SYSFS label=%s path=%s read_errno=%d\n",
+               label, path, read_errno);
+  fclose(fp);
+  pr_info("RMG_COW_CPU_SYSFS_END label=%s path=%s\n", label, path);
+}
 #endif
 
 static void rmg_diag_log_process_context(void) {
@@ -1171,6 +1194,13 @@ static void rmg_diag_log_process_context(void) {
 #if defined(RMG_DIAG_COW_PARENT_AFFINITY_ONLY) && \
     RMG_DIAG_COW_PARENT_AFFINITY_ONLY
   rmg_diag_log_parent_affinity_chain(ppid);
+  rmg_diag_log_readonly_file(
+      "core_ctl_global_state",
+      "/sys/devices/system/cpu/cpu0/core_ctl/global_state");
+  rmg_diag_log_readonly_file("root_cpuset", "/dev/cpuset/cpus");
+  rmg_diag_log_readonly_file("online_cpus", "/sys/devices/system/cpu/online");
+  rmg_diag_log_readonly_file("isolated_cpus",
+                             "/sys/devices/system/cpu/isolated");
 #else
   if (ppid > 0) {
     char parent_status[64];

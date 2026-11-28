@@ -5812,3 +5812,59 @@ Evidence is under `build/parent-affinity-chain-preflight-20261128/`:
 `result-ui.xml` (`D54F18418B396A79E826447263163F7CEF4D504DBFAE02C9C7BE11C4BDE47D01`),
 `result-screen.png` (`C119E46953BC9D6BEDBC8424C3DF00B99842DDAA6CBEB1C183F6B76A2112977D`),
 and `device-post-run.txt` (`CD8C8DB9A033FB9018F2D75CA797CE480D18DC1DE8487BC9324AE944E2AD2085`).
+
+#### Time-aligned WALT core-isolation trace
+
+Added read-only snapshots of WALT's `core_ctl/global_state`, the root
+cpuset, online CPUs, and the generic isolated-CPU sysfs file to the
+parent-only preflight. This logging is only compiled when
+`RMG_DIAG_COW_PARENT_AFFINITY_ONLY=1` and does not change scheduler state.
+
+The Samsung source bundle README says to use the G990BXXUGIYJ1 kernel source
+as the base and apply the G990BXXSLIZH2 kernel update. The update archive
+contains no `kernel/sched/` files, so the scheduler and WALT core-control
+files remain those from the base source. In `kernel/sched/core.c`,
+`sched_getaffinity()` intersects the task mask with `cpu_active_mask` and,
+when WALT is enabled, removes `cpu_isolated_mask` for user processes.
+`kernel/sched/walt/core_ctl.c` exposes per-CPU isolation state in its
+read-only `global_state` attribute at
+`/sys/devices/system/cpu/cpu0/core_ctl/global_state`.
+
+RMG run `983b2293-34a2-418f-8412-1cb71c45d5f5` captured these values in the
+same guarded attempt. Child PID 20340, supervisor PID 20337, and the same
+Shizuku `main` PID 13005 all reported effective mask `0x3f` (CPUs 0-5).
+The WALT snapshot marked CPUs 6 and 7 isolated and CPUs 0-5 not isolated.
+The root cpuset and online CPU mask both remained `0-7`; the generic
+`/sys/devices/system/cpu/isolated` file was empty. This directly explains
+the `0x3f` mask for this run: WALT core isolation filtered CPUs 6 and 7 even
+though they were online and included in the broad cpuset mask.
+
+The strict preflight verified pins to CPU 4 (mprotect-helper probe) and CPU
+0 (observer), while CPUs 6 (waiter) and 7 (consumer) were absent. It restored
+and verified `0x3f`, then stopped before KASLR, route setup, or COW. RMG
+again surfaced its generic failure code 255; no root or KernelSU load
+occurred. The earlier trace recorded `0x6f` for this same Shizuku PID. An
+intermediate read-only sample recorded `0x5f` for its main thread in 24
+samples at 250 ms intervals; a separate query showed all 17 Shizuku threads
+at `0x5f`. Its effective mask therefore changes over time; the time-aligned
+`0x3f` sample shows WALT isolation accounting for this run. Earlier masks
+were not paired with a simultaneous `core_ctl` snapshot, so their exact
+isolated CPU sets remain unconfirmed.
+
+The 173,712-byte API 30 artifact has SHA-256
+`C94696FAC07D7627F682C9822A118861CD514D7CDBED2474809EAFC4F361C82A`.
+Build flags are under
+`build/parent-affinity-walt-snapshot-20261128/build-flags.txt`. Afterward,
+the app's baseline payload was restored and verified at SHA-256
+`F33CADDAEC9CEDB0B07161D42FEA400CF9B0416E4B7DCD0DFCE13B42F78F009A`.
+The phone remains on the expected firmware and kernel, battery saver is
+off, ADB is UID 2000, and `/dev/ksu`, `/proc/ksu`, and a KSU module remain
+absent. The snapshot artifact remains in Downloads but is not active.
+
+Evidence is under `build/parent-affinity-walt-snapshot-20261128/`:
+`install-history-latest.json` (SHA-256
+`E18B50DD68CC14C737A6380E782AA8950B307740D919E378A446C6B4268DC594`),
+`cpu-state-review.txt` (`E0A323E4B41404A3344D4C8E2B215AD3E2F2E7BB4EB2423B0A99F173F013EDF6`),
+`result-ui.xml` (`49FD6CD9DECB0F1C0A456C4280006F28D52D9D4071732E20CF931807BB54D7F0`),
+`result-screen.png` (`C8891D0AB433C5494D5219B995F85FCDC05B3E7C2E5AD98A75057FE255A5018E`),
+and `device-post-run.txt` (`CD8C8DB9A033FB9018F2D75CA797CE480D18DC1DE8487BC9324AE944E2AD2085`).
