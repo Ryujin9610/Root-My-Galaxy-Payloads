@@ -5407,3 +5407,30 @@ keep that limitation explicit and use controlled timing variations as a
 correlation test. Re-run the nice-step candidate only after a blocked waiter
 sample reaches its guarded scheduler hook. Keep the diagnostic stop before
 CFI, physical read/write, and root, and use one attempt per run.
+
+### Follow-up: timing controls review (2026-11-28)
+
+The existing trace build already records the start and end of `pselect()` and
+each `mprotect()` syscall. It cannot mark the precise `__copy_to_user()` fault
+or the interval inside `mprotect()` when `mmap_sem` is held, so those remain
+inferred from syscall timing and the waiter state.
+
+The delayed COW-only run from 2026-11-26 used a 250-microsecond helper delay;
+`pselect()` returned in 62 microseconds, and the helper began mprotect about
+137 microseconds after that return. That delay missed the operation entirely.
+In the 2026-11-28 no-delay run, the first mprotect syscall began about 48
+microseconds before `pselect()` and returned at +602 microseconds, while
+`pselect()` returned at +611 microseconds; no blocked state was sampled. The
+earlier blocked run had a longer first mprotect interval, ending at +1,660
+microseconds, and observed the waiter in `D` around +514 microseconds.
+
+A useful next timing-only candidate is `RMG_DIAG_COW_MPROTECT_DELAY_USEC=75`
+in the one-attempt COW-only build. The main thread has a 50-microsecond
+head-start before entering `pselect()`, so this setting should start the
+helper near the beginning of `pselect()` (roughly +15 to +25 microseconds,
+subject to scheduling). That tests whether moving the helper window later
+captures the COW copyout, without enabling the nice step, CFI, physical
+read/write, or root stages. Treat the result as timing correlation, since the
+kernel lock interval itself is not directly traced. Only after a `D` sample
+reaches the guarded setter would a separate one-attempt nice-step run test the
+priority hypothesis.
