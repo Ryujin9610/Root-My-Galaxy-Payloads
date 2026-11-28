@@ -5920,3 +5920,17 @@ Samples are saved in
 (SHA-256
 `A035BC2FC3ACAFD8109122AF1A2302E6D4A236C7CD635921C91ABBDD8C3F3F3E`).
 No payload or scheduler state was changed.
+
+#### Focused CPU 6/7 availability check
+
+At 15:43:48 +01:00, a focused read-only check queried Shizuku PID 13005 and
+WALT state in 12 paired samples. All 17 threads stayed at `0x3f`; CPUs 6
+and 7 were both marked WALT-isolated and absent from the effective mask in
+every sample. Both CPUs were online and inside the root cpuset (`0-7`); the
+generic isolated-CPU list was empty. The waiter and consumer placements
+therefore remained unavailable, so the preflight was not run.
+
+Evidence: `build/parent-affinity-walt-snapshot-20261128/cpu6-cpu7-availability-20261128-154348.txt`
+(SHA-256
+`3D305D36A2A63D7215FEEB398D133F35F1B6E784ACD81DF5865B51630232824F`).
+No payload or scheduler state was changed.
